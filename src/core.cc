@@ -795,9 +795,12 @@ int Note::fill_file(const ProcessData& proc)
         block.Write(n.filename.c_str(), n.filename.size() + 1);
     }
     
-    // align to 4 bytes 
-    int size = roundup(block.Size(), 4);
-    char *p = allocate(size);
+    // 文件名区精确长度作 descsz，不要在内部补零。
+    // B15: 原实现 roundup(block.Size(),4) 会在文件名末尾补 0，gdb 把它解析成
+    // 一个多余的空文件名 → names 区比 count 个文件实际占用大 → gdb 报
+    // "malformed note - filename area is too big"。native core 的 NT_FILE
+    // descsz = 16 + count*24 + 精确文件名长度，末尾补齐由 note 对齐处理。
+    char *p = allocate(block.Size());
     memcpy(p, block.rBuf(), block.Size());
     
     return 0;
