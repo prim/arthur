@@ -278,13 +278,26 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     rc = fread(&hdr, 1, sizeof(hdr), _file);
     assert(rc == sizeof(hdr));
   
-    // tail mark 
+    // tail mark
     if (hdr.isTailMark()) {
+        return NULL;
+    }
+
+    // B20: hdr.size 是 19 位字段，最大 524287，但 buf 只有
+    // LZ4_COMPRESSBOUND(BLOCK_SIZE)（64KB 输入的最坏压缩后大小 ≈65809）。
+    // 合法写入者每块最多 BLOCK_SIZE 未压缩字节，压缩后必 ≤ 该值；
+    // 损坏/构造的 acore 可把 hdr.size 设成任意值 → fread 越过栈缓冲。
+    if (hdr.size > sizeof(buf)) {
+        error("block compressed size %u exceeds buffer (%lu), acore corrupt", hdr.size, sizeof(buf));
         return NULL;
     }
 
     // read out compressed data
     rc = fread(buf, 1, hdr.size, _file);
+    if (rc != (int)hdr.size) {
+        error("read block data failed (%d != %u)", rc, hdr.size);
+        return NULL;
+    }
 
     // decompress 
     rc = LZ4_decompress_safe_continue(_dec, buf, block.wBuf(), hdr.size, BLOCK_SIZE);
