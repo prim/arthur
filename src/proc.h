@@ -90,6 +90,8 @@ class ProcDecoder {
 public:
     ProcDecoder(){};
     ProcDecoder(ProcFile* pf) : _pf(pf) {};
+    // 多态基类（Parse 是虚函数）：必须虚析构，否则 delete 派生类是 UB
+    virtual ~ProcDecoder() {};
     int readline(int& cur, char*out, size_t n);
     virtual int Parse() = 0;
 
