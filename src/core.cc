@@ -1510,7 +1510,11 @@ int Coredump::generate(const char *corefile)
     WriteFileHeader(out);
 
     // attach main thread
-    pt_attach(_pid);
+    if (pt_attach(_pid) != 0) {
+        // 目标不存在/无权限：干净报错而非深层 assert 崩溃
+        error("cannot attach to process %d", _pid);
+        return -1;
+    }
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     collect_threads(_pid);
 
@@ -1570,7 +1574,11 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     ts_pause.begin();
 
     // attach main thread
-    pt_attach(_pid);
+    if (pt_attach(_pid) != 0) {
+        // 目标不存在/无权限：干净报错而非深层 assert 崩溃
+        error("cannot attach to process %d", _pid);
+        return -1;
+    }
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     collect_threads(_pid);
