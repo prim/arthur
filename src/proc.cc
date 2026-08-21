@@ -34,17 +34,26 @@ ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path)
         return NULL;
     }
 
-    ProcFile *pf = (ProcFile*)buf; 
+    ProcFile *pf = (ProcFile*)buf;
     int rc;
-    int left = buf_len - sizeof(ProcFile);
+    // 预留 1 字节给末尾 NUL 终止符：f_data 最多放 buf_len - sizeof(ProcFile) - 1
+    // 字节数据，否则 pf->f_data[len]='\0' 会越界写（B17 off-by-one）。
+    int left = buf_len - sizeof(ProcFile) - 1;
     int len = 0;
 
     for (;;) {
-        rc = read(fd, pf->f_data+len, 4096);
+        // 剩余空间不足时立即停止，避免越过 f_data 末尾写（B17）。
+        // 原实现读满后仍继续写，left 变负仍 read，堆/栈缓冲区溢出。
+        if (left <= 0) {
+            warn("buffer too small for %s, truncating at %d bytes", path, len);
+            break;
+        }
+
+        rc = read(fd, pf->f_data+len, MIN(4096, left));
         if (rc <= 0) {
             break;
         }
-        
+
         len += rc;
         left -= rc;
     }
