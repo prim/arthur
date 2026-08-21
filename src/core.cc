@@ -722,24 +722,25 @@ int Note::fill_prpsinfo(const ProcessData& proc)
         error("prpsinfo: missing thread/auxv metadata");
         return -1;
     }
-    elf_prpsinfo64 *p = allocate<elf_prpsinfo64>();
-
-    p->pr_state = proc._threads[0]._d_stat->state;
-    p->pr_sname = proc._threads[0]._d_stat->sname;
-    p->pr_uid = proc._d_auxv->uid;
-    p->pr_gid = proc._d_auxv->gid;
-    p->pr_pid = proc._threads[0]._d_stat->pid;
-    p->pr_ppid = proc._threads[0]._d_stat->ppid;
-    p->pr_pgrp = proc._threads[0]._d_stat->pgid;
-    p->pr_sid = proc._threads[0]._d_stat->sid;
+    // B36: note desc 落在 note+20（4 对齐非 8 对齐），直接 p->field 解引用是
+    // 未对齐 UB（UBSan 报错，aarch64 有风险）。在对齐局部结构里填好再 memcpy。
+    elf_prpsinfo64 info = {};
+    info.pr_state = proc._threads[0]._d_stat->state;
+    info.pr_sname = proc._threads[0]._d_stat->sname;
+    info.pr_uid = proc._d_auxv->uid;
+    info.pr_gid = proc._d_auxv->gid;
+    info.pr_pid = proc._threads[0]._d_stat->pid;
+    info.pr_ppid = proc._threads[0]._d_stat->ppid;
+    info.pr_pgrp = proc._threads[0]._d_stat->pgid;
+    info.pr_sid = proc._threads[0]._d_stat->sid;
 
     // B26: cmdline 为空（如内核线程/异常进程）时 argv[0] 越界。取 argv[0] 或空串。
     std::string fname;
     if (proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
         fname = proc._d_cmdline->argv[0];
     }
-    strncpy(p->pr_fname, fname.c_str(), sizeof(p->pr_fname));
-    p->pr_fname[sizeof(p->pr_fname) - 1] = '\0';
+    strncpy(info.pr_fname, fname.c_str(), sizeof(info.pr_fname));
+    info.pr_fname[sizeof(info.pr_fname) - 1] = '\0';
 
     const char* delim = " ";
     std::ostringstream args;
@@ -747,8 +748,11 @@ int Note::fill_prpsinfo(const ProcessData& proc)
         std::copy(proc._d_cmdline->argv.begin(), proc._d_cmdline->argv.end(),
                std::ostream_iterator<std::string>(args, delim));
     }
-    strncpy(p->pr_psargs, args.str().c_str(), sizeof(p->pr_psargs));
-    p->pr_psargs[sizeof(p->pr_psargs) - 1] = '\0';
+    strncpy(info.pr_psargs, args.str().c_str(), sizeof(info.pr_psargs));
+    info.pr_psargs[sizeof(info.pr_psargs) - 1] = '\0';
+
+    char *p = allocate(sizeof(info));
+    memcpy(p, &info, sizeof(info));
 
     return 0;
 }
@@ -820,37 +824,46 @@ int Note::fill_file(const ProcessData& proc)
 // NT_PRSTATUS
 int Note::fill_prstatus(const ThreadData& thr)
 {
+    // B36: note desc 非 8 对齐，在对齐局部结构里填好再 memcpy。同时防护 _d_stat 为空。
+    if (!thr._d_stat) {
+        error("prstatus: thread %u missing stat metadata", thr._pid);
+        return -1;
+    }
     if (thr._arch == ARCH_X64) {
-        x64_elf_prstatus *p = allocate<x64_elf_prstatus>();
-        p->pr_info.si_code = thr._siginfo.si_code;
-        p->pr_info.si_errno = thr._siginfo.si_errno;
-        p->pr_info.si_signo = thr._siginfo.si_signo;
-        p->pr_cursig = thr._siginfo.si_signo;
-        memcpy(&p->pr_reg, &thr._regs.x64, sizeof(thr._regs.x64));
-        p->pr_pid = thr._d_stat->pid; 
-        p->pr_ppid = thr._d_stat->ppid; 
-        p->pr_pgrp = thr._d_stat->pgid; 
-        p->pr_sid = thr._d_stat->sid;
-        memcpy(&p->pr_utime, &thr._d_stat->utime, sizeof(p->pr_utime));
-        memcpy(&p->pr_stime, &thr._d_stat->stime, sizeof(p->pr_stime));
-        memcpy(&p->pr_cutime, &thr._d_stat->cutime, sizeof(p->pr_cutime));
-        memcpy(&p->pr_cstime, &thr._d_stat->cstime, sizeof(p->pr_cstime));
+        x64_elf_prstatus info = {};
+        info.pr_info.si_code = thr._siginfo.si_code;
+        info.pr_info.si_errno = thr._siginfo.si_errno;
+        info.pr_info.si_signo = thr._siginfo.si_signo;
+        info.pr_cursig = thr._siginfo.si_signo;
+        memcpy(&info.pr_reg, &thr._regs.x64, sizeof(thr._regs.x64));
+        info.pr_pid = thr._d_stat->pid;
+        info.pr_ppid = thr._d_stat->ppid;
+        info.pr_pgrp = thr._d_stat->pgid;
+        info.pr_sid = thr._d_stat->sid;
+        info.pr_utime.tv_sec = thr._d_stat->utime;
+        info.pr_stime.tv_sec = thr._d_stat->stime;
+        info.pr_cutime.tv_sec = thr._d_stat->cutime;
+        info.pr_cstime.tv_sec = thr._d_stat->cstime;
+        char *p = allocate(sizeof(info));
+        memcpy(p, &info, sizeof(info));
     }
     else if (thr._arch == ARCH_AARCH64) {
-        arm64_elf_prstatus *p = allocate<arm64_elf_prstatus>();
-        p->pr_info.si_code = thr._siginfo.si_code;
-        p->pr_info.si_errno = thr._siginfo.si_errno;
-        p->pr_info.si_signo = thr._siginfo.si_signo;
-        p->pr_cursig = thr._siginfo.si_signo;
-        memcpy(&p->pr_reg, &thr._regs.arm64, sizeof(thr._regs.arm64));
-        p->pr_pid = thr._d_stat->pid; 
-        p->pr_ppid = thr._d_stat->ppid; 
-        p->pr_pgrp = thr._d_stat->pgid; 
-        p->pr_sid = thr._d_stat->sid;
-        memcpy(&p->pr_utime, &thr._d_stat->utime, sizeof(p->pr_utime));
-        memcpy(&p->pr_stime, &thr._d_stat->stime, sizeof(p->pr_stime));
-        memcpy(&p->pr_cutime, &thr._d_stat->cutime, sizeof(p->pr_cutime));
-        memcpy(&p->pr_cstime, &thr._d_stat->cstime, sizeof(p->pr_cstime));
+        arm64_elf_prstatus info = {};
+        info.pr_info.si_code = thr._siginfo.si_code;
+        info.pr_info.si_errno = thr._siginfo.si_errno;
+        info.pr_info.si_signo = thr._siginfo.si_signo;
+        info.pr_cursig = thr._siginfo.si_signo;
+        memcpy(&info.pr_reg, &thr._regs.arm64, sizeof(thr._regs.arm64));
+        info.pr_pid = thr._d_stat->pid;
+        info.pr_ppid = thr._d_stat->ppid;
+        info.pr_pgrp = thr._d_stat->pgid;
+        info.pr_sid = thr._d_stat->sid;
+        info.pr_utime.tv_sec = thr._d_stat->utime;
+        info.pr_stime.tv_sec = thr._d_stat->stime;
+        info.pr_cutime.tv_sec = thr._d_stat->cutime;
+        info.pr_cstime.tv_sec = thr._d_stat->cstime;
+        char *p = allocate(sizeof(info));
+        memcpy(p, &info, sizeof(info));
     }
     return 0;
 }
@@ -1137,12 +1150,23 @@ int Coredump::ReadMeta(Lz4Stream& in)
     _process._io = in.GetFile();
     _process._limits = in.GetFile();
    
+    // B23: thread_num 来自损坏 acore 可为任意值；限定上限避免无限/超长循环
+    if (thread_num < 0 || thread_num > 1000000) {
+        error("implausible thread_num %d, acore corrupt", thread_num);
+        return -1;
+    }
+
     for (int i=0; i<thread_num; i++) {
         ThreadData td;
-        td._arch = _arch; 
-        
+        td._arch = _arch;
+
         buf = in.ReadBlock(hdr);
-        
+        if (!buf) {
+            // 损坏 acore 提前结束：跳过剩余线程（避免 NULL 解引用）
+            error("thread block %d missing (truncated acore), stopping", i);
+            break;
+        }
+
         buf->Read((char*)&td._pid, sizeof(td._pid));
 
         if (_arch == ARCH_X64) {
@@ -1322,24 +1346,34 @@ int Coredump::ReadElfHeader(Lz4Stream& in)
     int rc;
     BlockHeader hdr;
     Block* block = in.ReadBlock(hdr);
+    if (!block) {
+        // 损坏 acore：ELF 块缺失
+        error("elf block missing (truncated acore)");
+        return -1;
+    }
 
     rc = block->Read((char*)&_ehdr, sizeof(_ehdr));
     if (rc != sizeof(_ehdr)) {
         error("decode ehdr failed.");
         return -1;
-    } 
-    
+    }
+
     while (block) {
-        
+
         while (block->Size() > 0) {
             Elf64_Phdr phdr;
             rc = block->Read((char*)&phdr, sizeof(phdr));
-            assert(rc == sizeof(phdr));
+            if (rc != sizeof(phdr)) {
+                error("decode phdr failed.");
+                return -1;
+            }
             _phdrs.push_back(phdr);
         }
-        
+
         rc = in.Peek((char*)&hdr, sizeof(hdr));
-        assert(rc == sizeof(hdr));
+        if (rc != sizeof(hdr)) {
+            break;
+        }
         if (hdr.block_type != BLOCK_TYPE_ELF) {
             break;
         }
@@ -1392,43 +1426,47 @@ int Coredump::GenerateNotes()
 {
     int rc = 0;
 
+    // B37: fill_* 失败（损坏 acore 缺元数据）时 note 的 _data 为 NULL，
+    // 直接 push 会让 fwrite(NULL) 崩溃。只在成功时加入。
+    auto add_note = [&](Note* nt, int fill_rc) -> void {
+        if (fill_rc != 0) {
+            error("note fill failed, skipping");
+            delete nt;
+            return;
+        }
+        _notes.push_back(nt);
+    };
+
     // NT_PRPSINFO (prpsinfo structure)
     Note *nt = new Note(NT_PRPSINFO);
-    nt->fill_prpsinfo(_process);
-    _notes.push_back(nt); 
+    add_note(nt, nt->fill_prpsinfo(_process));
 
     // NT_AUXV (auxiliary vector)
     nt = new Note(NT_AUXV);
-    nt->fill_auxv(_process);
-    _notes.push_back(nt);
+    add_note(nt, nt->fill_auxv(_process));
 
     // NT_FILE (mapped files)
     nt = new Note(NT_FILE);
-    nt->fill_file(_process);
-    _notes.push_back(nt);
+    add_note(nt, nt->fill_file(_process));
 
     for (auto& i : _process._threads) {
         // NT_PRSTATUS (prstatus structure)
         nt = new Note(NT_PRSTATUS);
-        nt->fill_prstatus(i);
-        _notes.push_back(nt);
+        add_note(nt, nt->fill_prstatus(i));
 
         // NT_FPREGSET (floating point registers)
         nt = new Note(NT_FPREGSET);
-        nt->fill_fpregset(i);
-        _notes.push_back(nt);
+        add_note(nt, nt->fill_fpregset(i));
 
-        if (_arch == ARCH_X64) {        
+        if (_arch == ARCH_X64) {
             // NT_X86_XSTATE (x86 XSAVE extended state)
             nt = new Note(NT_X86_XSTATE);
-            nt->fill_x86_xstate(i);
-            _notes.push_back(nt);
+            add_note(nt, nt->fill_x86_xstate(i));
         }
 
         // NT_SIGINFO (siginfo_t data)
         nt = new Note(NT_SIGINFO);
-        nt->fill_siginfo(i);
-        _notes.push_back(nt);
+        add_note(nt, nt->fill_siginfo(i));
     }
 
     for (Note *nt : _notes) {
