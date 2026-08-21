@@ -2091,8 +2091,16 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     ReadLoads(in, fout);
 
     // write elf header
-    ReadElfHeader(in);
-    fseek(fout, p_elf, SEEK_SET); 
+    // ReadElfHeader 失败（损坏 acore 缺 ELF 块）时 _phdrs 为空，写出的 core 无
+    // LOAD 段；检查返回值，报错而非产出残缺 core。
+    rc = ReadElfHeader(in);
+    if (rc != 0) {
+        error("read elf header failed, core incomplete");
+        fclose(fout);
+        in.Close();
+        return -1;
+    }
+    fseek(fout, p_elf, SEEK_SET);
     WriteElfHeader(fout);
 
     in.Close();
