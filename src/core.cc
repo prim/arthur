@@ -2005,6 +2005,13 @@ int Coredump::monitor(const char* corefile)
     siginfo_t sig_info;
     while(1) {
         if(signal_forkcore) {
+            if (signal_forkcore < 0) {
+                // forkcore_m 失败（fail-closed）：restore_target_after_fail 已 resume
+                // leader，无需、也不应把 -1 当中继信号注入。跳过。
+                info("forkcore failed (%d), continue monitoring", signal_forkcore);
+                signal_forkcore = 0;
+                continue;
+            }
             info("signal forkcore %d", signal_forkcore);
             if (signal_forkcore == SIGILL || signal_forkcore == SIGABRT || signal_forkcore == SIGSEGV) {
                 // write out corefile under SIGILL, SIGABRT, SIGSEGV
@@ -2182,6 +2189,7 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         cleanup_decompress();
         return -1;
     }
+    size_t loads_written = (size_t)rc;
 
     // write elf header
     // ReadElfHeader 失败（损坏 acore 缺 ELF 块）时 _phdrs 为空，写出的 core 无
@@ -2189,6 +2197,25 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     rc = ReadElfHeader(in);
     if (rc != 0) {
         error("read elf header failed, core incomplete");
+        fclose(fout);
+        in.Close();
+        cleanup_decompress();
+        return -1;
+    }
+
+    // 校验：读侧实际写出的 LOAD 字节数 == acore ELF 块 phdr 声明的 p_filesz 之和。
+    // 写侧 p_filesz 是每个 region 实际写入的未压缩字节数（含 pread 失败时的部分），
+    // 二者应严格相等；不一致说明 LOADS 块被 bit-flip 成了合法但不同长度的 LZ4 流，
+    // 静默写错 core 比报错更危险。
+    size_t expected = 0;
+    for (const auto& phdr : _phdrs) {
+        if (phdr.p_type == PT_LOAD) {
+            expected += phdr.p_filesz;
+        }
+    }
+    if (loads_written != expected) {
+        error("loads size mismatch: wrote %lu bytes, phdrs declare %lu (acore corrupt)",
+              loads_written, expected);
         fclose(fout);
         in.Close();
         cleanup_decompress();
