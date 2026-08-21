@@ -228,10 +228,11 @@ int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
     }
 
     int rc;
-    size_t len;
-    len = LZ4_compress_fast_continue(_enc, block.rBuf(), buf, block.Length(), sizeof(buf), 1);
-    if (len < 0) {
-        error("lz4 compress failed (%ld)\n", len);
+    // B49: LZ4_compress_fast_continue 返回 int；原用 size_t 存导致 `len < 0`
+    // 恒假（-Wall 报 type-limits），错误返回值被当巨大正数写进块头。
+    int len = LZ4_compress_fast_continue(_enc, block.rBuf(), buf, block.Length(), sizeof(buf), 1);
+    if (len <= 0) {
+        error("lz4 compress failed (%d)\n", len);
         return -1;
     }
 
