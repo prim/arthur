@@ -1879,6 +1879,14 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         info("waitpid = %d", (int)regs.get_rc());
     }
     pt_setregs(_pid, &saved_regs);
+    // B39: 本函数开头设了 PTRACE_O_TRACEFORK，若不清除则 monitor 继续运行时目标
+    // 后续每个 fork 的子进程都被自动 attach+SIGSTOP 冻结（实证：state=t、
+    // TracerPid=arthur）。SETOPTIONS 需 tracee 停止——此刻 leader 刚被 pt_attach
+    // 停住，是清除的正确时机（放在 pt_cont 之前）。
+    rc = ptrace(PTRACE_SETOPTIONS, _pid, 0, 0);
+    if (rc != 0) {
+        error("clear TRACEFORK on %d failed", _pid);
+    }
     if(!WIFSTOPPED(s)) {
         pt_cont(_pid);
     }
