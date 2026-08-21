@@ -352,19 +352,23 @@ ProcFile* Lz4Stream::GetFile()
 
     // read out the file
     BlockHeader hdr;
-    char *p = (char*)pf;    
+    char *p = (char*)pf;
 
     for (uint32_t i=0; i<size; ) {
         Block *block = ReadBlock(hdr);
         if (!block) {
             break;
         }
-       
+
         assert(hdr.block_type == BLOCK_TYPE_FILE);
 
         rc = block->Read(p+i, MIN(size-i, BLOCK_SIZE));
         i += rc;
-    } 
+    }
+
+    // B37: 损坏 acore 可让内部 f_size 大于实际 malloc 缓冲（size），后续
+    // ProcAuxv/ProcCmdline/ProcStat 按 f_size 读会越界。钳制到真实缓冲大小。
+    pf->f_size = (size > sizeof(ProcFile)) ? (size - sizeof(ProcFile)) : 0;
 
     return pf;
 }
