@@ -2113,9 +2113,9 @@ int Coredump::test_compress(const char* in_file, const char* out_file)
     for (;;) {
         size_t len = fread(buf, 1, sizeof(buf), fin);
         if (len == 0) {
-            error("read failed (%ld)", len);
+            // B22: EOF（fread 返回 0）是正常结束，不是错误
             break;
-        } 
+        }
         
         for (size_t i=0; i<len; i+= BLOCK_SIZE) {
             size_t j = MIN(len - i, BLOCK_SIZE);
