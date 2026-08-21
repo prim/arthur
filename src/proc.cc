@@ -267,13 +267,20 @@ int ProcStat::Parse()
     };
 
     sname = fld(2)[0];
+    // B25: 与内核 task_state_array 对齐（fs/proc/array.c）：
+    // R=0 S=1 D=2 T=4(stopped) t=8(tracing) X=16 Z=32 P=64 I=128。
+    // 原映射 'T'→3、'Z'→4 与内核不符（'T' 应为 4，'Z' 应为 32）。
     switch (sname) {
         case 'R': state=0; break;
         case 'S': state=1; break;
         case 'D': state=2; break;
-        case 'T': state=3; break;
-        case 'Z': state=4; break;
-        case 'W': state=5; break;
+        case 'T': state=4; break;   // TASK_STOPPED
+        case 't': state=8; break;   // TASK_TRACED
+        case 'X': state=16; break;  // EXIT_DEAD
+        case 'Z': state=32; break;  // EXIT_ZOMBIE
+        case 'P': state=64; break;  // TASK_PARKED
+        case 'I': state=128; break; // TASK_IDLE
+        default: state=0; break;
     }
 
     pid = strtol(fld(0), NULL, 10);
