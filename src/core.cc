@@ -2127,6 +2127,9 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     FILE *fout = fopen(out_core, "wb");
     if (!fout) {
         error("Fail to open file %s", out_core);
+        // B50 残留: ReadMeta 已分配 ProcFiles/decoders/线程 _d_stat，
+        // fopen 失败提前返回时未清理 → LeakSanitizer 报 8999 字节泄漏。
+        cleanup_decompress();
         return -1;
     }
     long p_elf = ftell(fout);
