@@ -82,8 +82,10 @@ struct MemRegion {
     // 赋给 ph.p_flags（uint32）时符号扩展到 0xFFFFFFFD，污染高位 PF_MASKOS。
     // 用无符号位域，p_flags 保持 4/5/6。
     unsigned perms:3;
-    char is_private:1;  // cow
-    char is_shared:1;
+    // B59: 同 perms——`char is_*:1` 是有符号 1 位位域，置 1 读回 -1，
+    // `== 1` 恒假。改无符号。（当前无消费者，防未来误用。）
+    unsigned is_private:1;  // cow
+    unsigned is_shared:1;
     
     std::string name;
 };
