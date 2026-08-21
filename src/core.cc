@@ -163,17 +163,184 @@ uint64_t get_module_address(pid_t pid, const char* so_path)
     return r_addr;
 }
 
-// function for get function address
-static uint64_t get_remote_func_address(pid_t pid,const char *so_path, const char *func_name){
-    // fix: support debian
-    uint64_t l_addr = (uint64_t)dlsym(NULL, func_name); 
-    assert(l_addr);
-    uint64_t l_mod = get_module_address(-1, so_path);
-    assert(l_mod);
-    uint64_t r_mod = get_module_address(pid, so_path);
-    assert(r_mod);
-    uint64_t r_addr = (l_addr - l_mod + r_mod);
-    return r_addr;
+// 从目标进程自身 libc ELF 的 .dynsym 解析符号地址（B11 修复）。
+//
+// 原实现 get_remote_func_address 用本机 dlsym 偏移 + 目标 libc 基址，
+// 隐含假设 arthur 与目标进程的 libc 版本/符号布局完全一致。目标运行在
+// 不同发行版/容器/chroot，或 arthur 所在机器 glibc 升级后，偏移即错——
+// pt_call 会让目标从错误地址取指令执行（垃圾代码）→ SIGSEGV 被当作正常
+// 完成，写坏 acore、破坏目标内存。
+//
+// 这里直接从目标 libc ELF 的 PT_DYNAMIC → DT_SYMTAB/DT_STRTAB 解析符号的
+// st_value（相对偏移），与宿主 libc 无关。符号个数经 SysV hash（nchain）
+// 或 GNU hash（链尾哨兵）确定。
+//
+// 不能用节表：libc 的节表（e_shoff 处）不在任何 PT_LOAD 的 p_filesz 内，
+// 运行期内存中该区域是 BSS 零填充，读出来全是 0。
+static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *func_name)
+{
+#define ARTHUR_STT_NOTYPE   0
+#define ARTHUR_STT_FUNC     2
+#define ARTHUR_PT_DYNAMIC   2
+#define ARTHUR_DT_NULL      0
+#define ARTHUR_DT_HASH      4
+#define ARTHUR_DT_STRTAB    5
+#define ARTHUR_DT_SYMTAB    6
+#define ARTHUR_DT_SYMENT    11
+#define ARTHUR_DT_GNU_HASH  0x6ffffef5
+    if (base == 0 || func_name == NULL) {
+        return 0;
+    }
+
+    char mempath[64];
+    snprintf(mempath, sizeof(mempath), "/proc/%u/mem", pid);
+    int fd = open(mempath, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+    // read ELF header at the load base
+    Elf64_Ehdr ehdr;
+    if (pread(fd, &ehdr, sizeof(ehdr), base) != (ssize_t)sizeof(ehdr) ||
+        ehdr.e_ident[0] != ELFMAG0 || ehdr.e_ident[1] != 'E' ||
+        ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F') {
+        close(fd);
+        return 0;
+    }
+
+    // read program headers, find PT_DYNAMIC
+    std::vector<Elf64_Phdr> phdrs(ehdr.e_phnum);
+    ssize_t ph_bytes = (ssize_t)(ehdr.e_phnum * ehdr.e_phentsize);
+    if (ph_bytes != (ssize_t)(phdrs.size() * sizeof(Elf64_Phdr)) ||
+        pread(fd, phdrs.data(), ph_bytes, base + ehdr.e_phoff) != ph_bytes) {
+        close(fd);
+        return 0;
+    }
+    uint64_t dyn_vaddr = 0;
+    for (size_t i = 0; i < phdrs.size(); i++) {
+        if (phdrs[i].p_type == ARTHUR_PT_DYNAMIC) {
+            dyn_vaddr = base + phdrs[i].p_vaddr;
+            break;
+        }
+    }
+    if (dyn_vaddr == 0) {
+        close(fd);
+        return 0;
+    }
+
+    // read dynamic entries until DT_NULL
+    //
+    // 注意：这里读的是运行期已 RELOCATE 过的 .dynamic（目标进程内存）——
+    // 动态链接器把 DT_SYMTAB/DT_STRTAB/DT_HASH/DT_GNU_HASH 的 d_ptr
+    // 重定位成了进程内绝对地址，不能再加 base。用 d_ptr < base 兜底：
+    // 若拿到的是文件内相对 vaddr（未重定位场景），补 base。
+    uint64_t symtab = 0, strtab = 0;
+    uint64_t syment = 24, hash = 0, gnu_hash = 0;
+    for (size_t i = 0; ; i++) {
+        Elf64_Dyn dyn;
+        if (pread(fd, &dyn, sizeof(dyn), dyn_vaddr + i * sizeof(dyn)) != (ssize_t)sizeof(dyn)) {
+            close(fd);
+            return 0;
+        }
+        if (dyn.d_tag == ARTHUR_DT_NULL) {
+            break;
+        }
+        uint64_t ptr = dyn.d_un.d_ptr;
+        if (ptr != 0 && ptr < base) {
+            ptr += base;    // 未重定位的相对 vaddr
+        }
+        switch (dyn.d_tag) {
+            case ARTHUR_DT_SYMTAB: symtab = ptr; break;
+            case ARTHUR_DT_STRTAB: strtab = ptr; break;
+            case ARTHUR_DT_SYMENT: syment = dyn.d_un.d_val; break;
+            case ARTHUR_DT_HASH:   hash = ptr; break;
+            case ARTHUR_DT_GNU_HASH: gnu_hash = ptr; break;
+        }
+    }
+    if (symtab == 0 || strtab == 0 || syment == 0) {
+        close(fd);
+        return 0;
+    }
+
+    // symbol count: SysV hash nchain, or GNU hash chain walk
+    uint64_t sym_count = 0;
+    if (hash != 0) {
+        uint32_t nbucket, nchain;
+        if (pread(fd, &nbucket, 4, hash) != 4 ||
+            pread(fd, &nchain, 4, hash + 4) != 4) {
+            close(fd);
+            return 0;
+        }
+        sym_count = nchain;
+    } else if (gnu_hash != 0) {
+        uint32_t hdr[4];
+        if (pread(fd, hdr, sizeof(hdr), gnu_hash) != (ssize_t)sizeof(hdr)) {
+            close(fd);
+            return 0;
+        }
+        uint32_t nbuckets = hdr[0], symoffset = hdr[1], bloom_size = hdr[2];
+        uint64_t buckets = gnu_hash + 16 + (uint64_t)bloom_size * 8;
+        uint64_t chains = buckets + (uint64_t)nbuckets * 4;
+        uint32_t max_chain = 0;
+        for (uint32_t b = 0; b < nbuckets; b++) {
+            uint32_t idx;
+            if (pread(fd, &idx, 4, buckets + b * 4) != 4) {
+                close(fd);
+                return 0;
+            }
+            while (idx >= symoffset) {
+                uint32_t c = idx - symoffset;
+                if (c > max_chain) max_chain = c;
+                uint32_t chain;
+                if (pread(fd, &chain, 4, chains + c * 4) != 4) {
+                    close(fd);
+                    return 0;
+                }
+                if (chain & 1) break;
+                idx++;
+            }
+        }
+        sym_count = symoffset + max_chain + 1;
+    }
+    if (sym_count == 0) {
+        close(fd);
+        return 0;
+    }
+
+    for (uint64_t i = 0; i < sym_count; i++) {
+        Elf64_Sym sym;
+        if (pread(fd, &sym, sizeof(sym), symtab + i * syment) != (ssize_t)sizeof(sym)) {
+            break;
+        }
+        int type = sym.st_info & 0xf;   // ELF64_ST_TYPE
+        if (type != ARTHUR_STT_FUNC && type != ARTHUR_STT_NOTYPE) {
+            continue;
+        }
+        if (sym.st_name == 0) {
+            continue;
+        }
+        char name[256];
+        ssize_t r = pread(fd, name, sizeof(name) - 1, strtab + sym.st_name);
+        if (r <= 0) {
+            continue;
+        }
+        name[r] = '\0';
+        if (strcmp(name, func_name) == 0) {
+            close(fd);
+            return base + sym.st_value;
+        }
+    }
+    close(fd);
+    return 0;
+#undef ARTHUR_STT_NOTYPE
+#undef ARTHUR_STT_FUNC
+#undef ARTHUR_PT_DYNAMIC
+#undef ARTHUR_DT_NULL
+#undef ARTHUR_DT_HASH
+#undef ARTHUR_DT_STRTAB
+#undef ARTHUR_DT_SYMTAB
+#undef ARTHUR_DT_SYMENT
+#undef ARTHUR_DT_GNU_HASH
 }
 
 /* pt_ functions, for ptrace_ calls.
@@ -1263,12 +1430,19 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         assert(rc == 0);
     }
 
-    // get functions address 
-    const char *so_path = "libc";
-    uint64_t r_mmap = get_remote_func_address(_pid, so_path, "mmap");
-    uint64_t r_munmap = get_remote_func_address(_pid, so_path, "munmap");
-    //uint64_t r_fork = get_remote_func_address(_pid, so_path, "fork");
-    uint64_t r_waitpid = get_remote_func_address(_pid, so_path, "waitpid");
+    // 从目标进程自身 libc 的 .dynsym 解析符号地址（B11），
+    // 不再假设宿主 libc 与目标 libc 同构。
+    uint64_t r_libc = get_module_address(_pid, "libc");
+    uint64_t r_mmap = get_remote_sym_address(_pid, r_libc, "mmap");
+    uint64_t r_munmap = get_remote_sym_address(_pid, r_libc, "munmap");
+    //uint64_t r_fork = get_remote_sym_address(_pid, r_libc, "fork");
+    uint64_t r_waitpid = get_remote_sym_address(_pid, r_libc, "waitpid");
+    if (r_mmap == 0 || r_munmap == 0 || r_waitpid == 0) {
+        // 目标 libc 无法解析（无节表/符号缺失）：fail-closed，
+        // 避免用垃圾地址远程执行破坏目标内存。
+        error("failed to resolve libc symbols in target (libc base %lx)", r_libc);
+        return -1;
+    }
     info("remote mmap at %lx", r_mmap);
     //info("remote fork at %p", r_fork);
     info("remote waitpid at %lx", r_waitpid);
@@ -1408,12 +1582,19 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         assert(rc == 0);
     }
 
-    // get functions address 
-    const char *so_path = "libc";
-    uint64_t r_mmap = get_remote_func_address(_pid, so_path, "mmap");
-    uint64_t r_munmap = get_remote_func_address(_pid, so_path, "munmap");
-    //uint64_t r_fork = get_remote_func_address(_pid, so_path, "fork");
-    uint64_t r_waitpid = get_remote_func_address(_pid, so_path, "waitpid");
+    // 从目标进程自身 libc 的 .dynsym 解析符号地址（B11），
+    // 不再假设宿主 libc 与目标 libc 同构。
+    uint64_t r_libc = get_module_address(_pid, "libc");
+    uint64_t r_mmap = get_remote_sym_address(_pid, r_libc, "mmap");
+    uint64_t r_munmap = get_remote_sym_address(_pid, r_libc, "munmap");
+    //uint64_t r_fork = get_remote_sym_address(_pid, r_libc, "fork");
+    uint64_t r_waitpid = get_remote_sym_address(_pid, r_libc, "waitpid");
+    if (r_mmap == 0 || r_munmap == 0 || r_waitpid == 0) {
+        // 目标 libc 无法解析（无节表/符号缺失）：fail-closed，
+        // 避免用垃圾地址远程执行破坏目标内存。
+        error("failed to resolve libc symbols in target (libc base %lx)", r_libc);
+        return -1;
+    }
     info("remote mmap at %lx", r_mmap);
     info("remote waitpid at %lx", r_waitpid);
 
