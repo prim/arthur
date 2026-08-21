@@ -1450,7 +1450,7 @@ int Coredump::ReadElfHeader(Lz4Stream& in)
     return 0;
 }
 
-int Coredump::ReadLoads(Lz4Stream& in, FILE* fout)
+ssize_t Coredump::ReadLoads(Lz4Stream& in, FILE* fout)
 {
     int rc;
     //size_t file_size = 0;
@@ -2280,15 +2280,17 @@ int Coredump::decompress(const char* in_file, const char* out_core)
 
     // write loads
     // B54: 截断 acore 使 ReadLoads 失败时不再 assert abort，干净报错。
-    rc = ReadLoads(in, fout);
-    if (rc < 0) {
+    // B60: ReadLoads 返回 ssize_t（实际写出的未压缩字节数）——>2GB 的合法
+    // dump 若用 int 返回会被截断成负数误判为失败（实证：3.2GB dump 被拒）。
+    ssize_t loads_rc = ReadLoads(in, fout);
+    if (loads_rc < 0) {
         error("read loads failed, core incomplete");
         fclose(fout);
         in.Close();
         cleanup_decompress();
         return -1;
     }
-    size_t loads_written = (size_t)rc;
+    size_t loads_written = (size_t)loads_rc;
 
     // write elf header
     // ReadElfHeader 失败（损坏 acore 缺 ELF 块）时 _phdrs 为空，写出的 core 无

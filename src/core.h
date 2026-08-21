@@ -292,7 +292,9 @@ private:
     // read acore 
     int VerifyFileHeader(Lz4Stream& in);
     int ReadMeta(Lz4Stream& in);
-    int ReadLoads(Lz4Stream& in, FILE* fout);
+    // 返回实际写出的未压缩字节数（可为数 GB，须用 ssize_t，不能用 int——
+    // >2GB 会截断成负数被调用方误判为错误）；-1 表示读失败。
+    ssize_t ReadLoads(Lz4Stream& in, FILE* fout);
     int ReadElfHeader(Lz4Stream& in);
  
     // write core
