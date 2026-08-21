@@ -941,12 +941,12 @@ Coredump::Coredump(pid_t pid)
 #else
       _arch(ARCH_X64),
 #endif
+      // 按 core.h 成员声明顺序（_ptrace_options 在 _ehdr/_note_phdr 之前）
+      _ptrace_options(0),
       _ehdr(),
       _note_phdr(),
-      _offset_load(0),
-      _ptrace_options(0)
+      _offset_load(0)
 {
-
 }
 
 int Coredump::WriteFileHeader(Lz4Stream& out)
@@ -1341,7 +1341,11 @@ int Coredump::WriteElfHeader(FILE* fout)
     ehdr.e_phnum = _phdrs.size();
 
     len = fwrite(&ehdr, 1, sizeof(ehdr), fout);
-    assert(len == sizeof(ehdr));
+    // B54: 输出磁盘满时 fwrite 短写，原 assert 直接 abort。
+    if (len != (ssize_t)sizeof(ehdr)) {
+        error("write elf header failed (%ld != %zu), disk full?", len, sizeof(ehdr));
+        return -1;
+    }
     rc += len;
 
     for (auto& _phdr : _phdrs) {
@@ -1350,7 +1354,10 @@ int Coredump::WriteElfHeader(FILE* fout)
             phdr.p_offset += _offset_load;
         }
         len = fwrite(&phdr, 1, sizeof(phdr), fout);
-        assert(len == sizeof(phdr));
+        if (len != (ssize_t)sizeof(phdr)) {
+            error("write phdr failed (%ld != %zu), disk full?", len, sizeof(phdr));
+            return -1;
+        }
         rc += len;
     }
 
@@ -1432,10 +1439,18 @@ int Coredump::ReadLoads(Lz4Stream& in, FILE* fout)
         }
 
         Block *block = in.ReadBlock(hdr);
-        assert(block);
+        if (!block) {
+            // 截断在 LOADS 块数据中间：Peek 读到头、ReadBlock 读数据失败。
+            // B54: 原 assert(block) 使损坏 acore 直接 abort（NDEBUG 下 NULL 解引用）。
+            error("loads block read failed (acore truncated)");
+            return -1;
+        }
 
         size_t len = fwrite(block->rBuf(), 1, block->Size(), fout);
-        assert(len == block->Size());
+        if (len != block->Size()) {
+            error("write loads block failed (%lu != %lu)", len, block->Size());
+            return -1;
+        }
 
         //file_size += hdr.size;
         loads_size += block->Size();
@@ -2143,12 +2158,27 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     for (Note* nt : _notes) {
         ssize_t len;
         len = fwrite(nt->_data, 1, nt->_size, fout);
-        assert(len == nt->_size);
+        // B54: 输出磁盘满时 fwrite 可能短写，原 assert 直接 abort。
+        if (len != nt->_size) {
+            error("write note failed (%ld != %d), disk full?", len, nt->_size);
+            fclose(fout);
+            in.Close();
+            cleanup_decompress();
+            return -1;
+        }
     }
     _offset_load = ftell(fout);
 
     // write loads
-    ReadLoads(in, fout);
+    // B54: 截断 acore 使 ReadLoads 失败时不再 assert abort，干净报错。
+    rc = ReadLoads(in, fout);
+    if (rc < 0) {
+        error("read loads failed, core incomplete");
+        fclose(fout);
+        in.Close();
+        cleanup_decompress();
+        return -1;
+    }
 
     // write elf header
     // ReadElfHeader 失败（损坏 acore 缺 ELF 块）时 _phdrs 为空，写出的 core 无
@@ -2162,7 +2192,14 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         return -1;
     }
     fseek(fout, p_elf, SEEK_SET);
-    WriteElfHeader(fout);
+    rc = WriteElfHeader(fout);
+    if (rc < 0) {
+        error("write elf header to core failed");
+        fclose(fout);
+        in.Close();
+        cleanup_decompress();
+        return -1;
+    }
 
     in.Close();
     fclose(fout);
