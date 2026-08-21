@@ -308,6 +308,9 @@ private:
     // 枚举 /proc/<leader>/task/ 全部线程并 attach 非主线程；attach 失败的
     // （线程已退出）从列表剔除，保证线程计数与实际写出的 THREAD 块一致。
     int collect_threads(pid_t leader);
+    // 采集失败（fail-closed）时还原目标：detach 兄弟线程、resume leader、
+    // 清空线程列表。monitor 场景下失败后目标必须能继续运行。
+    void restore_target_after_fail();
 private:
     pid_t _pid;             // target pid
     pid_t _core_pid;        // forked core's pid

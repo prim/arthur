@@ -1069,6 +1069,21 @@ int Coredump::collect_threads(pid_t leader)
     return 0;
 }
 
+// B35(问题1): 采集失败后还原目标。兄弟线程用 PTRACE_DETACH(NULL) 恢复
+// （无 SIGCONT，与 forkcore_m 末尾一致）；leader 用 CONT 恢复。monitor 场景
+// 下若不做这个还原，兄弟线程会永久停在 attach-stop，目标进程死锁。
+void Coredump::restore_target_after_fail()
+{
+    for (pid_t tid : _process._thrd_pid) {
+        if (tid == _pid) {
+            continue;
+        }
+        ptrace(PTRACE_DETACH, tid, NULL, NULL);
+    }
+    _process._thrd_pid.clear();
+    ptrace(PTRACE_CONT, _pid, NULL, NULL);
+}
+
 int Coredump::VerifyFileHeader(Lz4Stream& in)
 {
     int rc;
@@ -1443,6 +1458,9 @@ int Coredump::takememspace()
  */
 int Coredump::generate(const char *corefile)
 {
+    // 每次采集前清空跨调用累积的 _phdrs（SIGUSR1 forkcore_m 后再崩溃会写陈旧 phdr）
+    _phdrs.clear();
+    _core_pid = 0;
     int rc = 0;
     Lz4Stream out(Lz4Stream::LZ4_Compress);
     rc = out.Open(corefile);
@@ -1486,6 +1504,9 @@ int Coredump::generate(const char *corefile)
 
 int Coredump::forkcore(const char *corefile, bool sys_core)
 {
+    // 每次采集前清空跨调用累积的 _phdrs
+    _phdrs.clear();
+    _core_pid = 0;
     /* forkcore using a forked process for large memory dump, 
      * and all thread Registers Set is collected by this function.
      * 
@@ -1544,6 +1565,9 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // 目标 libc 无法解析（无节表/符号缺失）：fail-closed，
         // 避免用垃圾地址远程执行破坏目标内存。
         error("failed to resolve libc symbols in target (libc base %lx)", r_libc);
+        // 目标已被 pt_attach/pt_int + collect_threads 停住/attach：先还原再失败，
+        // 否则 monitor 场景下兄弟线程永久冻结、leader 无法恢复。
+        restore_target_after_fail();
         return -1;
     }
     info("remote mmap at %lx", r_mmap);
@@ -1638,6 +1662,9 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
  */ 
 int Coredump::forkcore_m(const char *corefile, bool sys_core)
 {
+    // 每次采集前清空跨调用累积的 _phdrs
+    _phdrs.clear();
+    _core_pid = 0;
     /* forkcore using a forked process for large memory dump, 
      * and all thread Registers Set is collected by this function.
      * 
@@ -1696,6 +1723,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // 目标 libc 无法解析（无节表/符号缺失）：fail-closed，
         // 避免用垃圾地址远程执行破坏目标内存。
         error("failed to resolve libc symbols in target (libc base %lx)", r_libc);
+        // 目标已被 pt_attach/pt_int + collect_threads 停住/attach：先还原再失败，
+        // 否则 monitor 场景下兄弟线程永久冻结、leader 无法恢复。
+        restore_target_after_fail();
         return -1;
     }
     info("remote mmap at %lx", r_mmap);
@@ -1779,7 +1809,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // assert(rc == 0);
 
     // in case any signal generated above
-    int s, sig = 0;
+    // 目标可能仍被 SIGUSR1 的 forkcore_m 停住；s 未初始化会被 WIFSIGNALED/WIFSTOPPED 误读
+    int s = 0, sig = 0;
     waitpid(_pid, &s, WNOHANG);
     // tracee will be killed if signaled on termination (SIGKILL)
     // arthur will exit here
@@ -1882,7 +1913,10 @@ int Coredump::monitor(const char* corefile)
                 exit_sig = status;
                 break;
             } else { // relay signals to tracee
-                ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) status);
+                // 中继目标用 sig_info.si_pid：TRACEFORK 自动 attach 的子进程
+                // 或非 leader 线程的停靠，si_pid 才是正确的恢复目标；固定 _pid
+                // 会恢复错误线程，让真正的停靠者永久冻结（问题2）。
+                ptrace(PTRACE_CONT, sig_info.si_pid, NULL, (uintptr_t) status);
             }
             signal_forkcore = 0; // reset signal 
         } else { 
