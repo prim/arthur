@@ -895,8 +895,20 @@ int Note::fill_arm_sve(const ThreadData& thr)
     return -1; 
 }
 
-Coredump::Coredump(pid_t pid) 
-    : _pid(pid)
+Coredump::Coredump(pid_t pid)
+    : _pid(pid),
+      _core_pid(0),
+      // B34: _arch 之前未初始化。WriteThreadMeta 用 `_arch == ARCH_X64` 决定
+      // 是否写 xstate——未初始化时若非 0 会跳过 xstate，而 ReadMeta 按 acore
+      // 头 arch 仍读 xstate → 块错位。采集侧统一按编译平台设置。
+#ifdef __aarch64__
+      _arch(ARCH_AARCH64),
+#else
+      _arch(ARCH_X64),
+#endif
+      _ehdr(),
+      _note_phdr(),
+      _offset_load(0)
 {
 
 }
