@@ -311,6 +311,9 @@ private:
     // 采集失败（fail-closed）时还原目标：detach 兄弟线程、resume leader、
     // 清空线程列表。monitor 场景下失败后目标必须能继续运行。
     void restore_target_after_fail();
+    // 释放 decompress 路径的堆分配（B50：GetFile ProcFiles / decoders /
+    // 线程 _d_stat / Note 对象），避免一次性泄漏。
+    void cleanup_decompress();
 private:
     pid_t _pid;             // target pid
     pid_t _core_pid;        // forked core's pid

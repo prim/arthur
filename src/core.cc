@@ -2098,6 +2098,7 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         error("read elf header failed, core incomplete");
         fclose(fout);
         in.Close();
+        cleanup_decompress();
         return -1;
     }
     fseek(fout, p_elf, SEEK_SET);
@@ -2105,8 +2106,37 @@ int Coredump::decompress(const char* in_file, const char* out_core)
 
     in.Close();
     fclose(fout);
+    cleanup_decompress();
     info("saved corefile '%s'.", out_core);
     return 0;
+}
+
+// B50: decompress 一次性泄漏——GetFile 的 ProcFiles、ParseAll 的 decoders、
+// 线程 _d_stat、GenerateNotes 的 Note 对象均未释放。按依赖顺序清理。
+void Coredump::cleanup_decompress()
+{
+    for (Note* nt : _notes) {
+        delete nt;      // ~Note 释放 _data
+    }
+    _notes.clear();
+
+    if (_process._d_maps) { delete _process._d_maps; _process._d_maps = NULL; }
+    if (_process._d_cmdline) { delete _process._d_cmdline; _process._d_cmdline = NULL; }
+    if (_process._d_auxv) { delete _process._d_auxv; _process._d_auxv = NULL; }
+    for (auto& t : _process._threads) {
+        if (t._d_stat) { delete t._d_stat; t._d_stat = NULL; }
+        if (t._stat) { free(t._stat); t._stat = NULL; }   // GetFile malloc'd
+    }
+
+    ProcFile* pfs[] = { _process._cmdline, _process._auxv, _process._maps,
+                        _process._environ, _process._io, _process._limits };
+    for (ProcFile* pf : pfs) {
+        if (pf) {
+            free(pf);
+        }
+    }
+    _process._cmdline = _process._auxv = _process._maps = NULL;
+    _process._environ = _process._io = _process._limits = NULL;
 }
 
 int Coredump::test_compress(const char* in_file, const char* out_file)
