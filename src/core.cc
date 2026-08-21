@@ -380,7 +380,7 @@ static inline int pt_getregs(pid_t pid, user_regs64_struct *pregs)
     rc = ptrace(PTRACE_GETREGS, pid, NULL, pregs);
 #endif
 
-    assert(rc == 0);
+    // B30: 不 assert，失败由调用方（WriteThreadMeta）处理，避免线程退出时 abort
     return rc;
 }
 
@@ -398,7 +398,7 @@ static inline int pt_getfpregs(pid_t pid, user_fpregs64_struct *pregs)
     rc = ptrace(PTRACE_GETFPREGS, pid, NULL, pregs);
 #endif
 
-    assert(rc == 0);
+    // B30: 不 assert，失败由调用方处理
     return rc;
 }
 
@@ -429,7 +429,7 @@ static inline int pt_getxstateregs(pid_t pid, x64_xstatereg *pregs)
     iov.iov_len = sizeof(x64_xstatereg);
     rc = ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &iov);
 
-    assert(rc == 0);
+    // B30: 不 assert，失败由调用方处理
     return rc;
 }
 
@@ -563,28 +563,24 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
 
 static inline int pt_write(pid_t pid, uint64_t dest, void *src, size_t len)
 {
-    int rc;
+    // B31: 原实现写硬编码 inject_fork 而非参数 src——当前调用者恰好都传
+    // inject_fork 才没暴露。改用 pwrite（避免 lseek+write 的偏移竞态）并
+    // 检查写全。
     char pbuf[128];
     snprintf(pbuf, sizeof(pbuf), "/proc/%u/mem", pid);
     int fd = open(pbuf, O_RDWR);
-    assert(fd > 2);
-    lseek(fd, (uint64_t)dest, SEEK_SET);
-    rc = write(fd, (void *)inject_fork, len);
-
-#if 0
-    char buf[64];
-    lseek(fd, (uint64_t)dest, SEEK_SET);
-    rc = read(fd, buf, len); 
-
-    int i;
-    for (i=0; i< inject_size; i++) {
-        printf("%02x ", (unsigned char)buf[i]);
+    if (fd < 0) {
+        error("open %s failed", pbuf);
+        return -1;
     }
-    printf("\n");
-#endif
-    
+    ssize_t rc = pwrite(fd, src, len, dest);
+    if (rc != (ssize_t)len) {
+        error("write mem(%lx) of %d failed(%d).", dest, pid, errno);
+        close(fd);
+        return -1;
+    }
     close(fd);
-    return rc;
+    return 0;
 }
 
 static inline int pt_attach(pid_t pid)
