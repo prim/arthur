@@ -1692,6 +1692,12 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
+            // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
+            // 0（syscall-restart 覆盖注入后 ret 到 0 fault）。fail-closed 前
+            // 恢复注入前的完整寄存器（含 rip/rsp/syscall 参数），CONT(0) 抑制
+            // 该 SIGSEGV 后目标从原 syscall 指令继续，不再崩溃。仅靠
+            // restore_target_after_fail 的 CONT(0) 会让 rip=0 立即重新 fault。
+            pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             return -1;
         }
@@ -1861,6 +1867,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
+            // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
+            // 0（syscall-restart 覆盖注入后 ret 到 0 fault）。fail-closed 前
+            // 恢复注入前的完整寄存器（含 rip/rsp/syscall 参数），CONT(0) 抑制
+            // 该 SIGSEGV 后目标从原 syscall 指令继续，不再崩溃。仅靠
+            // restore_target_after_fail 的 CONT(0) 会让 rip=0 立即重新 fault。
+            pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             return -1;
         }
