@@ -19,12 +19,6 @@
 #include <dlfcn.h>      // dlsym
 #include <dirent.h>     // readdir
 
-// PTRACE_GETOPTIONS 不在本系统的 sys/ptrace.h（仅 PT_SETOPTIONS 可用）。
-// 用裸请求号 0x4200 + 显式 enum cast 调用（B39 需要读现有 options）。
-static inline long pt_getoptions(pid_t pid) {
-    return ptrace((enum __ptrace_request)0x4200, pid, NULL, NULL);
-}
-
 #include <sstream>
 #include <iterator>
 
@@ -949,7 +943,8 @@ Coredump::Coredump(pid_t pid)
 #endif
       _ehdr(),
       _note_phdr(),
-      _offset_load(0)
+      _offset_load(0),
+      _ptrace_options(0)
 {
 
 }
@@ -1626,11 +1621,10 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // B39: SETOPTIONS 是整体替换——直接设 TRACEFORK 会清掉 pt_monitor 设的
     // TRACEEXIT，monitor 的退出检测降级。GET 现有选项后 OR 上 TRACEFORK。
     if (!sys_core) {
-        long opts = pt_getoptions(_pid);
-        if (opts < 0) {
-            opts = 0;
-        }
-        rc = ptrace(PTRACE_SETOPTIONS, _pid, 0, opts | PTRACE_O_TRACEFORK);
+        // 用跟踪的 _ptrace_options（pt_monitor 设的 TRACEEXIT）叠加 TRACEFORK，
+        // 避免整体替换清掉 TRACEEXIT（B39）。
+        rc = ptrace(PTRACE_SETOPTIONS, _pid, 0,
+                    _ptrace_options | (long)PTRACE_O_TRACEFORK);
         assert(rc == 0);
     }
 
@@ -1799,11 +1793,10 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // B39: SETOPTIONS 是整体替换——直接设 TRACEFORK 会清掉 pt_monitor 设的
     // TRACEEXIT，monitor 的退出检测降级。GET 现有选项后 OR 上 TRACEFORK。
     if (!sys_core) {
-        long opts = pt_getoptions(_pid);
-        if (opts < 0) {
-            opts = 0;
-        }
-        rc = ptrace(PTRACE_SETOPTIONS, _pid, 0, opts | PTRACE_O_TRACEFORK);
+        // 用跟踪的 _ptrace_options（pt_monitor 设的 TRACEEXIT）叠加 TRACEFORK，
+        // 避免整体替换清掉 TRACEEXIT（B39）。
+        rc = ptrace(PTRACE_SETOPTIONS, _pid, 0,
+                    _ptrace_options | (long)PTRACE_O_TRACEFORK);
         assert(rc == 0);
     }
 
@@ -1941,16 +1934,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 后续每个 fork 的子进程都被自动 attach+SIGSTOP 冻结（实证：state=t、
     // TracerPid=arthur）。SETOPTIONS 需 tracee 停止——此刻 leader 刚被 pt_attach
     // 停住，是清除的正确时机（放在 pt_cont 之前）。只清 TRACEFORK，保留
-    // pt_monitor 设的 TRACEEXIT（GET+AND NOT，避免 SETOPTIONS(0) 全清）。
-    long opts = pt_getoptions(_pid);
-    if (opts >= 0) {
-        opts &= ~((long)PTRACE_O_TRACEFORK);
-        rc = ptrace(PTRACE_SETOPTIONS, _pid, 0, opts);
-        if (rc != 0) {
-            error("clear TRACEFORK on %d failed", _pid);
-        }
-    } else {
-        error("get options on %d failed", _pid);
+    // 恢复 pt_monitor 设的 TRACEEXIT（去掉 TRACEFORK）——用跟踪的 _ptrace_options，
+    // 避免 SETOPTIONS(0) 全清（B39）。
+    rc = ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
+    if (rc != 0) {
+        error("clear TRACEFORK on %d failed", _pid);
     }
     if(!WIFSTOPPED(s)) {
         pt_cont(_pid);
@@ -1986,7 +1974,9 @@ int Coredump::monitor(const char* corefile)
     // write acore
     WriteFileHeader(out);
 
-    pt_monitor(_pid);    
+    pt_monitor(_pid);
+    // B39: 内核无 GETOPTIONS，arthur 自己跟踪设过的 options
+    _ptrace_options = PTRACE_O_TRACEEXIT;
     info("Launched in monitor mode");
 
     // block all signals

@@ -318,6 +318,10 @@ private:
     pid_t _pid;             // target pid
     pid_t _core_pid;        // forked core's pid
     int _arch;              // ARCHTYPE
+    // 内核没有 PTRACE_GETOPTIONS；arthur 需要自己跟踪给目标设过的 ptrace
+    // options（pt_monitor 设 TRACEEXIT，forkcore_m 临时叠加 TRACEFORK），
+    // 以便在清除 TRACEFORK 时把 TRACEEXIT 恢复回去（B39）。
+    long _ptrace_options;
 
     // TBD: move to acore or corefile class. 
     ProcessData _process;   // process data
