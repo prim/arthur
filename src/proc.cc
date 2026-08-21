@@ -110,24 +110,34 @@ int ProcDecoder::readline(int& cur, char *out, size_t n)
 int ProcMaps::Parse()
 {
     char perm[16];
-    char name[128];
-    char line[256];
-    
-    int cur = 0; 
+    char name[PATH_MAX];
+    char line[PATH_MAX];
+
+    int cur = 0;
     while (readline(cur, line, sizeof(line))) {
         //printf("%s\n", line);
         MemRegion r = {};
         name[0] = 0;
-        sscanf(line, "%lx-%lx %4s %8lx %x:%x %lu %s", 
-                &r.start_addr, 
+        int consumed = 0;
+        sscanf(line, "%lx-%lx %4s %8lx %x:%x %lu %n",
+                &r.start_addr,
                 &r.end_addr,
                 perm,
                 &r.offset,
                 &r.dev_major,
                 &r.dev_minor,
                 &r.inode,
-                name);
-        
+                &consumed);
+        // maps 第 6 列后的路径可能含空格或 (deleted) 后缀；%s 会截断，
+        // 用 %n 定位 inode 字段结束位置，取剩余整行为映射名。
+        if (consumed > 0 && consumed < (int)sizeof(line)) {
+            const char *path = line + consumed;
+            while (*path == ' ' || *path == '\t') {
+                path++;
+            }
+            snprintf(name, sizeof(name), "%s", path);
+        }
+
         // decode perm bits
         if (perm[0] == 'r') {
             r.perms |= PF_R;
