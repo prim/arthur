@@ -774,9 +774,15 @@ int Note::fill_prpsinfo(const ProcessData& proc)
 // NT_AUXV
 int Note::fill_auxv(const ProcessData& proc)
 {
+    // B56: 损坏 acore 使 GetFile 返回 NULL（size 前缀截断 / size>64MB 上限）时
+    // _auxv 为 NULL，直接 ->f_size 解引用崩溃。
+    if (!proc._auxv || proc._auxv->f_size == 0) {
+        error("auxv missing (corrupt acore)");
+        return -1;
+    }
     char *info = allocate(proc._auxv->f_size);
     memcpy(info, proc._auxv->f_data, proc._auxv->f_size);
-    return 0; 
+    return 0;
 }
 
 // NT_FILE

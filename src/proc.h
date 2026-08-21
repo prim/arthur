@@ -215,7 +215,13 @@ struct ProcStat : public ProcDecoder {
     unsigned long pending;
     unsigned long blocked;
 
-    ProcStat(ProcFile* pf) : ProcDecoder(pf) {};
+    // B56: 字段必须零初始化——auxv/stat 数据缺失或截断时 Parse() 提前返回
+    // 不设置字段，fill_prstatus/prpsinfo 会把未初始化值写进 note（垃圾 pr_pid/pr_uid）。
+    // 注意不能用 memset(this,...)——那会清掉基类 ProcDecoder 的 _pf。
+    ProcStat(ProcFile* pf)
+        : ProcDecoder(pf), state(0), sname(0), pid(0), ppid(0), pgid(0), sid(0),
+          stime(0), utime(0), cstime(0), cutime(0), vsize(0), rss(0),
+          num_threads(0), flags(0), nice(0), pending(0), blocked(0) {}
     int Parse();
 };
 
@@ -224,13 +230,15 @@ struct ProcStat : public ProcDecoder {
  * LD_SHOW_AUXV=1 ls
  */
 struct ProcAuxv : public ProcDecoder {
-    
+
     uint32_t uid;
     uint32_t gid;
     uint32_t euid;
     uint32_t egid;
 
-    ProcAuxv(ProcFile* pf) : ProcDecoder(pf) {};
+    // B56: uid/gid/euid/egid 零初始化——auxv 缺失/截断时 Parse 不设置，fill_prpsinfo 读垃圾。
+    ProcAuxv(ProcFile* pf)
+        : ProcDecoder(pf), uid(0), gid(0), euid(0), egid(0) {}
     int Parse();
 };
 
