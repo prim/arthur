@@ -1035,19 +1035,20 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     int rc;
 
     // 线程由调用方预先 attach（collect_threads）；此处只读寄存器。
-    // 读失败（线程可能在 attach 后退出）则跳过，不写不完整块。
-
-    // 先读全部寄存器，全部成功才写块，避免读到一半失败写出不完整块
-    ThreadData i;
+    // 读失败（线程可能在 attach 与 SIGSTOP 生效间退出）时不能跳过——meta 的
+    // thread_num 已按 _thrd_pid.size() 写入，缺块会让解压端按 thread_num 读到
+    // 下一个 LOADS/ELF 块当 THREAD 块，整体错位。改为写零化块保持计数一致
+    // （该线程现场确已消失，零寄存器是诚实近似）。
+    ThreadData i;   // 构造器 memset 为零
     rc = pt_getregs(pid, (user_regs64_struct*)&i._regs);
-    if (rc != 0) { error("getregs thread %d failed", pid); return -1; }
+    if (rc != 0) { warn("getregs thread %d failed, zeroed block", pid); }
     rc = pt_getfpregs(pid, (user_fpregs64_struct*)&i._fpregs);
-    if (rc != 0) { error("getfpregs thread %d failed", pid); return -1; }
+    if (rc != 0) { warn("getfpregs thread %d failed, zeroed block", pid); }
     rc = ptrace(PTRACE_GETSIGINFO, pid, 0, &i._siginfo);
-    if (rc != 0) { error("getsiginfo thread %d failed", pid); return -1; }
+    if (rc != 0) { warn("getsiginfo thread %d failed, zeroed block", pid); }
     if (_arch == ARCH_X64) {
         rc = pt_getxstateregs(pid, (x64_xstatereg*)&i._xstate);
-        if (rc != 0) { error("getxstateregs thread %d failed", pid); return -1; }
+        if (rc != 0) { warn("getxstateregs thread %d failed, zeroed block", pid); }
     }
 
     // write thread meta
@@ -1070,10 +1071,18 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     }
 
     out.Flush();
-    // read /proc/<pid>/stat
+    // read /proc/<pid>/stat；读失败时写最小合法 ProcFile（f_size=0），
+    // 避免把未初始化 buf 当 ProcFile 写出（解压端 GetFile 读垃圾 size）。
     char buf[BUFFER_SIZE];
-    ProcFile::ReadPid(buf, BUFFER_SIZE, pid, PROC_TYPE_STAT);
-    out.PutFile((ProcFile*) buf);
+    ProcFile *pf = ProcFile::ReadPid(buf, BUFFER_SIZE, pid, PROC_TYPE_STAT);
+    if (!pf) {
+        warn("read /proc/%d/stat failed, empty stat", pid);
+        memset(buf, 0, sizeof(ProcFile));
+        pf = (ProcFile*)buf;
+        pf->f_pid = pid;
+        pf->f_type = PROC_TYPE_STAT;
+    }
+    out.PutFile(pf);
 
     return 0;
 }
