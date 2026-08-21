@@ -100,6 +100,12 @@ int ProcDecoder::readline(int& cur, char *out, size_t n)
     }
     
     int len = q - p;
+
+    // B27: 原实现 `memcpy(out, p, len)` 不按 n 截断，maps 行长于调用方缓冲
+    // （ProcMaps 用 PATH_MAX=128）即栈溢出。这里截断到 n-1 保留 NUL 位置。
+    if (len >= (int)n) {
+        len = (int)n - 1;
+    }
     memcpy(out, p, len);
     out[len] = '\0';
 
@@ -118,9 +124,12 @@ int ProcDecoder::readline(int& cur, char *out, size_t n)
 
 int ProcMaps::Parse()
 {
+    // B27: PATH_MAX 在 inc.h 被压到 128，真实映射路径（深容器/长库名）会超，
+    // 既有 readline 溢出风险又有路径截断。行缓冲与名字缓冲提到 4096。
+    const int MAPS_BUF = 4096;
     char perm[16];
-    char name[PATH_MAX];
-    char line[PATH_MAX];
+    char name[MAPS_BUF];
+    char line[MAPS_BUF];
 
     int cur = 0;
     while (readline(cur, line, sizeof(line))) {
@@ -243,28 +252,37 @@ int ProcStat::Parse()
 
 int ProcAuxv::Parse()
 {
-    uint64_t *vec = (uint64_t*)_pf->f_data;
-    for (int i=0; i < (int)(_pf->f_size / 8); i+=2) {
-        switch (vec[i]) {
+    // B28: ProcFile 是 #pragma pack(1)，f_data 在偏移 9（未对齐）；直接
+    // (uint64_t*) 解引用在 aarch64 上可能 fault。用 memcpy 逐对读。
+    if (!_pf) {
+        return 0;
+    }
+    const char* base = _pf->f_data;
+    size_t count = _pf->f_size / 8;
+    for (size_t i = 0; i + 1 < count; i += 2) {
+        uint64_t type, val;
+        memcpy(&type, base + i * 8, 8);
+        memcpy(&val, base + (i + 1) * 8, 8);
+        switch (type) {
             case AT_NULL:
                 // end mark
                 return 0;
                 break;
 
             case AT_UID:
-                uid = vec[i+1];
+                uid = (uint32_t)val;
                 break;
-           
+
             case AT_GID:
-                gid = vec[i+1];
+                gid = (uint32_t)val;
                 break;
-            
+
             case AT_EUID:
-                euid = vec[i+1];
+                euid = (uint32_t)val;
                 break;
-            
+
             case AT_EGID:
-                egid = vec[i+1];
+                egid = (uint32_t)val;
                 break;
         }
     }
