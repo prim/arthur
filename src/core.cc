@@ -15,6 +15,7 @@
 #include <memory.h>
 #include <assert.h>
 #include <fcntl.h>      // open
+#include <errno.h>      // errno (PEEKDATA 判读)
 #include <dlfcn.h>      // dlsym
 #include <dirent.h>     // readdir
 
@@ -401,6 +402,23 @@ static inline int pt_getfpregs(pid_t pid, user_fpregs64_struct *pregs)
     return rc;
 }
 
+// write all fp registers (B3：注入后恢复被被调函数践踏的 FP/SIMD)
+static inline int pt_setfpregs(pid_t pid, user_fpregs64_struct *pregs)
+{
+    int rc;
+
+#ifdef __aarch64__
+    struct iovec iov;
+    iov.iov_base = pregs;
+    iov.iov_len = sizeof(user_fpregs64_struct);
+    rc = ptrace(PTRACE_SETREGSET, pid, NT_FPREGSET, &iov);
+#else
+    rc = ptrace(PTRACE_SETFPREGS, pid, NULL, pregs);
+#endif
+
+    return rc;
+}
+
 // read all xstate registers (x64)
 static inline int pt_getxstateregs(pid_t pid, x64_xstatereg *pregs)
 {
@@ -446,10 +464,28 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     rc = pt_getregs(pid, &regs);
     assert(rc == 0);
 
+    // B3: 注入会跑真实 libc 函数，按 SysV ABI 践踏 caller-saved 的 FP/SIMD
+    // 寄存器；监控型 dump 后目标继续运行会读到垃圾 xmm。先保存，结束恢复。
+    user_fpregs64_struct fpregs;
+    rc = pt_getfpregs(pid, &fpregs);
+    assert(rc == 0);
+
     // simulate call instruction
 #ifdef __aarch64__
     regs.regs[30] = 0;
 #else
+    // B3: [rsp-8] 是目标真实调用帧的返回地址槽位。原实现写 0 后永不恢复，
+    // saved_regs 只恢复 rsp 寄存器不恢复该内存——帧返回时 rip=0 → 目标崩。
+    // 先 PEEKDATA 保存原字，注入结束后写回。
+    uint64_t inject_rsp = regs.rsp - 8;
+    int stack_saved = 0;
+    uint64_t orig_stack_word = 0;
+    errno = 0;
+    long peeked = ptrace(PTRACE_PEEKDATA, pid, inject_rsp, NULL);
+    if (errno == 0) {
+        stack_saved = 1;
+        orig_stack_word = (uint64_t)peeked;
+    }
     regs.rsp -= 8;
     rc = ptrace(PTRACE_POKEDATA, pid, regs.rsp, 0);
     assert(rc == 0);
@@ -508,6 +544,19 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     if (oregs) {
         pt_getregs(pid, oregs);
     }
+
+    // B3: 恢复被注入践踏的状态。ret 已把 rsp 还原，[inject_rsp] 仍存 0；
+    // 写回原返回地址字，并恢复 FP/SIMD。
+#ifdef __aarch64__
+    // 无 [rsp-8] 模拟；仅恢复 FP
+    pt_setfpregs(pid, &fpregs);
+#else
+    if (stack_saved) {
+        errno = 0;
+        ptrace(PTRACE_POKEDATA, pid, inject_rsp, (void*)orig_stack_word);
+    }
+    pt_setfpregs(pid, &fpregs);
+#endif
 
     return rc;
 }
