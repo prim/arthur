@@ -89,7 +89,9 @@ int ProcDecoder::readline(int& cur, char *out, size_t n)
     }
 
     const char* p = _pf->f_data + cur;
-    const char* end = p + _pf->f_size;
+    // B36: 原实现 `end = p + f_size` 把结束指针放到 f_data+cur+f_size，
+    // 扫描/拷贝越过缓冲 cur 字节（ASAN 模糊测试确认堆越界）。
+    const char* end = _pf->f_data + _pf->f_size;
     const char* q = p;
 
     // find '\n'
@@ -181,39 +183,90 @@ int ProcMaps::Parse()
 
 int ProcCmdline::Parse()
 {
-    for (const char *p = _pf->f_data; p<(_pf->f_data + _pf->f_size);) {
-        // printf("%s\n", p);
-        argv.push_back(p);
-
-        // next string
-        while(*p++); 
+    // B37: 原实现 std::string(p) 依赖 strlen——损坏 acore 的 cmdline 数据无 NUL
+    // 终止时越界读。改用显式长度构造，并限定扫描范围。
+    if (!_pf) {
+        return 0;
     }
-    
+    const char* end = _pf->f_data + _pf->f_size;
+    const char* p = _pf->f_data;
+    while (p < end) {
+        const char* q = p;
+        while (q < end && *q) {
+            q++;
+        }
+        argv.push_back(std::string(p, (size_t)(q - p)));
+        if (q >= end) {
+            break;   // 无 NUL 终止（损坏数据）：结束
+        }
+        p = q + 1;
+    }
+
     return argv.size();
 }
 
 int ProcStat::Parse()
 {
-#define BUF_MAX (1024) 
-    char buf[BUF_MAX];
-    char *array[64] = {0};
-    
-    assert(_pf->f_size < BUF_MAX);
-
-    memcpy(buf, _pf->f_data, _pf->f_size);
-    buf[_pf->f_size] = '\0'; 
-
-    int i = 0;
-    char *p = strtok(buf, " ");
-    while(p) {
-        if (i > ((int)ARRAYSIZE(array) - 1)) {
-            break;
-        }
-        array[i++] = p;
-        p = strtok(NULL, " ");
+    // B18/B37: stat 解析要同时防"字段不足崩溃"与"comm 含空格字段错位"。
+    // /proc/<pid>/stat 格式 `pid (comm) state ppid ...`——comm 可能含空格/括号，
+    // strtok 按空格切分会把字段整体错位。正确做法：取第一个 '(' 与最后一个 ')'，
+    // '(' 前是 pid，')' 后才是真正按空格切的字段。字段不足时用 fld() 兜底 "0"。
+    if (!_pf) {
+        return 0;
     }
 
-    sname = array[2][0]; 
+    char buf[1024];
+    size_t n = _pf->f_size;
+    if (n >= sizeof(buf)) {
+        n = sizeof(buf) - 1;   // 防越界，替代原 assert
+    }
+    memcpy(buf, _pf->f_data, n);
+    buf[n] = '\0';
+
+    char *array[64] = {0};
+    int fields = 0;
+
+    char *open = strchr(buf, '(');
+    char *close = open ? strrchr(open, ')') : NULL;
+    if (open && close) {
+        // pid 在 '(' 之前
+        *open = '\0';
+        char *tok = strtok(buf, " ");
+        if (tok) {
+            array[fields++] = tok;        // array[0] = pid
+        }
+        // array[1] 保留为 comm（不解析，保持索引与注释一致）
+        // ')' 之后的字段：state ppid ...
+        char *rest = close + 1;
+        while (*rest == ' ') rest++;
+        tok = strtok(rest, " ");
+        int idx = 2;                      // array[2] = state, array[3] = ppid ...
+        while (tok) {
+            if (idx >= (int)ARRAYSIZE(array) - 1) {
+                break;
+            }
+            array[idx++] = tok;
+            tok = strtok(NULL, " ");
+        }
+        fields = idx;
+    } else {
+        // 无括号：退化为空格切分（字段可能错位，但保证不崩溃）
+        char *tok = strtok(buf, " ");
+        while (tok) {
+            if (fields >= (int)ARRAYSIZE(array) - 1) {
+                break;
+            }
+            array[fields++] = tok;
+            tok = strtok(NULL, " ");
+        }
+    }
+
+    // 字段缺失时返回 "0" 而非 NULL，避免 strtol/解引用崩溃
+    auto fld = [&](int idx) -> const char* {
+        return (idx >= 0 && idx < fields && array[idx]) ? array[idx] : "0";
+    };
+
+    sname = fld(2)[0];
     switch (sname) {
         case 'R': state=0; break;
         case 'S': state=1; break;
@@ -223,31 +276,30 @@ int ProcStat::Parse()
         case 'W': state=5; break;
     }
 
-    pid = strtol(array[0], NULL, 10);
-    ppid = strtol(array[3], NULL, 10);
-    pgid = strtol(array[4], NULL, 10);
-    sid = strtol(array[5], NULL, 10);
+    pid = strtol(fld(0), NULL, 10);
+    ppid = strtol(fld(3), NULL, 10);
+    pgid = strtol(fld(4), NULL, 10);
+    sid = strtol(fld(5), NULL, 10);
 
     /* kernel uses jiffies, here changed to MS
      */
-    utime = strtoul(array[13], NULL, 10);
-    stime = strtoul(array[14], NULL, 10);
-    cutime = strtoul(array[15], NULL, 10);
-    cstime = strtoul(array[16], NULL, 10);
+    utime = strtoul(fld(13), NULL, 10);
+    stime = strtoul(fld(14), NULL, 10);
+    cutime = strtoul(fld(15), NULL, 10);
+    cstime = strtoul(fld(16), NULL, 10);
 
     /* kernel task_vsize, PAGESIZE * mm->total_vm
      */
-    vsize = strtoul(array[22], NULL, 10) / 1024;
-    
+    vsize = strtoul(fld(22), NULL, 10) / 1024;
+
     /* kernel mm_struct, rss is anon_rss + file_rss pages
      */
-    rss = strtoul(array[23], NULL, 10) * PAGE_SIZE / 1024;
+    rss = strtoul(fld(23), NULL, 10) * PAGE_SIZE / 1024;
 
     // num_threads
-    num_threads = strtoul(array[19], NULL, 10);
-    
+    num_threads = strtoul(fld(19), NULL, 10);
+
     return 0;
-#undef BUF_MAX  
 }
 
 int ProcAuxv::Parse()
