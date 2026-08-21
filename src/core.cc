@@ -110,44 +110,50 @@ void debugstr(std::string a)
         printf("\n");
 }
 
-// function for get module base address 
+// function for get module base address
 uint64_t get_module_address(pid_t pid, const char* so_path)
 {
-    char line[PATH_MAX];
-    char base[PATH_MAX];
-    char name[PATH_MAX];
+    // B53: PATH_MAX 在 inc.h 被压到 128，深容器/长路径的 maps 行会被 fgets 截断，
+    // "libc" 出现在截断点之后 → 找不到 → B11 符号解析失败。缓冲提到 4096。
+    const int MAPS_BUF = 4096;
+    char line[MAPS_BUF];
+    char base[MAPS_BUF];
+    char name[MAPS_BUF];
     uint64_t r_addr = 0;
     size_t cur, start;
 
-    // this proc 
+    // this proc
     if (pid == -1) {
         pid = getpid();
     }
 
     snprintf(name, sizeof(name), "/proc/%u/maps", pid);
     FILE *f = fopen(name, "r");
+    if (!f) {
+        return 0;
+    }
     while (!feof(f)) {
-        // read line 
-        fgets(line, PATH_MAX, f);
+        // read line
+        fgets(line, sizeof(line), f);
 
-        // find path 
+        // find path
         cur = 0;
         while (line[cur] && line[cur]!='/') {
             cur++;
         }
-       
-        // not found 
+
+        // not found
         if (line[cur] != '/') {
             continue;
         }
 
-        // read file name 
+        // read file name
         start = cur;
-        while (line[cur]) {
+        while (line[cur] && (cur - start) < (sizeof(name) - 1)) {
             name[cur-start] = line[cur];
             cur++;
         }
-        name[cur-start-1] = 0;
+        name[cur-start] = 0;
         //printf("%s\n", name);
 
         // find
@@ -159,7 +165,7 @@ uint64_t get_module_address(pid_t pid, const char* so_path)
 
         // read base address
         cur = 0;
-        while (line[cur] != '-') {
+        while (line[cur] && line[cur] != '-') {
             base[cur] = line[cur];
             cur++;
         }
