@@ -891,12 +891,18 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
         ph.p_filesz = 0;    // update after pread
         ph.p_offset = file_size;
 
-        // TBD: if user request all memory. 
+        // TBD: if user request all memory.
         uint64_t end_addr = r.end_addr;
+        // 只 dump 可执行文件映射的首页以省体积，但仅当磁盘 ELF 可恢复时安全。
+        // memfd(/memfd:) 与已删除((deleted)) 映射没有磁盘文件，inode>0 不可信，
+        // 必须全量 dump，否则代码段永久缺失且 GDB 无法恢复。
+        bool file_recoverable =
+            !(r.name.rfind("(deleted)") != std::string::npos ||
+              r.name.compare(0, 7, "/memfd:") == 0);
         if (!(r.perms & PF_R)) { // not readable
             // do nothing
             continue;
-        } else if (r.inode > 0 && (r.perms & PF_X) && (ph.p_memsz > 0x1000)) {
+        } else if (r.inode > 0 && file_recoverable && (r.perms & PF_X) && (ph.p_memsz > 0x1000)) {
             // dump only the first page.
             end_addr = r.start_addr + 0x1000;
         }
