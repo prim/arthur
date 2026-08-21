@@ -456,7 +456,7 @@ static inline int pt_setregs(pid_t pid, user_regs64_struct *pregs)
     rc = ptrace(PTRACE_SETREGS, pid, NULL, pregs);
 #endif
 
-    assert(rc == 0);
+    // B57: 目标可能已退出；返回错误码让调用方 fail-closed，不再 assert。
     return rc;
 }
 
@@ -470,14 +470,16 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     assert(argc <= 6);
 
     // get origin regs
+    // B57: 目标可能在注入中途死亡（兄弟线程 SIGKILL / 自身崩溃），各 ptrace
+    // 调用返回 -ESRCH。全部改为干净返回错误，不再 assert abort。
     rc = pt_getregs(pid, &regs);
-    assert(rc == 0);
+    if (rc != 0) { error("pt_call: getregs %d failed", pid); return -1; }
 
     // B3: 注入会跑真实 libc 函数，按 SysV ABI 践踏 caller-saved 的 FP/SIMD
     // 寄存器；监控型 dump 后目标继续运行会读到垃圾 xmm。先保存，结束恢复。
     user_fpregs64_struct fpregs;
     rc = pt_getfpregs(pid, &fpregs);
-    assert(rc == 0);
+    if (rc != 0) { error("pt_call: getfpregs %d failed", pid); return -1; }
 
     // simulate call instruction
 #ifdef __aarch64__
@@ -497,7 +499,7 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     }
     regs.rsp -= 8;
     rc = ptrace(PTRACE_POKEDATA, pid, regs.rsp, 0);
-    assert(rc == 0);
+    if (rc != 0) { error("pt_call: poke [rsp-8] %d failed", pid); return -1; }
 #endif
 
     // makeup function call and arguments
@@ -528,7 +530,7 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     }
  
     rc = pt_setregs(pid, &regs);
-    assert(rc == 0);
+    if (rc != 0) { error("pt_call: setregs %d failed", pid); return -1; }
 
     // wait for a SIGSEGV
     for (;;) {
@@ -539,13 +541,17 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
             if ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8))) {
                 unsigned long msg;
                 rc = ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
-                assert(rc == 0);
+                if (rc != 0) { error("pt_call: geteventmsg %d failed", pid); return -1; }
                 dprint("child pid = %lu", msg);
-            } 
+            }
             dprint("statux = %x", status);
         }
         rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
-        assert(rc >= 0);
+        if (rc < 0) {
+            // 目标在注入过程中死亡（兄弟线程 SIGKILL 等）
+            error("pt_call: cont %d failed (%s)", pid, strerror(errno));
+            return -1;
+        }
 
         status = pt_wait(pid);
     }
@@ -610,7 +616,10 @@ static inline int pt_int(pid_t pid)
 {
     int rc;
     rc = ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
-    assert(rc == 0);
+    // B57: 目标可能已退出，INTERRUPT 返回 -ESRCH；assert 会让 monitor abort。
+    if (rc != 0) {
+        return rc;
+    }
     pt_wait(pid);
 
     return rc;
@@ -619,18 +628,30 @@ static inline int pt_int(pid_t pid)
 static inline int pt_cont(pid_t pid) {
     int rc;
     rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
-    assert(rc == 0);
-
+    // B57: 目标可能在 attach 后退出，CONT 返回 -ESRCH；assert 会让 monitor
+    // 对瞬时退出目标 abort。调用方检查 rc 或忽略（monitor 场景目标已死，无害）。
     return rc;
 }
 
 static inline int pt_monitor(pid_t pid) {
     int rc;
+    // B57: 目标可能刚好退出（瞬时进程 / 已僵尸）。SEIZE/INTERRUPT/SETOPTIONS
+    // 任一步返回 -ESRCH 都干净报错返回，不再 assert abort。
     rc = ptrace(PTRACE_SEIZE, pid, NULL, NULL);
-    assert(rc == 0);
-    pt_int(pid);
+    if (rc != 0) {
+        error("cannot seize process %d (%s)", pid, strerror(errno));
+        return -1;
+    }
+    rc = pt_int(pid);
+    if (rc != 0) {
+        error("cannot interrupt process %d (%s)", pid, strerror(errno));
+        return -1;
+    }
     rc = ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACEEXIT);
-    assert(rc == 0);
+    if (rc != 0) {
+        error("cannot set options on process %d (%s)", pid, strerror(errno));
+        return -1;
+    }
     // restart main thread
     rc = pt_cont(pid);
     return rc;
@@ -1655,7 +1676,12 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // 避免整体替换清掉 TRACEEXIT（B39）。
         rc = ptrace(PTRACE_SETOPTIONS, _pid, 0,
                     _ptrace_options | (long)PTRACE_O_TRACEFORK);
-        assert(rc == 0);
+        if (rc != 0) {
+            // B57: 目标可能在 attach/stop 后退出；fail-closed 还原，不 assert。
+            error("set TRACEFORK on %d failed (%s)", _pid, strerror(errno));
+            restore_target_after_fail();
+            return -1;
+        }
     }
 
     // 从目标进程自身 libc 的 .dynsym 解析符号地址（B11），
@@ -1689,7 +1715,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     {
         //uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
         uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
-        pt_call(_pid, &regs, r_mmap, 6, gv);
+        // B57: pt_call 失败（目标中途死亡）时不填充 regs；不检查会在下面读未初始化的
+        // inject_page 当垃圾地址继续注入。
+        if (pt_call(_pid, &regs, r_mmap, 6, gv) != 0) {
+            error("mmap injection failed (target died?)");
+            restore_target_after_fail();
+            return -1;
+        }
         info("mmap = %lx", regs.get_rc());
         inject_page = regs.get_rc();
         // B16 缓解：目标阻塞在可重启 syscall 时，syscall-restart 会覆盖注入，
@@ -1724,9 +1756,21 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
      
         pt_write(_pid, inject_page, (void *)inject_fork, inject_size);
-        pt_call(_pid, &regs, inject_page, 0, NULL);
+        // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
+        if (pt_call(_pid, &regs, inject_page, 0, NULL) != 0) {
+            error("fork injection failed (target died?)");
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
         info("child_pid = %d", (int)regs.get_rc());
         _core_pid = regs.get_rc();
+        if (_core_pid <= 0) {
+            error("fork returned implausible child %d", (int)_core_pid);
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
     }
 
     // munmap injected page.
@@ -1833,7 +1877,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // 避免整体替换清掉 TRACEEXIT（B39）。
         rc = ptrace(PTRACE_SETOPTIONS, _pid, 0,
                     _ptrace_options | (long)PTRACE_O_TRACEFORK);
-        assert(rc == 0);
+        if (rc != 0) {
+            // B57: 目标可能在 attach/stop 后退出；fail-closed 还原，不 assert。
+            error("set TRACEFORK on %d failed (%s)", _pid, strerror(errno));
+            restore_target_after_fail();
+            return -1;
+        }
     }
 
     // 从目标进程自身 libc 的 .dynsym 解析符号地址（B11），
@@ -1899,9 +1948,21 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
      
         pt_write(_pid, inject_page, (void *)inject_fork, inject_size);
-        pt_call(_pid, &regs, inject_page, 0, NULL);
+        // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
+        if (pt_call(_pid, &regs, inject_page, 0, NULL) != 0) {
+            error("fork injection failed (target died?)");
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
         info("child_pid = %d", (int)regs.get_rc());
         _core_pid = regs.get_rc();
+        if (_core_pid <= 0) {
+            error("fork returned implausible child %d", (int)_core_pid);
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
     }
 
     // munmap injected page.
@@ -2016,7 +2077,14 @@ int Coredump::monitor(const char* corefile)
     // write acore
     WriteFileHeader(out);
 
-    pt_monitor(_pid);
+    // B57: pt_monitor 失败（目标瞬时退出/无权限）时干净退出，不留空 acore。
+    rc = pt_monitor(_pid);
+    if (rc != 0) {
+        error("monitor attach failed; process %d not traced", _pid);
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
     // B39: 内核无 GETOPTIONS，arthur 自己跟踪设过的 options
     _ptrace_options = PTRACE_O_TRACEEXIT;
     info("Launched in monitor mode");
