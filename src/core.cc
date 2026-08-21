@@ -1848,9 +1848,10 @@ int Coredump::monitor(const char* corefile)
             signal_forkcore = 0; // reset signal 
         } else { 
             // signal SIGUSR1 to arthur
-            char out[17];
-            sprintf(out, "acore.%u\n", (unsigned)time(NULL));
-            out[16] = '\0';
+            // B19: 原实现 `char out[17]; sprintf(out, "acore.%u\n", ...)`——
+            // 10 位时间戳时写 18 字节（含 NUL）溢出 1 字节；格式串还带换行。
+            char out[32];
+            snprintf(out, sizeof(out), "acore.%u", (unsigned)time(NULL));
             info("writing out %s...", out);
             signal_forkcore = forkcore_m(out, false);
             info("writing out acore finished, resume monitoring");
