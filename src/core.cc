@@ -935,21 +935,37 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
 
     // put raw files
     char buf[BUFFER_SIZE];
-    ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_CMDLINE);
+    // B29: 原实现忽略 ReadPid 返回值——读失败时 NULL 传入 PutFile（NULL 解引用
+    // 崩溃）或未初始化 buf 被当 ProcFile 写出垃圾。这里逐项检查，失败即返回 -1。
+    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_CMDLINE)) {
+        error("read cmdline of %d failed", _pid); return -1;
+    }
     out.PutFile((ProcFile*) buf);
-    ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_AUXV);
+    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_AUXV)) {
+        error("read auxv of %d failed", _pid); return -1;
+    }
     out.PutFile((ProcFile*) buf);
 
     ProcFile* _maps = ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_MAPS);
+    if (!_maps) {
+        error("read maps of %d failed", _pid);
+        return -1;
+    }
     out.PutFile(_maps);
     maps.setpf(_maps);
     maps.Parse();
-    
-    ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_ENVIRON); 
+
+    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_ENVIRON)) {
+        error("read environ of %d failed", _pid); return -1;
+    }
     out.PutFile((ProcFile*) buf);
-    ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_IO); 
+    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_IO)) {
+        error("read io of %d failed", _pid); return -1;
+    }
     out.PutFile((ProcFile*) buf);
-    ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_LIMITS); 
+    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_LIMITS)) {
+        error("read limits of %d failed", _pid); return -1;
+    }
     out.PutFile((ProcFile*) buf);
 
     return 0;
