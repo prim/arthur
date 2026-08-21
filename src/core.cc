@@ -2043,6 +2043,9 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // load meta
     rc = ReadMeta(in);
     if (rc != 0) {
+        // ReadMeta 可能已分配部分 ProcFiles（cmdline/auxv/maps），
+        // 提前返回前要清理，否则损坏输入路径泄漏。
+        cleanup_decompress();
         return rc;
     }
     
@@ -2068,6 +2071,8 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     dprint("room = %d", hdr_size);
     rc = makeroom(fout, hdr_size);
     if (rc < 0) {
+        fclose(fout);
+        cleanup_decompress();
         return -1;
     } 
     long p_note = ftell(fout);
