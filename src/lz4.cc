@@ -209,7 +209,10 @@ int Lz4Stream::WriteBlock(const char *s, size_t n, BlockType t)
 
         m += rc;
         rc = Compress(block, block_hdr);
-        assert(rc > 0); 
+        if (rc <= 0) {
+            error("compress block failed (%d)", rc);
+            return -1;
+        }
 
         // more than one block
         block_hdr.prev_cont = 1;
@@ -275,10 +278,17 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     Block& block = CurrentBlock(); 
     block.Clear();
 
-    // read out block size 
+    // read out block size
     rc = fread(&hdr, 1, sizeof(hdr), _file);
-    assert(rc == sizeof(hdr));
-  
+    if (rc != (int)sizeof(hdr)) {
+        // 截断在块头边界：正常 EOF 或损坏 acore，返回 NULL 让调用方结束
+        if (rc == 0) {
+            return NULL;   // 干净 EOF
+        }
+        error("read block header failed (%d), acore truncated", rc);
+        return NULL;
+    }
+
     // tail mark
     if (hdr.isTailMark()) {
         return NULL;
@@ -330,7 +340,10 @@ int Lz4Stream::PutFile(ProcFile* pf)
 
     // write file context
     rc = WriteBlock((const char*)pf, size, BLOCK_TYPE_FILE);
-    assert(rc > 0);
+    if (rc < 0) {
+        error("write proc file block failed");
+        return rc;
+    }
 
     return rc;
 }
