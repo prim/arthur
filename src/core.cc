@@ -717,6 +717,11 @@ T* Note::allocate()
 // NT_PRPSINFO
 int Note::fill_prpsinfo(const ProcessData& proc)
 {
+    // 损坏 acore 可能让 thread_num=0 或 _d_stat 为空；_threads[0] 越界/空指针解引用
+    if (proc._threads.size() == 0 || !proc._threads[0]._d_stat || !proc._d_auxv) {
+        error("prpsinfo: missing thread/auxv metadata");
+        return -1;
+    }
     elf_prpsinfo64 *p = allocate<elf_prpsinfo64>();
 
     p->pr_state = proc._threads[0]._d_stat->state;
@@ -727,15 +732,25 @@ int Note::fill_prpsinfo(const ProcessData& proc)
     p->pr_ppid = proc._threads[0]._d_stat->ppid;
     p->pr_pgrp = proc._threads[0]._d_stat->pgid;
     p->pr_sid = proc._threads[0]._d_stat->sid;
-    strncpy(p->pr_fname, proc._d_cmdline->argv[0].c_str(), sizeof(p->pr_fname));
+
+    // B26: cmdline 为空（如内核线程/异常进程）时 argv[0] 越界。取 argv[0] 或空串。
+    std::string fname;
+    if (proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
+        fname = proc._d_cmdline->argv[0];
+    }
+    strncpy(p->pr_fname, fname.c_str(), sizeof(p->pr_fname));
+    p->pr_fname[sizeof(p->pr_fname) - 1] = '\0';
 
     const char* delim = " ";
     std::ostringstream args;
-    std::copy(proc._d_cmdline->argv.begin(), proc._d_cmdline->argv.end(),
-           std::ostream_iterator<std::string>(args, delim));
+    if (proc._d_cmdline) {
+        std::copy(proc._d_cmdline->argv.begin(), proc._d_cmdline->argv.end(),
+               std::ostream_iterator<std::string>(args, delim));
+    }
     strncpy(p->pr_psargs, args.str().c_str(), sizeof(p->pr_psargs));
+    p->pr_psargs[sizeof(p->pr_psargs) - 1] = '\0';
 
-    return 0; 
+    return 0;
 }
 
 // NT_AUXV
@@ -914,16 +929,16 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
         u32 = _process._thrd_pid.size();
         out.Write((const char*)&u32, sizeof(u32));
 
-        // time 
+        // time
         struct timeval tv;
-        struct timezone tz;
-        gettimeofday (&tv, &tz); 
+        struct timezone tz = {0};   // gettimeofday 不填 tz，避免把未初始化栈写进 acore
+        gettimeofday (&tv, &tz);
         out.Write((const char*)&tv, sizeof(tv));
         out.Write((const char*)&tz, sizeof(tz));
 
-        // uname
-        char ubuf[512];
-        uname((utsname*)ubuf); 
+        // uname（sizeof 512 只写入 ~390 字节，其余置零）
+        char ubuf[512] = {0};
+        uname((utsname*)ubuf);
         out.Write((const char*)ubuf, sizeof(ubuf));
         
         out.Flush();
