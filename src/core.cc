@@ -2097,6 +2097,7 @@ int Coredump::monitor(const char* corefile)
 
     int exit_sig = 0;
     int signal_forkcore = 0; // signal generated due to free section in forkcore
+    unsigned dump_seq = 0;   // B58: SIGUSR1 dump 单调序号，避免同秒文件名覆盖
     siginfo_t sig_info;
     while(1) {
         if(signal_forkcore) {
@@ -2154,12 +2155,15 @@ int Coredump::monitor(const char* corefile)
                 ptrace(PTRACE_CONT, sig_info.si_pid, NULL, (uintptr_t) status);
             }
             signal_forkcore = 0; // reset signal 
-        } else { 
+        } else {
             // signal SIGUSR1 to arthur
             // B19: 原实现 `char out[17]; sprintf(out, "acore.%u\n", ...)`——
             // 10 位时间戳时写 18 字节（含 NUL）溢出 1 字节；格式串还带换行。
-            char out[32];
-            snprintf(out, sizeof(out), "acore.%u", (unsigned)time(NULL));
+            // B58: 秒级 time(NULL) 做文件名，同一秒内多次 SIGUSR1 互相覆盖丢数据
+            // （实证：3 次 dump 只留 2 个文件）。加单调序号保证唯一。
+            char out[40];
+            snprintf(out, sizeof(out), "acore.%u.%u",
+                     (unsigned)time(NULL), dump_seq++);
             info("writing out %s...", out);
             signal_forkcore = forkcore_m(out, false);
             info("writing out acore finished, resume monitoring");
