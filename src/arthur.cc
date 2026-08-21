@@ -163,7 +163,10 @@ int main(int argc, char *argv[])
 
     // merge
     if (cfg.op == ARTHUR_OP_MERGE) {
-         
+        // merge 未实现（Coredump::merge 只有声明）。避免静默成功误导调用方。
+        error("merge (-m) not implemented yet; mode 2 outputs a metadata file that "
+              "cannot be merged into a final GNU corefile");
+        return -1;
     }
 
     if (argc == optind) {
