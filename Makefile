@@ -7,7 +7,7 @@ ifeq ($(ARCH), aarch64)
 else
 	LIBRARY = -llz4-x64
 endif
-LDFLAGS += -Wl,--gc-sections -Wl,--as-needed -Llib $(LIBRARY) -ldl 
+LDFLAGS += -Wl,--gc-sections -Wl,--as-needed -Llib $(LIBRARY) -ldl -no-pie 
 
 GIT_VERSION := $(shell git describe --abbrev=6 --dirty --always --tags)
 
