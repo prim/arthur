@@ -345,11 +345,24 @@ ProcFile* Lz4Stream::GetFile()
     // TBD: remove the Raw Size
     // readout the file size
     rc = ReadRaw((char*)&size, sizeof(size));
-    assert(rc > 0);
-    
+    if (rc != (int)sizeof(size)) {
+        error("read proc file size failed");
+        return NULL;
+    }
+
+    // B23: size 来自 acore 可构造为任意 32 位值；malloc(huge) 会 OOM/巨量分配。
+    // 合法 /proc 文件不会超过 64MB（真实进程 maps 最多几 MB）。超限拒绝。
+    if (size > 64*1024*1024) {
+        error("proc file size %u exceeds sanity cap, acore corrupt", size);
+        return NULL;
+    }
+
     // malloc
     ProcFile *pf = (ProcFile*)malloc(size);
-    assert(pf);
+    if (!pf) {
+        error("out of memory reading proc file (%u bytes)", size);
+        return NULL;
+    }
 
     // read out the file
     BlockHeader hdr;
@@ -361,9 +374,17 @@ ProcFile* Lz4Stream::GetFile()
             break;
         }
 
-        assert(hdr.block_type == BLOCK_TYPE_FILE);
+        // 损坏 acore 的块类型不匹配：拒绝而非 assert abort
+        if (hdr.block_type != BLOCK_TYPE_FILE) {
+            error("expected FILE block, got type %u, acore corrupt", hdr.block_type);
+            free(pf);
+            return NULL;
+        }
 
         rc = block->Read(p+i, MIN(size-i, BLOCK_SIZE));
+        if (rc <= 0) {
+            break;   // 读不动了，防死循环
+        }
         i += rc;
     }
 
