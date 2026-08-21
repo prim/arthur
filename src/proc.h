@@ -78,7 +78,10 @@ struct MemRegion {
     uint32_t dev_minor;
     uint64_t inode;
 
-    char perms:3;
+    // B59: 上游 `char perms:3` 是有符号位域——R|X=5 存成 0b101 读回 -3，
+    // 赋给 ph.p_flags（uint32）时符号扩展到 0xFFFFFFFD，污染高位 PF_MASKOS。
+    // 用无符号位域，p_flags 保持 4/5/6。
+    unsigned perms:3;
     char is_private:1;  // cow
     char is_shared:1;
     
