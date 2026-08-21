@@ -866,8 +866,11 @@ int Note::fill_siginfo(const ThreadData& thr)
 // NT_X86_XSTATE
 int Note::fill_x86_xstate(const ThreadData& thr)
 {
-    char *p = allocate(2688);
-    memcpy(p, &thr._xstate.x64, 2688);
+    // 用 sizeof 而非硬编码 2688：x64_xstatereg = X86_XSTATE_MAX_SIZE = 2696。
+    // 原硬编码 2688 让 note 少 8 字节，gdb 报 "Unexpected size of section
+    // .reg-xstate"，且与 WriteThreadMeta 写入/ReadMeta 读回的 2696 不一致。
+    char *p = allocate(sizeof(thr._xstate.x64));
+    memcpy(p, &thr._xstate.x64, sizeof(thr._xstate.x64));
     return 0;
 }
 
@@ -972,8 +975,17 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     // write thread meta
     out.SetBlock(BLOCK_TYPE_THREAD);
     out.Write((const char*)&pid, sizeof(i._pid));
-    out.Write((const char*)&i._regs, sizeof(i._regs));
-    out.Write((const char*)&i._fpregs, sizeof(i._fpregs));
+    // B14: 写成员实际大小，不能用 sizeof(i._regs)（union = max(x64, arm64) 成员）。
+    // x64 下 union regs=272/fpregs=528，但 ReadMeta 读 sizeof(x64 成员)=216/512，
+    // 多写的 56+16=72 字节让 fpregs/siginfo/xstate 在解压时整体偏移 72 →
+    // xstate 头 xfeatures 读到错位数据变 0，gdb 报 .reg-xstate 尺寸不符。
+#ifdef __aarch64__
+    out.Write((const char*)&i._regs, sizeof(i._regs.arm64));
+    out.Write((const char*)&i._fpregs, sizeof(i._fpregs.arm64));
+#else
+    out.Write((const char*)&i._regs, sizeof(i._regs.x64));
+    out.Write((const char*)&i._fpregs, sizeof(i._fpregs.x64));
+#endif
     out.Write((const char*)&i._siginfo, sizeof(i._siginfo));
     if (_arch == ARCH_X64) {
         out.Write((const char*)&i._xstate.x64, sizeof(i._xstate.x64));
