@@ -299,6 +299,12 @@ int ProcStat::Parse()
     // num_threads
     num_threads = strtoul(fld(19), NULL, 10);
 
+    // B25: 补充 note 字段
+    flags = strtoul(fld(8), NULL, 10);    // stat 字段 9
+    nice = (int)strtol(fld(18), NULL, 10); // stat 字段 19
+    pending = strtoul(fld(30), NULL, 10); // stat 字段 31
+    blocked = strtoul(fld(31), NULL, 10); // stat 字段 32
+
     return 0;
 }
 

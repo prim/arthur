@@ -203,10 +203,17 @@ struct ProcStat : public ProcDecoder {
     unsigned long cstime;    // kernel time with all children
     unsigned long cutime;    // user time with all children
     
-    unsigned long vsize;     // virtual memory size, in KBs 
-    unsigned long rss;       // physical memory size, in KBs 
+    unsigned long vsize;     // virtual memory size, in KBs
+    unsigned long rss;       // physical memory size, in KBs
 
     int num_threads;    // number of threads
+
+    // B25: 补充 prpsinfo/prstatus 需要的字段（stat 字段：flags=9, nice=19,
+    // pending=31, blocked=32）
+    unsigned long flags;
+    int nice;
+    unsigned long pending;
+    unsigned long blocked;
 
     ProcStat(ProcFile* pf) : ProcDecoder(pf) {};
     int Parse();

@@ -737,6 +737,11 @@ int Note::fill_prpsinfo(const ProcessData& proc)
     info.pr_pgrp = proc._threads[0]._d_stat->pgid;
     info.pr_sid = proc._threads[0]._d_stat->sid;
 
+    // B25: 填充 pr_flag/pr_zomb/pr_nice（内核原生 core 会填这些）
+    info.pr_flag = proc._threads[0]._d_stat->flags;
+    info.pr_zomb = 0;
+    info.pr_nice = proc._threads[0]._d_stat->nice;
+
     // B26: cmdline 为空（如内核线程/异常进程）时 argv[0] 越界。取 argv[0] 或空串。
     std::string fname;
     if (proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
@@ -847,6 +852,10 @@ int Note::fill_prstatus(const ThreadData& thr)
         info.pr_stime.tv_sec = thr._d_stat->stime;
         info.pr_cutime.tv_sec = thr._d_stat->cutime;
         info.pr_cstime.tv_sec = thr._d_stat->cstime;
+        // B25: 填充 pr_sigpend/pr_sighold/pr_fpvalid（内核原生 core 会填）
+        info.pr_sigpend = thr._d_stat->pending;
+        info.pr_sighold = thr._d_stat->blocked;
+        info.pr_fpvalid = 1;
         char *p = allocate(sizeof(info));
         memcpy(p, &info, sizeof(info));
     }
@@ -865,6 +874,10 @@ int Note::fill_prstatus(const ThreadData& thr)
         info.pr_stime.tv_sec = thr._d_stat->stime;
         info.pr_cutime.tv_sec = thr._d_stat->cutime;
         info.pr_cstime.tv_sec = thr._d_stat->cstime;
+        // B25: 填充 pr_sigpend/pr_sighold/pr_fpvalid（内核原生 core 会填）
+        info.pr_sigpend = thr._d_stat->pending;
+        info.pr_sighold = thr._d_stat->blocked;
+        info.pr_fpvalid = 1;
         char *p = allocate(sizeof(info));
         memcpy(p, &info, sizeof(info));
     }
