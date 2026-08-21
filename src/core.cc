@@ -1939,10 +1939,19 @@ int Coredump::monitor(const char* corefile)
             int status = sig_info.si_status; // status signal code
             int code = sig_info.si_code;  // tracee current state
             if (code == CLD_KILLED || code == CLD_DUMPED || code == CLD_EXITED){
-                if(status == 0) { // process exits normally
-                    info("process %d exit voluntarily", _pid);
-                } else { // process exits on receving signal
-                    info("%s: process %d exit voluntarily", strsignal(status), _pid);
+                if (code == CLD_EXITED) {
+                    // 正常退出，si_status 是退出码（不是信号号）
+                    info("process %d exited (code %d)", _pid, status);
+                } else if (status == SIGILL || status == SIGABRT || status == SIGSEGV) {
+                    // B38: 进程死于致命信号但未产生 leader 的 signal-delivery-stop
+                    // （通常是非 leader 线程崩溃，进程已死，内存/寄存器已消失，
+                    // 无法采集现场）。如实报告并清掉开头写的空 acore。
+                    error("%s: process %d crashed (likely a non-leader thread); "
+                          "no core written", strsignal(status), _pid);
+                    out.Close();
+                    unlink(corefile);
+                } else {
+                    info("%s: process %d terminated by signal", strsignal(status), _pid);
                     ptrace(PTRACE_DETACH, _pid, NULL, (uintptr_t) status);
                 }
                 return 0;
