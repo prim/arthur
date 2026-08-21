@@ -1650,6 +1650,15 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         pt_call(_pid, &regs, r_mmap, 6, gv);
         info("mmap = %lx", regs.get_rc());
         inject_page = regs.get_rc();
+        // B16 缓解：目标阻塞在可重启 syscall 时，syscall-restart 会覆盖注入，
+        // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
+        // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
+        if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000) {
+            error("remote mmap returned implausible %#lx "
+                  "(target likely in a restartable syscall); aborting", inject_page);
+            restore_target_after_fail();
+            return -1;
+        }
     }
     pt_getregs(_pid, &regs);
 
@@ -1805,6 +1814,15 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         pt_call(_pid, &regs, r_mmap, 6, gv);
         info("mmap = %lx", regs.get_rc());
         inject_page = regs.get_rc();
+        // B16 缓解：目标阻塞在可重启 syscall 时，syscall-restart 会覆盖注入，
+        // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
+        // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
+        if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000) {
+            error("remote mmap returned implausible %#lx "
+                  "(target likely in a restartable syscall); aborting", inject_page);
+            restore_target_after_fail();
+            return -1;
+        }
     }
     pt_getregs(_pid, &regs);
 
