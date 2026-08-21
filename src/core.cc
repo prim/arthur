@@ -376,7 +376,10 @@ static inline int pt_attach(pid_t pid)
     int rc;
 
     rc = ptrace(PTRACE_ATTACH, pid, NULL, NULL);
-    assert(rc == 0);
+    if (rc != 0) {
+        // 线程可能已退出（ESRCH）：返回错误让调用方容错，而非 abort
+        return rc;
+    }
     pt_wait(pid);
 
     return rc;
@@ -733,45 +736,66 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
 int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     info("thread: %d", pid); // thread info
     int rc;
-    char buf[BUFFER_SIZE];
-    // ptrace_attach 
-    if (!is_main) {
-        pt_attach(pid);
+
+    // 线程由调用方预先 attach（collect_threads）；此处只读寄存器。
+    // 读失败（线程可能在 attach 后退出）则跳过，不写不完整块。
+
+    // 先读全部寄存器，全部成功才写块，避免读到一半失败写出不完整块
+    ThreadData i;
+    rc = pt_getregs(pid, (user_regs64_struct*)&i._regs);
+    if (rc != 0) { error("getregs thread %d failed", pid); return -1; }
+    rc = pt_getfpregs(pid, (user_fpregs64_struct*)&i._fpregs);
+    if (rc != 0) { error("getfpregs thread %d failed", pid); return -1; }
+    rc = ptrace(PTRACE_GETSIGINFO, pid, 0, &i._siginfo);
+    if (rc != 0) { error("getsiginfo thread %d failed", pid); return -1; }
+    if (_arch == ARCH_X64) {
+        rc = pt_getxstateregs(pid, (x64_xstatereg*)&i._xstate);
+        if (rc != 0) { error("getxstateregs thread %d failed", pid); return -1; }
     }
 
     // write thread meta
-    ThreadData i;
     out.SetBlock(BLOCK_TYPE_THREAD);
-
     out.Write((const char*)&pid, sizeof(i._pid));
-
-    // get Grnerate Registers
-    rc = pt_getregs(pid, (user_regs64_struct*)buf);
-    assert(rc == 0);
-    out.Write(buf, sizeof(i._regs));
-
-    // get FP Registers 
-    rc = pt_getfpregs(pid, (user_fpregs64_struct*)buf);
-    assert(rc == 0);
-    out.Write(buf, sizeof(i._fpregs));
-
-    // get SIGINFO
-    rc = ptrace(PTRACE_GETSIGINFO, pid, 0, buf);
-    assert(rc == 0);
-    out.Write(buf, sizeof(i._siginfo));
-
+    out.Write((const char*)&i._regs, sizeof(i._regs));
+    out.Write((const char*)&i._fpregs, sizeof(i._fpregs));
+    out.Write((const char*)&i._siginfo, sizeof(i._siginfo));
     if (_arch == ARCH_X64) {
-        // get NT_X86_XSTATE     
-        rc = pt_getxstateregs(pid, (x64_xstatereg*)&i._xstate);
-        assert(rc == 0);
-        out.Write(buf, sizeof(i._xstate.x64));
+        out.Write((const char*)&i._xstate.x64, sizeof(i._xstate.x64));
     }
 
     out.Flush();
     // read /proc/<pid>/stat
+    char buf[BUFFER_SIZE];
     ProcFile::ReadPid(buf, BUFFER_SIZE, pid, PROC_TYPE_STAT);
     out.PutFile((ProcFile*) buf);
 
+    return 0;
+}
+
+int Coredump::collect_threads(pid_t leader)
+{
+    _process._thrd_pid.clear();
+    _process._thrd_pid.push_back(leader);   // leader 计入计数，但由调用方单独 attach
+
+    char pbuf[64];
+    snprintf(pbuf, sizeof(pbuf), "/proc/%u/task/", leader);
+    DIR *dirp = opendir(pbuf);
+    if (!dirp) {
+        return -1;
+    }
+    struct dirent *dp = NULL;
+    while ((dp = readdir(dirp)) != NULL) {
+        if (dp->d_name[0] == '.') continue;
+        int tid = atoi(dp->d_name);
+        if (tid == 0 || tid == leader) continue;
+        if (pt_attach(tid) != 0) {
+            // 线程可能在枚举后退出（ESRCH）：跳过，保证计数与实际块一致
+            error("attach thread %d failed (may have exited), skipped", tid);
+            continue;
+        }
+        _process._thrd_pid.push_back(tid);
+    }
+    closedir(dirp);
     return 0;
 }
 
@@ -1161,21 +1185,8 @@ int Coredump::generate(const char *corefile)
 
     // attach main thread
     pt_attach(_pid);
-    // get all threads pid
-    char pbuf[64];
-    snprintf(pbuf, sizeof(pbuf), "/proc/%u/task/", _pid);
-    DIR *dirp = opendir(pbuf);
-    struct dirent *dp = NULL;
-    do {
-        dp = readdir(dirp);
-        if (dp && dp->d_name[0]!='.') {
-            int tid = atoi(dp->d_name);
-            if (tid == 0)
-                continue;
-            _process._thrd_pid.push_back(tid);
-        }
-    } while (dp);
-    closedir(dirp);
+    // get all threads pid（attach 全部非主线程，剔除已退出的）
+    collect_threads(_pid);
 
     ProcMaps maps;
     WriteProcessMeta(out, maps);
@@ -1232,21 +1243,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // attach main thread
     pt_attach(_pid);
 
-    // get all threads pid
-    char pbuf[64];
-    snprintf(pbuf, sizeof(pbuf), "/proc/%u/task/", _pid);
-    DIR *dirp = opendir(pbuf);
-    struct dirent *dp = NULL;
-    do {
-        dp = readdir(dirp);
-        if (dp && dp->d_name[0]!='.') {
-            int tid = atoi(dp->d_name);
-            if (tid == 0)
-                continue;
-            _process._thrd_pid.push_back(tid);
-        }
-    } while (dp);
-    closedir(dirp);
+    // get all threads pid（attach 全部非主线程，剔除已退出的）
+    collect_threads(_pid);
 
     ProcMaps maps;
     WriteProcessMeta(out, maps); 
@@ -1390,21 +1388,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // stop tracee
     pt_int(_pid);
 
-    // get all threads pid
-    char pbuf[64];
-    snprintf(pbuf, sizeof(pbuf), "/proc/%u/task/", _pid);
-    DIR *dirp = opendir(pbuf);
-    struct dirent *dp = NULL;
-    do {
-        dp = readdir(dirp);
-        if (dp && dp->d_name[0]!='.') {
-            int tid = atoi(dp->d_name);
-            if (tid == 0)
-                continue;
-            _process._thrd_pid.push_back(tid);
-        }
-    } while (dp);
-    closedir(dirp);
+    // get all threads pid（attach 全部非主线程，剔除已退出的）
+    collect_threads(_pid);
 
     ProcMaps maps;
     WriteProcessMeta(out, maps); 
@@ -1630,21 +1615,8 @@ int Coredump::monitor(const char* corefile)
     info("%s: process %d exit", strsignal(exit_sig), _pid);
     info("Writing out corefile...");
 
-    // get all threads pid
-    char pbuf[64];
-    snprintf(pbuf, sizeof(pbuf), "/proc/%u/task/", _pid);
-    DIR *dirp = opendir(pbuf);
-    struct dirent *dp = NULL;
-    do {
-        dp = readdir(dirp);
-        if (dp && dp->d_name[0]!='.') {
-            int tid = atoi(dp->d_name);
-            if (tid == 0)
-                continue;
-            _process._thrd_pid.push_back(tid);
-        }
-    } while (dp);
-    closedir(dirp);
+    // get all threads pid（attach 全部非主线程，剔除已退出的）
+    collect_threads(_pid);
 
     ProcMaps maps;
     WriteProcessMeta(out, maps);

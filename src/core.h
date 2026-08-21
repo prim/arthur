@@ -305,6 +305,9 @@ private:
 
     int WriteProcessMeta(Lz4Stream& out, ProcMaps& maps);
     int WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main = false);
+    // 枚举 /proc/<leader>/task/ 全部线程并 attach 非主线程；attach 失败的
+    // （线程已退出）从列表剔除，保证线程计数与实际写出的 THREAD 块一致。
+    int collect_threads(pid_t leader);
 private:
     pid_t _pid;             // target pid
     pid_t _core_pid;        // forked core's pid
