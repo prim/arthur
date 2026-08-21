@@ -39,13 +39,16 @@ extern "C" {
 #define __used__ __attribute__((used))
 
 #ifdef __aarch64__
-static __used__ void inject_fork(void) 
+static __used__ void inject_fork(void)
 {
-    // aarch64 doesn't have a fork syscall, needs clone flags for fork(). 
+    // aarch64 没有 SYS_fork，用 SYS_clone 等价 fork。
+    // x0 = flags = SIGCHLD(17)：与 x86 SYS_fork 语义一致（纯 fork）。
+    // 原实现 `movk x0, #120, lsl #16` 把 bits 19-22（CLONE_SETTLS/PARENT_SETTID/
+    // CLEARTID/DETACHED）置位，与注释"CLONE_CHILD_SETTID|CLEARTID"(bit24/21) 不符；
+    // 对快照功能虽无害，但非干净 fork。改为仅 SIGCHLD。
     asm(
     "inject_begin: \n"
-        "mov x0, #17 \n"        // SIGCHLD
-        "movk x0, #120, lsl #16 \n" // CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
+        "mov x0, #17 \n"        // SIGCHLD（fork 语义）
         "mov x1, #0 \n"
         "mov x2, #0 \n"
         "mov x3, #0 \n"
