@@ -1614,6 +1614,12 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
                 warn("pread mem(%lx) failed(%d).", addr, errno);
                 break;
             }
+            if (len < req) {
+                // R50-1: 短读（0<=len<req）时本循环按整缓冲推进，未读部分被静默跳过
+                // → 该区域 core 数据有洞（gdb 零填充）。目标已停止时少见，但不应无声。
+                warn("pread mem(%lx) short read %zd of %d bytes; region data hole",
+                     addr, len, req);
+            }
             mem_size += len;
 
             for (ssize_t i=0; i<len; i+= BLOCK_SIZE) {

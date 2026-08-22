@@ -84,6 +84,11 @@ ProcFile* ProcFile::Read(char* buf, int buf_len, const char *fmt, ...)
 
 int ProcDecoder::readline(int& cur, char *out, size_t n)
 {
+    // b27 (Codex review) 加固点: n==0 时下方 `(int)n-1` 得 -1，memcpy 变成巨大
+    // size_t 越界；!out 同理。入口显式拒绝。
+    if (!out || n == 0) {
+        return 0;
+    }
     if (!_pf || cur >= (int)_pf->f_size) {
         return 0;
     }
