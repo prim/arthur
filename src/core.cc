@@ -366,13 +366,29 @@ static inline int pt_wait(pid_t pid)
     int status = 0;
     // 原实现忽略 waitpid 返回值：失败（EINTR 被信号打断 / ECHILD 目标已被 reap）时
     // status 未初始化就被返回，pt_call 循环对垃圾值做 WIFSTOPPED/WSTOPSIG。
+    // R50-1: 阻塞 waitpid 会无限挂起——多线程目标 fork 注入实测：auto-attach 的
+    // child 停住未回收，leader 在 EVENT_FORK 后不再停靠，waitpid 永不返回。改用
+    // WNOHANG 轮询 + 截止时间，卡死时返回 -1（调用方 fail-closed）。
+    struct timeval t0;
+    gettimeofday(&t0, NULL);
+    const long WAIT_TIMEOUT_MS = 10000;
     for (;;) {
-        pid_t rc = waitpid(pid, &status, WUNTRACED);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        if ((tv.tv_sec - t0.tv_sec) * 1000 + (tv.tv_usec - t0.tv_usec) / 1000 > WAIT_TIMEOUT_MS) {
+            error("pt_wait: %d did not stop within %ld ms (target stuck?)", pid, WAIT_TIMEOUT_MS);
+            return -1;
+        }
+        pid_t rc = waitpid(pid, &status, WUNTRACED | WNOHANG);
         if (rc == pid) {
             break;
         }
         if (rc < 0 && errno == EINTR) {
             continue;   // 被信号打断，重试
+        }
+        if (rc == 0) {
+            usleep(1000);   // 无状态变化，稍等再查
+            continue;
         }
         return -1;      // ECHILD 等：调用方按"非停止/失败"处理
     }
@@ -615,7 +631,19 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     if (rc != 0) { return fail("setregs"); }
 
     // wait for a SIGSEGV
+    // R50-1: 注入可能卡死——多线程目标的 fork 注入实测：EVENT_FORK 后 leader 不再
+    // 停靠（auto-attach 的 child 停住未回收，leader 在注入页运行却不 fault），pt_wait
+    // 无限阻塞，arthur 永久挂起。加超时，卡死时 fail-closed（fail() 恢复 xstate/
+    // [rsp-8]），调用方还原目标。
+    struct timeval t0;
+    gettimeofday(&t0, NULL);
+    const long INJECT_TIMEOUT_MS = 10000;
     for (;;) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        if ((tv.tv_sec - t0.tv_sec) * 1000 + (tv.tv_usec - t0.tv_usec) / 1000 > INJECT_TIMEOUT_MS) {
+            return fail("inject timeout");
+        }
         if (WIFSTOPPED(status)) {
             if (WSTOPSIG(status) == SIGSEGV) {
                 break;
@@ -626,7 +654,6 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
                 if (rc != 0) { return fail("geteventmsg"); }
                 dprint("child pid = %lu", msg);
             }
-            dprint("statux = %x", status);
         }
         rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
         if (rc < 0) {
