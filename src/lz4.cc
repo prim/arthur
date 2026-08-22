@@ -280,7 +280,7 @@ int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
         return -1;
     }
 
-    dprint("writed %lu, compress = %lu", block.Length(), len);
+    dprint("writed %lu, compress = %d", block.Length(), len);
  
     // clear the block 
     block.Clear(); 

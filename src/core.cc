@@ -1324,9 +1324,11 @@ int Coredump::ReadMeta(Lz4Stream& in)
 
         buf = in.ReadBlock(hdr);
         if (!buf) {
-            // 损坏 acore 提前结束：跳过剩余线程（避免 NULL 解引用）
-            error("thread block %d missing (truncated acore), stopping", i);
-            break;
+            // 损坏 acore 提前结束。b43 (Codex review): 线程块缺失是截断，不能
+            // break 后带不完整线程集当成功返回——fail-closed 返回 -1，让
+            // decompress 统一清理并报错。
+            error("thread block %d missing (truncated acore)", i);
+            return -1;
         }
 
         buf->Read((char*)&td._pid, sizeof(td._pid));
@@ -1567,6 +1569,12 @@ int Coredump::ReadElfHeader(Lz4Stream& in)
             break;
         }
         block = in.ReadBlock(hdr);
+        if (!block) {
+            // b46 (Codex review): Peek 已看到后续 ELF 块，但 ReadBlock 因截断/
+            // 解压失败返回 NULL——结束循环当成功会产出残缺 core。fail-closed。
+            error("elf continuation block truncated (acore corrupt)");
+            return -1;
+        }
     }
 
     dprint("phdr : %d, %d", _ehdr.e_phnum, _phdrs.size());
@@ -1625,8 +1633,10 @@ int Coredump::GenerateNotes()
 
     // B37: fill_* 失败（损坏 acore 缺元数据）时 note 的 _data 为 NULL，
     // 直接 push 会让 fwrite(NULL) 崩溃。只在成功时加入。
+    // b47 (Codex review): "返回 0" 不等价于 "payload 已初始化"——纵深防护，
+    // 只接受 fill 成功且 _data 非空（Note::_size 已由构造器初始化为 0）。
     auto add_note = [&](Note* nt, int fill_rc) -> void {
-        if (fill_rc != 0) {
+        if (fill_rc != 0 || nt->_data == NULL) {
             error("note fill failed, skipping");
             delete nt;
             return;

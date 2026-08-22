@@ -86,6 +86,12 @@ public:
         _environ = NULL;
         _io = NULL;
         _limits = NULL;
+        // b50 (Codex review): 三个 decoder 指针原未初始化。cleanup_decompress()
+        // 在 ParseAll() 之前（ReadMeta 失败）会读并 delete 它们——未初始化指针
+        // invalid delete，UB。构造器统一置 NULL。
+        _d_cmdline = NULL;
+        _d_maps = NULL;
+        _d_auxv = NULL;
     }
     int ParseAll();
 };
