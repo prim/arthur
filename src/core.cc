@@ -1362,11 +1362,17 @@ int Coredump::ReadMeta(Lz4Stream& in)
         return -1;
     }
 
-    // B23: thread_num 来自损坏 acore 可为任意值；限定上限避免无限/超长循环
-    if (thread_num < 0 || thread_num > 1000000) {
+    // B23: thread_num 来自损坏 acore 可为任意值；限定上限避免无限/超长循环。
+    // b23/b43 (Codex review): 100 万线程上限仍允许数 GiB 分配（每 ThreadData
+    // 约 3KB 寄存器 + stat，可压缩到极小）。降到 2^17，并加线程块累计未压缩
+    // 字节预算兜底——构造的线程块无法无限放大内存。
+    if (thread_num < 0 || thread_num > 131072) {
         error("implausible thread_num %d, acore corrupt", thread_num);
         return -1;
     }
+    // 线程元数据累计未压缩字节上限（x64 每线程 ~3.5KB，131072 线程 ≈ 460MB）
+    const size_t THREAD_META_MAX = 512*1024*1024;
+    size_t meta_bytes = 0;
 
     for (int i=0; i<thread_num; i++) {
         ThreadData td;
@@ -1378,6 +1384,12 @@ int Coredump::ReadMeta(Lz4Stream& in)
             // break 后带不完整线程集当成功返回——fail-closed 返回 -1，让
             // decompress 统一清理并报错。
             error("thread block %d missing (truncated acore)", i);
+            return -1;
+        }
+
+        meta_bytes += buf->Length();
+        if (meta_bytes > THREAD_META_MAX) {
+            error("thread metadata %zu exceeds budget, acore corrupt", meta_bytes);
             return -1;
         }
 
