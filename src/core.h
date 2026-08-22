@@ -143,7 +143,10 @@ struct Load {
 class Note {
 
 public:
-    Note(int t) : _type(t), _data(NULL) {}
+    // b23 (Codex review): _size 原未初始化。fill_* 若在未知 arch/异常路径返回 0
+    // 而不调 allocate，_size 保持未定义值，decompress 会按该长度 fwrite NULL 数据。
+    // 纵深防护：任何未 allocate 的 note 读到 _size==0（空 note，不会写坏）。
+    Note(int t) : _type(t), _data(NULL), _size(0) {}
     ~Note() {
         if (_data) {
             free(_data);

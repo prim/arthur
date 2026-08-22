@@ -802,7 +802,9 @@ int Note::fill_prpsinfo(const ProcessData& proc)
 
     // B25: 填充 pr_flag/pr_zomb/pr_nice（内核原生 core 会填这些）
     info.pr_flag = proc._threads[0]._d_stat->flags;
-    info.pr_zomb = 0;
+    // b25 (Codex review): 内核 fill_psinfo 用 `pr_zomb = exit_state==EXIT_ZOMBIE`。
+    // 恒 0 是错的——僵尸进程应置 1。/proc 的 sname=='Z' 即 EXIT_ZOMBIE。
+    info.pr_zomb = (proc._threads[0]._d_stat->sname == 'Z') ? 1 : 0;
     info.pr_nice = proc._threads[0]._d_stat->nice;
 
     // B63: pr_fname 用 task->comm（stat 括号内文本，可执行名），与内核原生 core
@@ -970,6 +972,12 @@ int Note::fill_prstatus(const ThreadData& thr)
         char *p = allocate(sizeof(info));
         memcpy(p, &info, sizeof(info));
     }
+    else {
+        // b23 (Codex review): 未知 arch 时若静默返回 0，note 带 NULL 数据/未初始化
+        // 长度被 GenerateNotes 接受。fail-closed：拒绝生成该 note。
+        error("prstatus: unsupported arch %d", thr._arch);
+        return -1;
+    }
     return 0;
 }
 
@@ -983,6 +991,11 @@ int Note::fill_fpregset(const ThreadData& thr)
     else if (thr._arch == ARCH_AARCH64) {
         arm64_elf_fpregset *p = allocate<arm64_elf_fpregset>();
         memcpy(p, &thr._fpregs.arm64, sizeof(thr._fpregs.arm64));
+    }
+    else {
+        // b23 (Codex review): 同 fill_prstatus，未知 arch fail-closed。
+        error("fpregset: unsupported arch %d", thr._arch);
+        return -1;
     }
     return 0;
 }
@@ -1245,6 +1258,15 @@ int Coredump::VerifyFileHeader(Lz4Stream& in)
     rc = in.ReadRaw((char*)&hdr.m, sizeof(hdr.m));
     if (rc != sizeof(hdr.m) || hdr.m.version > ACORE_VERSION) {
         error("acore version %d > %d.", hdr.m.version, ACORE_VERSION);
+        return -1;
+    }
+
+    // b23 (Codex review): arch 来自 acore 头，损坏 acore 可构造为任意值。未知
+    // arch 会让 fill_prstatus/fill_fpregset 不进入任何分支却返回 0，add_note
+    // 于是接受 _data==NULL、_size 未初始化的 note，fwrite 崩溃或写出超大写。
+    // 在入口拒绝未知 arch（fail-closed）。
+    if (hdr.m.arch >= ARCH_MAX) {
+        error("unsupported arch %d, acore corrupt", hdr.m.arch);
         return -1;
     }
 
@@ -2676,30 +2698,53 @@ int Coredump::test_compress(const char* in_file, const char* out_file)
     for (;;) {
         size_t len = fread(buf, 1, sizeof(buf), fin);
         if (len == 0) {
-            // B22: EOF（fread 返回 0）是正常结束，不是错误
+            // B22: fread==0 不只有 EOF——真实 I/O 错误（ferror）也返回 0。
+            // b22 (Codex review): 只有 feof 才是正常结束；ferror 时须报错并返回
+            // 非零，否则调用者会把空/截断输出当成成功的压缩结果。
+            if (ferror(fin)) {
+                error("read failed (%s)", strerror(errno));
+                rc = -1;
+            }
             break;
         }
-        
+        data_size += len;
+
         for (size_t i=0; i<len; i+= BLOCK_SIZE) {
             size_t j = MIN(len - i, BLOCK_SIZE);
-            int rc = out.Write((const char*)(buf+i), j);
-            assert(rc > 0);
-            data_size += len;
-            file_size += rc;
+            // B78/B70: Write 可因磁盘满返回 -1；用显式检查代替 assert（NDEBUG
+            // 下 assert 消失，失败会静默丢数据）。原 data_size += len 误放内层
+            // 循环，多块读时把同一段字节重复计数（只影响日志，一并修正）。
+            int wrc = out.Write((const char*)(buf+i), j);
+            if (wrc <= 0) {
+                error("compress write failed (%d)", wrc);
+                rc = -1;
+                goto flush_and_close;
+            }
+            file_size += wrc;
         }
-             
+
         if (len < sizeof(buf)) {
+            // 短读可能伴随 I/O 错误；ferror 时不能当正常结束。
+            if (ferror(fin)) {
+                error("read failed (%s)", strerror(errno));
+                rc = -1;
+            }
             break;
         }
     }
-    out.Flush();
+
+flush_and_close:
+    if (out.Flush() < 0) {
+        error("compress flush failed");
+        rc = -1;
+    }
     WriteTailMark(out);
     out.Close();
-    fclose(fin); 
+    fclose(fin);
 
     info(" %lu => %lu ", data_size, file_size);
 
-    return 0;
+    return rc;
 }
 
 int Coredump::test_decompress(const char* in_file, const char* out_file)
