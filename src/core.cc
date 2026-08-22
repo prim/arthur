@@ -2320,15 +2320,20 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         pt_getregs(_pid, &saved_regs);
         {
             uint64_t gv[3] = { (uint64_t)_core_pid, (uint64_t)NULL, 0 };
-            pt_call(_pid, &regs, r_waitpid, 3, gv);
-            info("waitpid = %d", (int)regs.get_rc());
-            // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
-            // 会让注入的 waitpid 不执行，返回垃圾/ECHILD → 子进程作为目标 zombie 残留，
-            // 重复采集累积。检查返回值并如实报告。
-            if (regs.get_rc() != (uint64_t)_core_pid) {
-                warn("injected waitpid returned %d (expected %d); child may linger "
-                     "as a zombie (target likely in a restartable syscall)",
-                     (int)regs.get_rc(), (int)_core_pid);
+            // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc()
+            // 读垃圾进日志/告警。检查并告警（acore 已有效，best-effort 收尸）。
+            if (pt_call(_pid, &regs, r_waitpid, 3, gv) != 0) {
+                warn("waitpid injection failed (target died?)");
+            } else {
+                info("waitpid = %d", (int)regs.get_rc());
+                // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
+                // 会让注入的 waitpid 不执行，返回垃圾/ECHILD → 子进程作为目标 zombie 残留，
+                // 重复采集累积。检查返回值并如实报告。
+                if (regs.get_rc() != (uint64_t)_core_pid) {
+                    warn("injected waitpid returned %d (expected %d); child may linger "
+                         "as a zombie (target likely in a restartable syscall)",
+                         (int)regs.get_rc(), (int)_core_pid);
+                }
             }
         }
         pt_setregs(_pid, &saved_regs);
@@ -2588,6 +2593,19 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     pt_cont(_pid);
     _process._thrd_pid.clear(); // clear all thread id in array
 
+    // R50-1: leader 已被 pt_cont 放行（运行中带 TRACEFORK）。此处失败若只调
+    // restore_target_after_fail，对运行中 tracee 的 SETOPTIONS/CONT 都会失败（ESRCH，
+    // agent 实测），TRACEFORK 残留 → 目标下次 fork 被冻结/SIGTRAP 误杀；且 _core_pid
+    // 子进程（auto-attach 冻结）未被回收。先杀子进程、再 INTERRUPT 停住 leader 清
+    // TRACEFORK（保留 TRACEEXIT）再 CONT。
+    auto recover_after_resume = [&]() -> void {
+        ptrace(PTRACE_DETACH, _core_pid, NULL, SIGKILL);   // 回收冻结的 fork 子进程
+        if (pt_int(_pid) == 0) {                            // 停住 leader 才能 SETOPTIONS
+            ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
+            ptrace(PTRACE_CONT, _pid, NULL, NULL);
+        }
+    };
+
     // TBD: dump memory regions
     if (!sys_core) {
         // write acore
@@ -2595,13 +2613,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             // B65: 读子进程内存失败（child 消失/dumpable=0）时 fail-closed，还原目标。
         if (WriteLoads(out, _core_pid, maps) != 0) {
             error("failed to dump memory of child %d", (int)_core_pid);
-            restore_target_after_fail();
+            recover_after_resume();
             return -1;
         }
             // B69: ELF 块写入失败（磁盘满）时 fail-closed。
             if (WriteElfHeader(out) != 0) {
                 error("failed to write elf header");
-                restore_target_after_fail();
+                recover_after_resume();
                 return -1;
             }
             WriteTailMark(out);
@@ -2642,10 +2660,16 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             // B67: TRACEFORK auto-attach 的 fork 子进程残留在 arthur 上（TracerPid=arthur、
             // state=t），monitor 继续运行时不 CONT 它 → 永久冻结。GETEVENTMSG 拿子进程
             // pid 并 DETACH(SIGCONT) 解冻，让它正常继续运行。
-            unsigned long child_pid = 0;
-            if (ptrace(PTRACE_GETEVENTMSG, _pid, 0, &child_pid) == 0 && child_pid > 0) {
-                ptrace(PTRACE_DETACH, (pid_t)child_pid, NULL, (void*)SIGCONT);
-                info("detached auto-attached fork child %lu", child_pid);
+            // R50-1: 只有 FORK/CLONE/VFORK（事件 1/2/3）才有 auto-attach 的子进程要
+            // detach。EVENT_EXIT 的 GETEVENTMSG 是退出码（实测 exit(42)→0x2a00），
+            // 把它当 pid 去 DETACH 会对无关进程发伪 ptrace 调用。
+            int ev = (int)((s >> 16) & 0xff);
+            if (ev == PTRACE_EVENT_FORK || ev == PTRACE_EVENT_VFORK || ev == PTRACE_EVENT_CLONE) {
+                unsigned long child_pid = 0;
+                if (ptrace(PTRACE_GETEVENTMSG, _pid, 0, &child_pid) == 0 && child_pid > 0) {
+                    ptrace(PTRACE_DETACH, (pid_t)child_pid, NULL, (void*)SIGCONT);
+                    info("detached auto-attached fork child %lu", child_pid);
+                }
             }
         }
     } else {
@@ -2661,14 +2685,18 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     pt_getregs(_pid, &saved_regs);
     {
         uint64_t gv[3] = {(uint64_t)_core_pid, (uint64_t)NULL, 0};
-        pt_call(_pid, &regs, r_waitpid, 3, gv);
-        info("waitpid = %d", (int)regs.get_rc());
-        // B73 (Codex B2 review): 注入 waitpid 失败（B16 syscall-restart）时
-        // 子进程作为目标 zombie 残留；如实报告。
-        if (regs.get_rc() != (uint64_t)_core_pid) {
-            warn("injected waitpid returned %d (expected %d); child may linger "
-                 "as a zombie (target likely in a restartable syscall)",
-                 (int)regs.get_rc(), (int)_core_pid);
+        // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc() 读垃圾。
+        if (pt_call(_pid, &regs, r_waitpid, 3, gv) != 0) {
+            warn("waitpid injection failed (target died?)");
+        } else {
+            info("waitpid = %d", (int)regs.get_rc());
+            // B73 (Codex B2 review): 注入 waitpid 失败（B16 syscall-restart）时
+            // 子进程作为目标 zombie 残留；如实报告。
+            if (regs.get_rc() != (uint64_t)_core_pid) {
+                warn("injected waitpid returned %d (expected %d); child may linger "
+                     "as a zombie (target likely in a restartable syscall)",
+                     (int)regs.get_rc(), (int)_core_pid);
+            }
         }
     }
     pt_setregs(_pid, &saved_regs);
@@ -2816,15 +2844,15 @@ int Coredump::monitor(const char* corefile)
                 // 中继目标用 sig_info.si_pid：TRACEFORK 自动 attach 的子进程
                 // 或非 leader 线程的停靠，si_pid 才是正确的恢复目标；固定 _pid
                 // 会恢复错误线程，让真正的停靠者永久冻结（问题2）。
-                // b39 (Codex review): 事件停靠（PTRACE_EVENT_XXX，含 TRACEEXIT 的
-                // EVENT_EXIT）与组停靠（PTRACE_EVENT_STOP）的 WSTOPSIG 是 SIGTRAP/
-                // SIGSTOP——把 si_status 当中继信号注入会用 SIGTRAP/SIGSTOP 误杀或
-                // 冻结目标。事件编号在 wait status 高 16 位，非零即事件/组停靠，
-                // 用信号 0 恢复，让 EVENT_EXIT 之后正常走到 CLD_EXITED。
-                int pt_event = status >> 16;
-                if (pt_event != 0) {
-                    info("ptrace event-stop (%d) on %d, resume with 0", pt_event, sig_info.si_pid);
-                    ptrace(PTRACE_CONT, sig_info.si_pid, NULL, 0);
+                // b39 (Codex review): SIGCHLD.si_status 对所有 ptrace 停靠只是裸信号号
+                // （事件号只在 waitpid 的 status 字高 16 位，sigwaitinfo 拿不到）。
+                // 对停止类信号（SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU）先试 PTRACE_LISTEN——
+                // 组停靠的正确恢复是保持停靠并停止上报，避免反复重投 SIGSTOP 的
+                // stop-resume 空转；非组停靠（普通 signal-delivery stop）回退 CONT(sig)。
+                int sig = status;
+                if ((sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) &&
+                    ptrace(PTRACE_LISTEN, sig_info.si_pid, NULL, NULL) == 0) {
+                    // 组停靠：已 LISTEN，保持停靠等 SIGCONT。不重投信号。
                 } else {
                     ptrace(PTRACE_CONT, sig_info.si_pid, NULL, (uintptr_t) status);
                 }
