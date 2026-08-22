@@ -1583,6 +1583,15 @@ int Coredump::ReadMeta(Lz4Stream& in)
             error("thread %d stat missing (acore corrupt)", td._pid);
             return -1;
         }
+        // R50-7: 线程 stat 的 GetFile 上限 64MB，且不计入上方 THREAD_META_MAX 预算
+        //（只累加 THREAD 块长度）——构造 acore 可让每线程 stat 都接近 64MB，
+        // 131072 线程 ≈ 8TB 堆分配（LZ4 高压缩比重复数据使文件本身很小）。
+        // 把 stat 序列化大小也计入预算，超限即拒。
+        meta_bytes += td._stat->Size();
+        if (meta_bytes > THREAD_META_MAX) {
+            error("thread metadata %zu exceeds budget (with stat), acore corrupt", meta_bytes);
+            return -1;
+        }
         _process._threads.push_back(td);
         info("thread: %d", td._pid);
     }
@@ -1784,7 +1793,7 @@ int Coredump::WriteTailMark(Lz4Stream& out)
     return 0;
 }
 
-int Coredump::ReadElfHeader(Lz4Stream& in)
+int Coredump::ReadElfHeader(Lz4Stream& in, size_t max_phdrs)
 {
     int rc;
     BlockHeader hdr;
@@ -1804,6 +1813,14 @@ int Coredump::ReadElfHeader(Lz4Stream& in)
     while (block) {
 
         while (block->Size() > 0) {
+            // R50-7: 构造 acore 可用高压缩比的重复 phdr 数据在拒绝前撑爆 _phdrs
+            //（每 ELF 块 64KB/56B ≈ 1170 个 phdr；LZ4 重复块在文件里可极小）。
+            // 预算上限（maps 条目 + 1 note）在读入时强制执行，不做事后检查。
+            if (_phdrs.size() >= max_phdrs) {
+                error("elf phdr count %zu exceeds budget %zu (acore corrupt)",
+                      _phdrs.size() + 1, max_phdrs);
+                return -1;
+            }
             Elf64_Phdr phdr;
             rc = block->Read((char*)&phdr, sizeof(phdr));
             if (rc != sizeof(phdr)) {
@@ -3198,7 +3215,9 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // write elf header
     // ReadElfHeader 失败（损坏 acore 缺 ELF 块）时 _phdrs 为空，写出的 core 无
     // LOAD 段；检查返回值，报错而非产出残缺 core。
-    rc = ReadElfHeader(in);
+    // R50-7: 预算上限（maps 条目 + 1 note）传入读循环，构造 acore 在分配
+    // 海量 phdr 前即被拒（原实现读完后才检查）。
+    rc = ReadElfHeader(in, _process._d_maps->size() + 1);
     if (rc != 0) {
         error("read elf header failed, core incomplete (removed)");
         return fail_core();
@@ -3216,10 +3235,17 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // 写侧 p_filesz 是每个 region 实际写入的未压缩字节数（含 pread 失败时的部分），
     // 二者应严格相等；不一致说明 LOADS 块被 bit-flip 成了合法但不同长度的 LZ4 流，
     // 静默写错 core 比报错更危险。
+    // R50-7: 构造 phdr 可声明 p_filesz=2^64-1，多个求和回绕后撞上真实 loads_written
+    // 绕过校验——用溢出检测代替裸累加（真实 dump 的字节和远小于 2^64）。
     size_t expected = 0;
     for (const auto& phdr : _phdrs) {
         if (phdr.p_type == PT_LOAD) {
-            expected += phdr.p_filesz;
+            size_t next;
+            if (__builtin_add_overflow(expected, phdr.p_filesz, &next)) {
+                error("phdr p_filesz sum overflows size_t (acore corrupt, core removed)");
+                return fail_core();
+            }
+            expected = next;
         }
     }
     if (loads_written != expected) {
