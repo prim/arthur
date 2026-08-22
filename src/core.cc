@@ -590,7 +590,12 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     }
     
     if (oregs) {
-        pt_getregs(pid, oregs);
+        // b30 (Codex review): 末尾 getregs 返回被忽略——注入结束后目标若已退出
+        // （兄弟线程 SIGKILL/自身崩溃），oregs 是未初始化垃圾，调用方按它继续
+        // （waitpid 结果/恢复寄存器）会出错。检查返回并 fail-closed。
+        if (pt_getregs(pid, oregs) != 0) {
+            return fail("getregs after call");
+        }
     }
 
     // B3: 恢复被注入践踏的状态。ret 已把 rsp 还原，[inject_rsp] 仍存 0；
@@ -2033,26 +2038,29 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // B76 (Codex B6 review): 末尾 re-attach 的 pt_attach/pt_getregs/pt_setregs/
     // pt_detach 返回全被忽略——目标若在自由运行窗口退出/被另一 tracer 占用，
     // attach 失败后继续注入会读到垃圾。acore 已写（有效），此处告警而非静默成功。
+    // b6 (Codex review): attach 失败后仍无条件 getregs/waitpid/setregs/detach，
+    // 在未 attached/已死亡目标上执行并消费垃圾寄存器——跳过收尾注入，dump 仍有效。
     if (pt_attach(_pid) != 0) {
         warn("re-attach of %d failed; injected waitpid may not have reaped the "
              "fork child", _pid);
-    }
-    pt_getregs(_pid, &saved_regs);
-    {
-        uint64_t gv[3] = { (uint64_t)_core_pid, (uint64_t)NULL, 0 };
-        pt_call(_pid, &regs, r_waitpid, 3, gv);
-        info("waitpid = %d", (int)regs.get_rc());
-        // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
-        // 会让注入的 waitpid 不执行，返回垃圾/ECHILD → 子进程作为目标 zombie 残留，
-        // 重复采集累积。检查返回值并如实报告。
-        if (regs.get_rc() != (uint64_t)_core_pid) {
-            warn("injected waitpid returned %d (expected %d); child may linger "
-                 "as a zombie (target likely in a restartable syscall)",
-                 (int)regs.get_rc(), (int)_core_pid);
+    } else {
+        pt_getregs(_pid, &saved_regs);
+        {
+            uint64_t gv[3] = { (uint64_t)_core_pid, (uint64_t)NULL, 0 };
+            pt_call(_pid, &regs, r_waitpid, 3, gv);
+            info("waitpid = %d", (int)regs.get_rc());
+            // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
+            // 会让注入的 waitpid 不执行，返回垃圾/ECHILD → 子进程作为目标 zombie 残留，
+            // 重复采集累积。检查返回值并如实报告。
+            if (regs.get_rc() != (uint64_t)_core_pid) {
+                warn("injected waitpid returned %d (expected %d); child may linger "
+                     "as a zombie (target likely in a restartable syscall)",
+                     (int)regs.get_rc(), (int)_core_pid);
+            }
         }
+        pt_setregs(_pid, &saved_regs);
+        pt_detach(_pid);
     }
-    pt_setregs(_pid, &saved_regs);
-    pt_detach(_pid);
 
     info("Process %u paused %0.3f ms.", _pid, ts_pause.timediff()*1000);
     out.PrintStat();

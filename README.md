@@ -70,6 +70,12 @@ Kernel coredump mode,
 arthur -p <pid> -2
 ```
 
+> NOTE (mode 2): the kernel core is produced by the forked child's `int $3`;
+> arthur warns (does not fail) when the target's `RLIMIT_CORE` is 0 or the
+> system `core_pattern` is a pipe, in which case no kernel core appears.
+> The metadata cannot yet be merged into a final GNU corefile (`-m` merge is
+> NOT IMPLEMENTED); the kernel core alone is usable.
+
 Monitor mode,
 
 ```
