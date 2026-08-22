@@ -967,15 +967,23 @@ int Note::fill_file(const ProcessData& proc)
     uint64_t v = entries.size();
     payload.append((const char*)&v, 8);
 
-    // page size (4k)
-    v = 0x1000;
+    // R50-6: NT_FILE 的 page_size 字段是 file_ofs 的单位，file_ofs 必须写
+    // **页偏移**（内核 fill_files_note 写 vma->vm_pgoff），不是 /proc/maps
+    // 的字节偏移。gdb linux-tdep 读 file_ofs 后乘 page_size；旧实现写字节
+    // 偏移导致 gdb info proc mappings 的文件偏移放大 4096 倍（已实证）。
+    // page_size 用真实页大小（ptrace 同架构宿主==目标），不硬编码 0x1000，
+    // aarch64 64K 页系统同样正确。
+    long page_size = sysconf(_SC_PAGESIZE);
+    v = (uint64_t)page_size;
     payload.append((const char*)&v, 8);
 
     // address
     for (auto& n : entries) {
         payload.append((const char*)&n.start_addr, 8);
         payload.append((const char*)&n.end_addr, 8);
-        payload.append((const char*)&n.offset, 8);
+        // file_ofs = 字节偏移 / page_size（页对齐，整除无舍入）
+        uint64_t file_ofs = n.offset / (uint64_t)page_size;
+        payload.append((const char*)&file_ofs, 8);
     }
 
     // file names
@@ -1279,7 +1287,12 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     ThreadData i;   // 构造器 memset 为零
     int fp_ok = 1;
     rc = pt_getregs(pid, (user_regs64_struct*)&i._regs);
-    if (rc != 0) { warn("getregs thread %d failed, zeroed block", pid); }
+    if (rc != 0) {
+        warn("getregs thread %d failed, zeroed block", pid);
+        // R50-6: 通用寄存器读失败同样说明该线程现场不可信，pr_fpvalid 应整体
+        // 置 0——否则写出"GP 全零、pr_fpvalid=1"的自相矛盾 THREAD 块。
+        fp_ok = 0;
+    }
     rc = pt_getfpregs(pid, (user_fpregs64_struct*)&i._fpregs);
     if (rc != 0) { warn("getfpregs thread %d failed, zeroed block", pid); fp_ok = 0; }
     rc = ptrace(PTRACE_GETSIGINFO, pid, 0, &i._siginfo);
@@ -1974,8 +1987,13 @@ int Coredump::generate(const char *corefile)
     }
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    // R50-6: leader 已 attach（SIGSTOP）；失败须 detach 已 attach 线程，
+    // 否则目标冻结（内核自动 detach 不恢复 TASK_STOPPED）。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        for (pid_t& tid : _process._thrd_pid) {
+            pt_detach(tid);
+        }
         out.Close();
         unlink(corefile);
         return -1;
@@ -2140,8 +2158,11 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    // R50-6: leader 已 attach（SIGSTOP）；须还原（detach 兄弟 + 清 TRACEFORK +
+    // CONT leader），否则目标冻结。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        restore_target_after_fail();
         out.Close();
         unlink(corefile);
         return -1;
@@ -2341,10 +2362,17 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     ts_pause.end();
 
     if (!sys_core) {
+        // R50-6: 失败路径在末尾杀 fork 子进程之前提前 return，子进程会作为
+        // TRACEFORK 停止态 tracee 泄漏（若目标有 SIGTRAP handler，detach 后
+        // 重投的 SIGTRAP 被处理，子进程作为目标副本继续存活）。统一先杀。
+        auto kill_fork_child = [&]() -> void {
+            ptrace(PTRACE_DETACH, _core_pid, NULL, SIGKILL);
+        };
         // write acore
         // B65: 读子进程内存失败（child 消失/dumpable=0）时 fail-closed，还原目标。
         if (WriteLoads(out, _core_pid, maps) != 0) {
             error("failed to dump memory of child %d", (int)_core_pid);
+            kill_fork_child();
             restore_target_after_fail();
             out.Close();
             unlink(corefile);
@@ -2353,6 +2381,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // B69: ELF 块写入失败（磁盘满）时 fail-closed。
         if (WriteElfHeader(out) != 0) {
             error("failed to write elf header");
+            kill_fork_child();
             restore_target_after_fail();
             out.Close();
             unlink(corefile);
@@ -2361,6 +2390,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // R50-6: 尾标写失败同 B69/B70——缺结束标记的解压必拒，显式失败。
         if (WriteTailMark(out) != 0) {
             error("failed to write tail mark (disk full?)");
+            kill_fork_child();
             restore_target_after_fail();
             out.Close();
             unlink(corefile);
@@ -2464,8 +2494,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    // R50-6: leader 已被 INTERRUPT 停住；失败须还原（detach 兄弟 + 清 TRACEFORK +
+    // CONT leader），否则目标冻结、monitor 误以为仍在监控。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        restore_target_after_fail();
         // b41 (Codex review): 清理已打开的空 acore（8 字节 header），不残留假文件。
         out.Close();
         unlink(corefile);
@@ -2980,10 +3013,23 @@ int Coredump::monitor(const char* corefile)
     _phdrs.clear();
     _core_pid = 0;
 
+    // R50-6: 崩溃采集的失败路径同样要让崩溃进程死亡——成功路径末尾对每个线程
+    // PTRACE_DETACH(exit_sig) 重投崩溃信号；失败路径若只 detach(NULL) 或直接
+    // return，leader 停在崩溃信号 delivery-stop，内核自动 detach 不重投信号，
+    // 进程既不运行也不死亡，滞留冻结。统一走这个 kill_crashed。
+    auto kill_crashed = [&]() -> void {
+        for (pid_t& tid : _process._thrd_pid) {
+            ptrace(PTRACE_DETACH, tid, NULL, (uintptr_t) exit_sig);
+        }
+    };
+
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        kill_crashed();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -2991,6 +3037,7 @@ int Coredump::monitor(const char* corefile)
     // N4: 崩溃路径 /proc 读失败时目标已死，无法重试；报错并清理空 acore。
     if (WriteProcessMeta(out, maps) != 0) {
         error("write process meta failed for crashed process");
+        kill_crashed();
         out.Close();
         unlink(corefile);
         return -1;
@@ -3001,6 +3048,7 @@ int Coredump::monitor(const char* corefile)
     // LOADS/ELF → 坏 acore。检查并清理部分产物。
     if (WriteThreadMeta(out, _pid, true) != 0) {
         error("write leader thread meta failed");
+        kill_crashed();
         out.Close();
         unlink(corefile);
         return -1;
@@ -3011,6 +3059,7 @@ int Coredump::monitor(const char* corefile)
 
         if (WriteThreadMeta(out, tid) != 0) {
             error("write thread meta of %d failed", tid);
+            kill_crashed();
             out.Close();
             unlink(corefile);
             return -1;
@@ -3021,6 +3070,7 @@ int Coredump::monitor(const char* corefile)
         // B65: 崩溃路径 /proc/pid/mem 读不到时报错并清理，不产出空 core。
         if (WriteLoads(out, _pid, maps) != 0) {
             error("failed to dump memory of crashed process %d", _pid);
+            kill_crashed();
             out.Close();
             unlink(corefile);
             return -1;
@@ -3028,6 +3078,7 @@ int Coredump::monitor(const char* corefile)
         // B69: ELF 块写入失败时清理。
         if (WriteElfHeader(out) != 0) {
             error("failed to write elf header for crashed process");
+            kill_crashed();
             out.Close();
             unlink(corefile);
             return -1;
@@ -3035,6 +3086,7 @@ int Coredump::monitor(const char* corefile)
         // R50-6: 尾标写失败同 B69——缺结束标记的解压必拒，清理残缺 acore。
         if (WriteTailMark(out) != 0) {
             error("failed to write tail mark (disk full?)");
+            kill_crashed();
             out.Close();
             unlink(corefile);
             return -1;
@@ -3234,6 +3286,8 @@ int Coredump::test_compress(const char* in_file, const char* out_file)
     Lz4Stream out(Lz4Stream::LZ4_Compress);
     rc = out.Open(out_file);
     if (rc < 0) {
+        // R50-6: out 打开失败时 fin 已 fopen，泄漏输入 fd。
+        fclose(fin);
         return -1;
     }
 
