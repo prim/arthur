@@ -1601,7 +1601,12 @@ int Coredump::generate(const char *corefile)
     collect_threads(_pid);
 
     ProcMaps maps;
-    WriteProcessMeta(out, maps);
+    // N4: WriteProcessMeta 失败（/proc 读失败）时继续写会让 acore 缺进程元数据，
+    // 解压错位；直接失败。
+    if (WriteProcessMeta(out, maps) != 0) {
+        error("write process meta failed");
+        return -1;
+    }
     // handle  leader first and then rest
     WriteThreadMeta(out, _pid, true);
     for(pid_t& tid : _process._thrd_pid) {
@@ -1666,7 +1671,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     collect_threads(_pid);
 
     ProcMaps maps;
-    WriteProcessMeta(out, maps); 
+    // N4: WriteProcessMeta 失败（/proc 读失败）时若继续写，acore 缺进程元数据，
+    // 解压端 ReadMeta 的 GetFile 序列错位。fail-closed 还原目标。
+    if (WriteProcessMeta(out, maps) != 0) {
+        error("write process meta failed");
+        restore_target_after_fail();
+        return -1;
+    }
     // handle  leader first and then rest
     WriteThreadMeta(out, _pid, true);
     for(pid_t& tid : _process._thrd_pid) {
@@ -1867,7 +1878,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     collect_threads(_pid);
 
     ProcMaps maps;
-    WriteProcessMeta(out, maps); 
+    // N4: WriteProcessMeta 失败（/proc 读失败）时若继续写，acore 缺进程元数据，
+    // 解压端 ReadMeta 的 GetFile 序列错位。fail-closed 还原目标。
+    if (WriteProcessMeta(out, maps) != 0) {
+        error("write process meta failed");
+        restore_target_after_fail();
+        return -1;
+    }
     // handle  leader first and then rest
     WriteThreadMeta(out, _pid, true);
     for(pid_t& tid : _process._thrd_pid) {
@@ -2193,7 +2210,13 @@ int Coredump::monitor(const char* corefile)
     collect_threads(_pid);
 
     ProcMaps maps;
-    WriteProcessMeta(out, maps);
+    // N4: 崩溃路径 /proc 读失败时目标已死，无法重试；报错并清理空 acore。
+    if (WriteProcessMeta(out, maps) != 0) {
+        error("write process meta failed for crashed process");
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
 
     // handle  leader first and then rest
     WriteThreadMeta(out, _pid, true);
