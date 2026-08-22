@@ -469,28 +469,48 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     user_regs64_struct regs;
     assert(argc <= 6);
 
+    // B71: 中途失败也要恢复被注入践踏的状态（[rsp-8] 内存字 + FP/SIMD），
+    // 否则 fail-closed 后目标带着注入的 0 / 垃圾 xmm 继续运行。
+    user_fpregs64_struct fpregs;
+    int fp_saved = 0;
+    int stack_saved = 0;
+    uint64_t orig_stack_word = 0;
+    uint64_t inject_rsp = 0;
+
+    auto fail = [&](const char* msg) -> int {
+        error("pt_call: %s %d failed (%s)", msg, pid, strerror(errno));
+        // 恢复注入期间被修改的目标状态
+#ifndef __aarch64__
+        if (stack_saved) {
+            errno = 0;
+            ptrace(PTRACE_POKEDATA, pid, inject_rsp, (void*)orig_stack_word);
+        }
+#endif
+        if (fp_saved) {
+            pt_setfpregs(pid, &fpregs);
+        }
+        return -1;
+    };
+
     // get origin regs
     // B57: 目标可能在注入中途死亡（兄弟线程 SIGKILL / 自身崩溃），各 ptrace
     // 调用返回 -ESRCH。全部改为干净返回错误，不再 assert abort。
     rc = pt_getregs(pid, &regs);
-    if (rc != 0) { error("pt_call: getregs %d failed", pid); return -1; }
+    if (rc != 0) { return fail("getregs"); }
 
     // B3: 注入会跑真实 libc 函数，按 SysV ABI 践踏 caller-saved 的 FP/SIMD
     // 寄存器；监控型 dump 后目标继续运行会读到垃圾 xmm。先保存，结束恢复。
-    user_fpregs64_struct fpregs;
     rc = pt_getfpregs(pid, &fpregs);
-    if (rc != 0) { error("pt_call: getfpregs %d failed", pid); return -1; }
+    if (rc != 0) { return fail("getfpregs"); }
+    fp_saved = 1;
 
     // simulate call instruction
 #ifdef __aarch64__
     regs.regs[30] = 0;
 #else
-    // B3: [rsp-8] 是目标真实调用帧的返回地址槽位。原实现写 0 后永不恢复，
-    // saved_regs 只恢复 rsp 寄存器不恢复该内存——帧返回时 rip=0 → 目标崩。
-    // 先 PEEKDATA 保存原字，注入结束后写回。
-    uint64_t inject_rsp = regs.rsp - 8;
-    int stack_saved = 0;
-    uint64_t orig_stack_word = 0;
+    // B3: [rsp-8] 是模拟 call 压入的返回地址槽位（red zone 下方）。原实现写 0
+    // 后永不恢复，目标帧返回时 rip=0 → 崩。先 PEEKDATA 保存原字，注入结束后写回。
+    inject_rsp = regs.rsp - 8;
     errno = 0;
     long peeked = ptrace(PTRACE_PEEKDATA, pid, inject_rsp, NULL);
     if (errno == 0) {
@@ -499,7 +519,7 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     }
     regs.rsp -= 8;
     rc = ptrace(PTRACE_POKEDATA, pid, regs.rsp, 0);
-    if (rc != 0) { error("pt_call: poke [rsp-8] %d failed", pid); return -1; }
+    if (rc != 0) { return fail("poke [rsp-8]"); }
 #endif
 
     // makeup function call and arguments
@@ -511,26 +531,26 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
                 break;
             case 1:
                 regs.set_arg1(argv[1]);
-                break; 
+                break;
             case 2:
                 regs.set_arg2(argv[2]);
-                break; 
+                break;
             case 3:
                 regs.set_arg3(argv[3]);
-                break; 
+                break;
             case 4:
                 regs.set_arg4(argv[4]);
-                break; 
+                break;
             case 5:
                 regs.set_arg5(argv[5]);
                 break;
             default:
-               assert(0); 
+               assert(0);
         }
     }
- 
+
     rc = pt_setregs(pid, &regs);
-    if (rc != 0) { error("pt_call: setregs %d failed", pid); return -1; }
+    if (rc != 0) { return fail("setregs"); }
 
     // wait for a SIGSEGV
     for (;;) {
@@ -541,7 +561,7 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
             if ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8))) {
                 unsigned long msg;
                 rc = ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
-                if (rc != 0) { error("pt_call: geteventmsg %d failed", pid); return -1; }
+                if (rc != 0) { return fail("geteventmsg"); }
                 dprint("child pid = %lu", msg);
             }
             dprint("statux = %x", status);
@@ -549,8 +569,7 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
         rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
         if (rc < 0) {
             // 目标在注入过程中死亡（兄弟线程 SIGKILL 等）
-            error("pt_call: cont %d failed (%s)", pid, strerror(errno));
-            return -1;
+            return fail("cont");
         }
 
         status = pt_wait(pid);
