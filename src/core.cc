@@ -435,7 +435,7 @@ static inline int pt_setfpregs(pid_t pid, user_fpregs64_struct *pregs)
 }
 
 // read all xstate registers (x64)
-static inline int pt_getxstateregs(pid_t pid, x64_xstatereg *pregs)
+static inline int pt_getxstateregs(pid_t pid, x64_xstatereg *pregs, size_t *out_len = NULL)
 {
     int rc;
 
@@ -445,7 +445,21 @@ static inline int pt_getxstateregs(pid_t pid, x64_xstatereg *pregs)
     rc = ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &iov);
 
     // B30: 不 assert，失败由调用方处理
+    if (out_len) {
+        // 内核回写 iov_len 为实际 XSTATE 大小（取决于 XCR0）
+        *out_len = (rc == 0) ? iov.iov_len : 0;
+    }
     return rc;
+}
+
+// b3: 恢复完整 XSTATE。len 用保存时的实际长度——SETREGSET 对大于 CPU 支持
+// 的缓冲（iov_len 超 XCR0 覆盖区）会失败。
+static inline int pt_setxstateregs(pid_t pid, x64_xstatereg *pregs, size_t len)
+{
+    struct iovec iov;
+    iov.iov_base = pregs;
+    iov.iov_len = len;
+    return ptrace(PTRACE_SETREGSET, pid, NT_X86_XSTATE, &iov);
 }
 
 // write all general purpose registers
@@ -482,8 +496,19 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
 
     // B71: 中途失败也要恢复被注入践踏的状态（[rsp-8] 内存字 + FP/SIMD），
     // 否则 fail-closed 后目标带着注入的 0 / 垃圾 xmm 继续运行。
+#ifdef __aarch64__
     user_fpregs64_struct fpregs;
     int fp_saved = 0;
+#endif
+#ifndef __aarch64__
+    // b3 (Codex review): 注入真实 libc 函数按 SysV ABI 践踏 caller-saved 扩展
+    // 状态——FXSAVE 512B 只覆盖 x87/xmm 低 128 位，AVX/AVX-512 的 ymm/zmm
+    // 高半部与 opmask 在 XSTATE 里。GETREGSET(NT_X86_XSTATE) 全量保存，
+    // SETREGSET 同实际长度写回（XCR0 决定大小）。
+    x64_xstatereg xstate;
+    size_t xstate_len = 0;
+    int xstate_saved = 0;
+#endif
     int stack_saved = 0;
     uint64_t orig_stack_word = 0;
     uint64_t inject_rsp = 0;
@@ -496,10 +521,14 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
             errno = 0;
             ptrace(PTRACE_POKEDATA, pid, inject_rsp, (void*)orig_stack_word);
         }
-#endif
+        if (xstate_saved && pt_setxstateregs(pid, &xstate, xstate_len) != 0) {
+            error("pt_call: restore xstate %d failed (%s)", pid, strerror(errno));
+        }
+#else
         if (fp_saved) {
             pt_setfpregs(pid, &fpregs);
         }
+#endif
         return -1;
     };
 
@@ -509,11 +538,16 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     rc = pt_getregs(pid, &regs);
     if (rc != 0) { return fail("getregs"); }
 
-    // B3: 注入会跑真实 libc 函数，按 SysV ABI 践踏 caller-saved 的 FP/SIMD
-    // 寄存器；监控型 dump 后目标继续运行会读到垃圾 xmm。先保存，结束恢复。
+    // B3: 保存 FP/SIMD（x86-64 用 XSTATE 全量含 AVX-512，aarch64 用 FPSIMD）
+#ifndef __aarch64__
+    rc = pt_getxstateregs(pid, &xstate, &xstate_len);
+    if (rc != 0) { return fail("getxstateregs"); }
+    xstate_saved = 1;
+#else
     rc = pt_getfpregs(pid, &fpregs);
     if (rc != 0) { return fail("getfpregs"); }
     fp_saved = 1;
+#endif
 
     // simulate call instruction
 #ifdef __aarch64__
@@ -599,7 +633,7 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     }
 
     // B3: 恢复被注入践踏的状态。ret 已把 rsp 还原，[inject_rsp] 仍存 0；
-    // 写回原返回地址字，并恢复 FP/SIMD。
+    // 写回原返回地址字，并恢复 FP/SIMD（x86-64 用 XSTATE 全量含 AVX-512）。
 #ifdef __aarch64__
     // 无 [rsp-8] 模拟；仅恢复 FP
     pt_setfpregs(pid, &fpregs);
@@ -608,7 +642,9 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
         errno = 0;
         ptrace(PTRACE_POKEDATA, pid, inject_rsp, (void*)orig_stack_word);
     }
-    pt_setfpregs(pid, &fpregs);
+    if (xstate_saved && pt_setxstateregs(pid, &xstate, xstate_len) != 0) {
+        error("pt_call: restore xstate %d failed (%s)", pid, strerror(errno));
+    }
 #endif
 
     return rc;
