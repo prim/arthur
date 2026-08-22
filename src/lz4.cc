@@ -96,6 +96,12 @@ int Lz4Stream::Open(const char *file)
 
 void Lz4Stream::Close()
 {
+    // R50-6: 幂等——双重 Close 曾因 fclose(NULL) 使 arthur 自身段错误
+    //（forkcore 失败路径复制了 out.Close(); unlink(); 两组）。NULL 时直接返回。
+    if (!_file) {
+        return;
+    }
+
     if (_enc) {
         Flush();
     }

@@ -2038,7 +2038,17 @@ int Coredump::generate(const char *corefile)
             unlink(corefile);
             return -1;
         }
-        WriteTailMark(out);
+        // R50-6: 尾标 3 字节短写（磁盘满）时 acore 缺结束标记，解压报 truncated；
+        // 与 B68/B69/B70 同类，检查并 fail-closed。
+        if (WriteTailMark(out) != 0) {
+            error("failed to write tail mark for %d (disk full?)", _pid);
+            for (pid_t& tid : _process._thrd_pid) {
+                pt_detach(tid);
+            }
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
     // detach all threads
     for (pid_t& tid : _process._thrd_pid) {
@@ -2155,8 +2165,6 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         restore_target_after_fail();
         out.Close();
         unlink(corefile);
-        out.Close();
-        unlink(corefile);
         return -1;
     }
     for(pid_t& tid : _process._thrd_pid) {
@@ -2166,8 +2174,6 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (WriteThreadMeta(out, tid) != 0) {
             error("write thread meta of %d failed", tid);
             restore_target_after_fail();
-            out.Close();
-            unlink(corefile);
             out.Close();
             unlink(corefile);
             return -1;
@@ -2352,7 +2358,14 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             unlink(corefile);
             return -1;
         }
-        WriteTailMark(out);
+        // R50-6: 尾标写失败同 B69/B70——缺结束标记的解压必拒，显式失败。
+        if (WriteTailMark(out) != 0) {
+            error("failed to write tail mark (disk full?)");
+            restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
 
     // kill the forked process
@@ -2477,8 +2490,6 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         restore_target_after_fail();
         out.Close();
         unlink(corefile);
-        out.Close();
-        unlink(corefile);
         return -1;
     }
     for(pid_t& tid : _process._thrd_pid) {
@@ -2488,8 +2499,6 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         if (WriteThreadMeta(out, tid) != 0) {
             error("write thread meta of %d failed", tid);
             restore_target_after_fail();
-            out.Close();
-            unlink(corefile);
             out.Close();
             unlink(corefile);
             return -1;
@@ -2686,18 +2695,30 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // write acore
         {
             // B65: 读子进程内存失败（child 消失/dumpable=0）时 fail-closed，还原目标。
+            // R50-6: 放行后失败同样要清理部分 acore（此前只 recover，残留残缺文件）。
         if (WriteLoads(out, _core_pid, maps) != 0) {
             error("failed to dump memory of child %d", (int)_core_pid);
             recover_after_resume();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
             // B69: ELF 块写入失败（磁盘满）时 fail-closed。
             if (WriteElfHeader(out) != 0) {
                 error("failed to write elf header");
                 recover_after_resume();
+                out.Close();
+                unlink(corefile);
                 return -1;
             }
-            WriteTailMark(out);
+            // R50-6: 尾标写失败同 B69——缺结束标记的解压必拒，显式失败并清理。
+            if (WriteTailMark(out) != 0) {
+                error("failed to write tail mark (disk full?)");
+                recover_after_resume();
+                out.Close();
+                unlink(corefile);
+                return -1;
+            }
         }
     }
 
@@ -3011,7 +3032,13 @@ int Coredump::monitor(const char* corefile)
             unlink(corefile);
             return -1;
         }
-        WriteTailMark(out);
+        // R50-6: 尾标写失败同 B69——缺结束标记的解压必拒，清理残缺 acore。
+        if (WriteTailMark(out) != 0) {
+            error("failed to write tail mark (disk full?)");
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
 
     for (pid_t& tid : _process._thrd_pid) {
@@ -3255,7 +3282,10 @@ flush_and_close:
         error("compress flush failed");
         rc = -1;
     }
-    WriteTailMark(out);
+    // R50-6: 尾标写失败（磁盘满）时输出缺结束标记，解压必拒；与 rc 一并传播。
+    if (WriteTailMark(out) != 0) {
+        rc = -1;
+    }
     out.Close();
     fclose(fin);
 

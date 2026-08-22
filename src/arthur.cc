@@ -70,7 +70,7 @@ void help()
 
 int main(int argc, char *argv[])
 {   
-    const char *opts = "hvp:d:t:mc:o:1234567890";
+    const char *opts = "hvp:mc:o:1234567890";
     struct option longopts[] = {
              { "help", no_argument, NULL, 'h' },
              { "pid", required_argument, NULL, 'p' },
@@ -82,6 +82,7 @@ int main(int argc, char *argv[])
     };
 
     int ch;
+    int mode_set = 0;   // R50-6: 记录 mode 选项个数，冲突检测
     while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
         switch (ch) {
 
@@ -92,7 +93,7 @@ int main(int argc, char *argv[])
         case 'm':   // merge
             cfg.op = ARTHUR_OP_MERGE;
             break;
-        
+
         case 'c':   // core
             cfg.op = ARTHUR_OP_DECOMPRESS;
             cfg.metafile = strdup(optarg);
@@ -104,18 +105,22 @@ int main(int argc, char *argv[])
 
         case '0':   // forkcore
             cfg.mode = 0;
+            mode_set++;
             break;
 
         case '1':   // gcore
-            cfg.mode = 1; 
+            cfg.mode = 1;
+            mode_set++;
             break;
-        
-        case '2':   // forkcore by kernel 
-            cfg.mode = 2; 
+
+        case '2':   // forkcore by kernel
+            cfg.mode = 2;
+            mode_set++;
             break;
 
         case '3':   // monitor
             cfg.mode = 3;
+            mode_set++;
             break;
 
         case 'h':
@@ -130,6 +135,13 @@ int main(int argc, char *argv[])
             help();
             return -1;
         }
+    }
+
+    // R50-6: 多个 mode 选项（-0/-1/-2/-3）同时给出时，原实现"最后一个生效"
+    // 静默覆盖（如 `-0 -2` 实际执行 mode 2）。冲突应显式失败。
+    if (mode_set > 1) {
+        error("conflicting mode options (-0/-1/-2/-3 are mutually exclusive)");
+        return -1;
     }
 
     Coredump dump(cfg.pid);
@@ -199,5 +211,9 @@ int main(int argc, char *argv[])
         return dump.test_decompress(in_file, out_file);
     }
 
-    return 0;
+    // R50-6: 无 -p/-c/-m、mode 非 1/2 却带位置参数——原实现静默 return 0
+    //（no-op 却报成功，脚本误判）。显式失败。
+    error("no operation selected (use -p <pid>, -c <acore>, or -1/-2 for test)");
+    help();
+    return 2;
 }
