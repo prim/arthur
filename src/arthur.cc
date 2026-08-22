@@ -178,11 +178,22 @@ int main(int argc, char *argv[])
 
     // test file compress
     if (cfg.mode == 1) {
+        // R50-1: 缺输入文件时 argv[optind] 为 NULL——snprintf %s 与 fopen(NULL)
+        // 崩溃。显式报错。
+        if (optind >= argc) {
+            error("test_compress: missing input file");
+            return 2;
+        }
         const char *file = argv[optind];
         char buf[128];
         snprintf(buf, sizeof(buf), "%s.z4", file);
         return dump.test_compress(file, buf);
     } else if (cfg.mode == 2) {
+        // R50-1: 缺输出文件时 argv[optind+1] 为 NULL——fopen(NULL,"wb") 崩溃。
+        if (optind + 1 >= argc) {
+            error("test_decompress: missing output file");
+            return 2;
+        }
         const char *in_file = argv[optind];
         const char *out_file = argv[optind+1];
         return dump.test_decompress(in_file, out_file);
