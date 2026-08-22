@@ -276,19 +276,22 @@ int ProcStat::Parse()
     };
 
     sname = fld(2)[0];
-    // B25: 与内核 task_state_array 对齐（fs/proc/array.c）：
-    // R=0 S=1 D=2 T=4(stopped) t=8(tracing) X=16 Z=32 P=64 I=128。
-    // 原映射 'T'→3、'Z'→4 与内核不符（'T' 应为 4，'Z' 应为 32）。
+    // b25 (Codex review): ELF prpsinfo 的 pr_state 由内核 fill_psinfo 填
+    // task_state_index(p)，即 fs/proc/array.c task_state_array 的**序数**
+    // （`return fls(state)`：find last set bit），不是 TASK_* 位值。
+    // task_state_array = {R,S,D,T,t,X,Z,P,I}，序数为 R=0 S=1 D=2 T=3 t=4
+    // X=5 Z=6 P=7 I=8。原实现写的是位值（T=4/t=8/X=16/Z=32/P=64/I=128），
+    // 与内核 pr_state 不符，gdb info proc 显示错误的状态序号。
     switch (sname) {
         case 'R': state=0; break;
         case 'S': state=1; break;
         case 'D': state=2; break;
-        case 'T': state=4; break;   // TASK_STOPPED
-        case 't': state=8; break;   // TASK_TRACED
-        case 'X': state=16; break;  // EXIT_DEAD
-        case 'Z': state=32; break;  // EXIT_ZOMBIE
-        case 'P': state=64; break;  // TASK_PARKED
-        case 'I': state=128; break; // TASK_IDLE
+        case 'T': state=3; break;   // task_state_array index 3 (stopped)
+        case 't': state=4; break;   // index 4 (tracing stop)
+        case 'X': state=5; break;   // index 5 (dead)
+        case 'Z': state=6; break;   // index 6 (zombie)
+        case 'P': state=7; break;   // index 7 (parked)
+        case 'I': state=8; break;   // index 8 (idle)
         default: state=0; break;
     }
 
