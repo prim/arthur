@@ -52,15 +52,17 @@ void help()
     " -0 : forkcore and lz4 compressed. (default)\n"
     " -1 : same as gcore but lz4 compressed, less file size.\n"
     " -2 : same as (1) but corefile by kernel, merge a corefile afterwise.\n"
+    "      NOTE: merge (-m) is not implemented; the kernel core alone is usable,\n"
+    "      but the metadata file cannot be merged into a final GNU corefile.\n"
     " -3 : attach to process, write gcore with lz4 compressed on SIGSIL, SIGABRT and SIGSEGV\n"
     "      able to write out acorefile when monitoring"
     "\n"
     "Convert acore to corefile,\n"
     "  arthur -c <acore> -o <corefile>\n"
     "\n"
-    "Merge support for Mode(2),\n"
+    "Merge support for Mode(2) -- NOT IMPLEMENTED,\n"
     "  arthur -m <acore> <core> -o <corefile>\n"
-    "\n" 
+    "\n"
     ;
 
     puts(help);

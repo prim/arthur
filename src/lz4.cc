@@ -172,17 +172,37 @@ int Lz4Stream::Write(const char *s, size_t n)
     }
 
     // begin a new block
-    Flush();
+    // B78: Flush 失败（磁盘满）时当前块未密封，继续写会错位。
+    if (Flush() < 0) {
+        error("Write: flush failed (disk full?)");
+        return -1;
+    }
 
     // one block
     if (n < BLOCK_SIZE) {
         Block& block = CurrentBlock();
-        return block.Write(s, n); 
+        return block.Write(s, n);
     }
 
-    // write blocks
-    assert(0);
-    return n;
+    // B78 (Codex B5/B9 review): 原 `assert(0)` 对 n >= BLOCK_SIZE 直接 abort
+    //（NDEBUG 下返回 n 却不写数据）。循环切块写入并传播 Flush 错误。
+    size_t m = 0;
+    while (m < n) {
+        size_t j = MIN(BLOCK_SIZE, n - m);
+        Block& b = CurrentBlock();
+        b.Clear();
+        int wrc = b.Write(s + m, j);
+        if (wrc < 0) {
+            error("Write: block write failed");
+            return -1;
+        }
+        m += wrc;
+        if (Flush() < 0) {
+            error("Write: flush failed (disk full?)");
+            return -1;
+        }
+    }
+    return (int)m;
 }
 
 /* write blocks and flush.

@@ -1184,10 +1184,18 @@ int Coredump::collect_threads(pid_t leader)
         if (dp->d_name[0] == '.') continue;
         int tid = atoi(dp->d_name);
         if (tid == 0 || tid == leader) continue;
+        errno = 0;
         if (pt_attach(tid) != 0) {
-            // 线程可能在枚举后退出（ESRCH）：跳过，保证计数与实际块一致
-            error("attach thread %d failed (may have exited), skipped", tid);
-            continue;
+            // B77 (Codex B7 review): 线程可能在枚举与 attach 间退出（ESRCH，跳过）；
+            // 但 EPERM/tracer 冲突等非 ESRCH 错误是真实故障，跳过会静默产出不完整
+            // dump。fail-closed。
+            if (errno == ESRCH) {
+                error("attach thread %d failed (exited), skipped", tid);
+                continue;
+            }
+            error("attach thread %d failed (%s), aborting collection", tid, strerror(errno));
+            closedir(dirp);
+            return -1;
         }
         _process._thrd_pid.push_back(tid);
     }
@@ -1672,7 +1680,11 @@ int Coredump::generate(const char *corefile)
         return -1;
     }
     // get all threads pid（attach 全部非主线程，剔除已退出的）
-    collect_threads(_pid);
+    // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    if (collect_threads(_pid) != 0) {
+        error("failed to collect threads of %d", _pid);
+        return -1;
+    }
 
     ProcMaps maps;
     // N4: WriteProcessMeta 失败（/proc 读失败）时继续写会让 acore 缺进程元数据，
@@ -1784,7 +1796,11 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     }
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
-    collect_threads(_pid);
+    // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    if (collect_threads(_pid) != 0) {
+        error("failed to collect threads of %d", _pid);
+        return -1;
+    }
 
     ProcMaps maps;
     // N4: WriteProcessMeta 失败（/proc 读失败）时若继续写，acore 缺进程元数据，
@@ -1953,7 +1969,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 
     // now the process becomes zombie,
     // we have to waitpid the forked pid.
-    pt_attach(_pid);
+    // B76 (Codex B6 review): 末尾 re-attach 的 pt_attach/pt_getregs/pt_setregs/
+    // pt_detach 返回全被忽略——目标若在自由运行窗口退出/被另一 tracer 占用，
+    // attach 失败后继续注入会读到垃圾。acore 已写（有效），此处告警而非静默成功。
+    if (pt_attach(_pid) != 0) {
+        warn("re-attach of %d failed; injected waitpid may not have reaped the "
+             "fork child", _pid);
+    }
     pt_getregs(_pid, &saved_regs);
     {
         uint64_t gv[3] = { (uint64_t)_core_pid, (uint64_t)NULL, 0 };
@@ -2015,7 +2037,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     pt_int(_pid);
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
-    collect_threads(_pid);
+    // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    if (collect_threads(_pid) != 0) {
+        error("failed to collect threads of %d", _pid);
+        return -1;
+    }
 
     ProcMaps maps;
     // N4: WriteProcessMeta 失败（/proc 读失败）时若继续写，acore 缺进程元数据，
@@ -2395,7 +2421,11 @@ int Coredump::monitor(const char* corefile)
     _core_pid = 0;
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
-    collect_threads(_pid);
+    // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
+    if (collect_threads(_pid) != 0) {
+        error("failed to collect threads of %d", _pid);
+        return -1;
+    }
 
     ProcMaps maps;
     // N4: 崩溃路径 /proc 读失败时目标已死，无法重试；报错并清理空 acore。
