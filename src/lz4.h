@@ -261,9 +261,16 @@ public:
     int ReadRaw(char* out, size_t n);
     int Peek(char*out, size_t n);
 
-    // put or get file to stream 
+    // put or get file to stream
     ProcFile* GetFile();
     int PutFile(ProcFile *pf);
+
+    // R50-1: 区分干净 EOF / 真实 I/O 错误（test_decompress 判断 ReadBlock NULL）
+    bool IsEof() { return _file ? feof(_file) : true; }
+    bool IsError() { return _file ? ferror(_file) : false; }
+    // R50-1: 最近一次 ReadBlock 返回 NULL 是否因"干净结束"（块边界 EOF / 尾标）。
+    // 短读命中 EOF 也会置 feof，不能用 IsEof() 判断；由 ReadBlock 内部标记。
+    bool LastReadClean() { return _eof_clean; }
 
     // file position
     long Tell();
@@ -308,6 +315,9 @@ private:
     // counter
     size_t _size_real;          // real bytes, decompressed data size.
     size_t _size_file;          // file bytes, compressed data size.
+
+    // R50-1: 最近一次 ReadBlock 是否为干净结束（块边界 EOF/尾标）
+    bool _eof_clean;
 };
 
 };

@@ -363,9 +363,19 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
  */
 static inline int pt_wait(pid_t pid)
 {
-    int status;
-    waitpid(pid, &status, WUNTRACED);
-    //assert (rc == pid);
+    int status = 0;
+    // 原实现忽略 waitpid 返回值：失败（EINTR 被信号打断 / ECHILD 目标已被 reap）时
+    // status 未初始化就被返回，pt_call 循环对垃圾值做 WIFSTOPPED/WSTOPSIG。
+    for (;;) {
+        pid_t rc = waitpid(pid, &status, WUNTRACED);
+        if (rc == pid) {
+            break;
+        }
+        if (rc < 0 && errno == EINTR) {
+            continue;   // 被信号打断，重试
+        }
+        return -1;      // ECHILD 等：调用方按"非停止/失败"处理
+    }
     dprint("status = %x (%d, %d)", status, WIFSTOPPED(status), WSTOPSIG(status));
     return status;
 }
@@ -558,10 +568,14 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     inject_rsp = regs.rsp - 8;
     errno = 0;
     long peeked = ptrace(PTRACE_PEEKDATA, pid, inject_rsp, NULL);
-    if (errno == 0) {
-        stack_saved = 1;
-        orig_stack_word = (uint64_t)peeked;
+    if (errno != 0) {
+        // R50-1: PEEKDATA 失败（栈槽不可读）却继续 POKE 0，恢复时因 stack_saved=0
+        // 漏写回，目标 [rsp-8] 永久残留 0 → 后续 ret 到 0 崩。栈槽不可读是异常
+        // 状态，fail-closed 返回（fail() 会恢复 xstate/fp）。
+        return fail("peek [rsp-8]");
     }
+    stack_saved = 1;
+    orig_stack_word = (uint64_t)peeked;
     regs.rsp -= 8;
     rc = ptrace(PTRACE_POKEDATA, pid, regs.rsp, 0);
     if (rc != 0) { return fail("poke [rsp-8]"); }
@@ -664,7 +678,13 @@ static inline int pt_write(pid_t pid, uint64_t dest, void *src, size_t len)
     }
     ssize_t rc = pwrite(fd, src, len, dest);
     if (rc != (ssize_t)len) {
-        error("write mem(%lx) of %d failed(%d).", dest, pid, errno);
+        // R50-1: 短写（0<=rc<len）时 POSIX 不保证设置 errno，打印陈旧 errno 误导
+        // 排障。仅 rc<0 才解释 errno；短写打印实际字节数。
+        if (rc < 0) {
+            error("write mem(%lx) of %d failed (%s)", dest, pid, strerror(errno));
+        } else {
+            error("write mem(%lx) of %d short write: %zd of %zu bytes", dest, pid, rc, len);
+        }
         close(fd);
         return -1;
     }
@@ -893,7 +913,10 @@ int Note::fill_auxv(const ProcessData& proc)
 // NT_FILE
 int Note::fill_file(const ProcessData& proc)
 {
-    Block block;
+    // R50-1: 原用固定 64KB 的局部 Block 拼 NT_FILE，block.Write 的 -ENOSPC 返回
+    // 全被忽略——进程文件型映射足够多（约 >2000 个）时内容超 64KB，多余 entry/
+    // 文件名静默丢弃，但第 8 字节的 count 仍是完整数 → gdb 报 malformed note。
+    // 改为可增长 std::string，不再有容量上限。
     struct file_entry {
         uint64_t start_addr;
         uint64_t end_addr;
@@ -902,8 +925,6 @@ int Note::fill_file(const ProcessData& proc)
     };
     std::vector<file_entry> entries;
 
-    uint64_t v;
-    block.Clear();
     for (auto &r : *proc._d_maps) {
         if (r.name.size() > 0 && r.inode > 0) {
             file_entry n;
@@ -915,33 +936,33 @@ int Note::fill_file(const ProcessData& proc)
         }
     }
 
-    // number of entries
-    v = entries.size();
-    block.Write((const char*)&v, 8);
-    
+    std::string payload;
+    uint64_t v = entries.size();
+    payload.append((const char*)&v, 8);
+
     // page size (4k)
     v = 0x1000;
-    block.Write((const char*)&v, 8);
+    payload.append((const char*)&v, 8);
 
-    // address 
-    for (auto& n :entries) {
-        block.Write((const char*)&n.start_addr, 8);
-        block.Write((const char*)&n.end_addr, 8);
-        block.Write((const char*)&n.offset, 8);
+    // address
+    for (auto& n : entries) {
+        payload.append((const char*)&n.start_addr, 8);
+        payload.append((const char*)&n.end_addr, 8);
+        payload.append((const char*)&n.offset, 8);
     }
-   
+
     // file names
-    for (auto& n :entries) {
-        block.Write(n.filename.c_str(), n.filename.size() + 1);
+    for (auto& n : entries) {
+        payload.append(n.filename.c_str(), n.filename.size() + 1);
     }
-    
+
     // 文件名区精确长度作 descsz，不要在内部补零。
     // B15: 原实现 roundup(block.Size(),4) 会在文件名末尾补 0，gdb 把它解析成
     // 一个多余的空文件名 → names 区比 count 个文件实际占用大 → gdb 报
     // "malformed note - filename area is too big"。native core 的 NT_FILE
     // descsz = 16 + count*24 + 精确文件名长度，末尾补齐由 note 对齐处理。
-    char *p = allocate(block.Size());
-    memcpy(p, block.rBuf(), block.Size());
+    char *p = allocate(payload.size());
+    memcpy(p, payload.data(), payload.size());
 
     return 0;
 }
@@ -1109,33 +1130,40 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
     // put ProcessData
     {
         uint32_t u32;
-        out.SetBlock(BLOCK_TYPE_PROCESS); 
+        out.SetBlock(BLOCK_TYPE_PROCESS);
+        // R50-1: 各 out.Write/Flush 返回原未检查——磁盘满时 PROCESS 块缺失仍继续。
+        auto wr = [&](const void* p, size_t n) -> bool {
+            return out.Write((const char*)p, n) >= 0;
+        };
 
-        // this pid 
-        u32 = _pid; 
-        out.Write((const char*)&u32, sizeof(u32));
-        
+        // this pid
+        u32 = _pid;
+        bool ok = wr(&u32, sizeof(u32));
+
         // forked pid if has
         u32 = _core_pid;
-        out.Write((const char*)&u32, sizeof(u32));
+        ok = ok && wr(&u32, sizeof(u32));
 
         // thread number
         u32 = _process._thrd_pid.size();
-        out.Write((const char*)&u32, sizeof(u32));
+        ok = ok && wr(&u32, sizeof(u32));
 
         // time
         struct timeval tv;
         struct timezone tz = {0};   // gettimeofday 不填 tz，避免把未初始化栈写进 acore
         gettimeofday (&tv, &tz);
-        out.Write((const char*)&tv, sizeof(tv));
-        out.Write((const char*)&tz, sizeof(tz));
+        ok = ok && wr(&tv, sizeof(tv));
+        ok = ok && wr(&tz, sizeof(tz));
 
         // uname（sizeof 512 只写入 ~390 字节，其余置零）
         char ubuf[512] = {0};
         uname((utsname*)ubuf);
-        out.Write((const char*)ubuf, sizeof(ubuf));
-        
-        out.Flush();
+        ok = ok && wr(ubuf, sizeof(ubuf));
+
+        if (!ok || out.Flush() < 0) {
+            error("write PROCESS block failed (disk full?)");
+            return -1;
+        }
     }
 
     // put raw files
@@ -1145,33 +1173,51 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
     if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_CMDLINE)) {
         error("read cmdline of %d failed", _pid); return -1;
     }
-    out.PutFile((ProcFile*) buf);
+    if (out.PutFile((ProcFile*) buf) < 0) {
+        error("write proc file failed (disk full?)");
+        return -1;
+    }
     if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_AUXV)) {
         error("read auxv of %d failed", _pid); return -1;
     }
-    out.PutFile((ProcFile*) buf);
+    if (out.PutFile((ProcFile*) buf) < 0) {
+        error("write proc file failed (disk full?)");
+        return -1;
+    }
 
     ProcFile* _maps = ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_MAPS);
     if (!_maps) {
         error("read maps of %d failed", _pid);
         return -1;
     }
-    out.PutFile(_maps);
+    if (out.PutFile(_maps) < 0) {
+        error("write maps failed (disk full?)");
+        return -1;
+    }
     maps.setpf(_maps);
     maps.Parse();
 
     if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_ENVIRON)) {
         error("read environ of %d failed", _pid); return -1;
     }
-    out.PutFile((ProcFile*) buf);
+    if (out.PutFile((ProcFile*) buf) < 0) {
+        error("write proc file failed (disk full?)");
+        return -1;
+    }
     if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_IO)) {
         error("read io of %d failed", _pid); return -1;
     }
-    out.PutFile((ProcFile*) buf);
+    if (out.PutFile((ProcFile*) buf) < 0) {
+        error("write proc file failed (disk full?)");
+        return -1;
+    }
     if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_LIMITS)) {
         error("read limits of %d failed", _pid); return -1;
     }
-    out.PutFile((ProcFile*) buf);
+    if (out.PutFile((ProcFile*) buf) < 0) {
+        error("write proc file failed (disk full?)");
+        return -1;
+    }
 
     return 0;
 }
@@ -1229,30 +1275,35 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     }
 
     // write thread meta
+    // R50-1: 各 out.Write/Flush/PutFile 返回原未检查——磁盘满时静默产出缺线程块的
+    // 坏 acore（与 B64-B70 同 class，WriteThreadMeta 漏了）。检查并 fail-closed。
     out.SetBlock(BLOCK_TYPE_THREAD);
-    out.Write((const char*)&pid, sizeof(i._pid));
+    auto wr = [&](const void* p, size_t n) -> bool {
+        return out.Write((const char*)p, n) >= 0;
+    };
+    bool ok = wr(&pid, sizeof(i._pid));
     // B14: 写成员实际大小，不能用 sizeof(i._regs)（union = max(x64, arm64) 成员）。
     // x64 下 union regs=272/fpregs=528，但 ReadMeta 读 sizeof(x64 成员)=216/512，
     // 多写的 56+16=72 字节让 fpregs/siginfo/xstate 在解压时整体偏移 72 →
     // xstate 头 xfeatures 读到错位数据变 0，gdb 报 .reg-xstate 尺寸不符。
 #ifdef __aarch64__
-    out.Write((const char*)&i._regs, sizeof(i._regs.arm64));
-    out.Write((const char*)&i._fpregs, sizeof(i._fpregs.arm64));
+    ok = ok && wr(&i._regs, sizeof(i._regs.arm64));
+    ok = ok && wr(&i._fpregs, sizeof(i._fpregs.arm64));
 #else
-    out.Write((const char*)&i._regs, sizeof(i._regs.x64));
-    out.Write((const char*)&i._fpregs, sizeof(i._fpregs.x64));
+    ok = ok && wr(&i._regs, sizeof(i._regs.x64));
+    ok = ok && wr(&i._fpregs, sizeof(i._fpregs.x64));
 #endif
-    out.Write((const char*)&i._siginfo, sizeof(i._siginfo));
+    ok = ok && wr(&i._siginfo, sizeof(i._siginfo));
     if (_arch == ARCH_X64) {
-        out.Write((const char*)&i._xstate.x64, sizeof(i._xstate.x64));
+        ok = ok && wr(&i._xstate.x64, sizeof(i._xstate.x64));
     }
-    // v3: THREAD 块尾部——FP 有效位(1) + 全 64 位 SigPnd/SigBlk(8+8)；解压端据此填
-    // pr_fpvalid/pr_sigpend/pr_sighold。合法 v2 读取器不消费这些字节。
-    out.Write((const char*)&i._fp_valid, sizeof(i._fp_valid));
-    out.Write((const char*)&i._sigpend, sizeof(i._sigpend));
-    out.Write((const char*)&i._sighold, sizeof(i._sighold));
-
-    out.Flush();
+    ok = ok && wr(&i._fp_valid, sizeof(i._fp_valid));
+    ok = ok && wr(&i._sigpend, sizeof(i._sigpend));
+    ok = ok && wr(&i._sighold, sizeof(i._sighold));
+    if (!ok || out.Flush() < 0) {
+        error("write thread meta failed (disk full?)");
+        return -1;
+    }
     // read /proc/<pid>/stat；读失败时写最小合法 ProcFile（f_size=0），
     // 避免把未初始化 buf 当 ProcFile 写出（解压端 GetFile 读垃圾 size）。
     // （buf 复用：上方 status 已解析完，这里覆盖。）
@@ -1264,7 +1315,10 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
         pf->f_pid = pid;
         pf->f_type = PROC_TYPE_STAT;
     }
-    out.PutFile(pf);
+    if (out.PutFile(pf) < 0) {
+        error("write thread stat failed (disk full?)");
+        return -1;
+    }
 
     return 0;
 }
@@ -1379,12 +1433,23 @@ int Coredump::ReadMeta(Lz4Stream& in)
     int u = 0;
     int thread_num = 0;
     {
-        buf->Read((char*)&u, sizeof(u));
+        // R50-1: PROCESS 块读返回未检查——块解压不足 12 字节时 u 保留陈旧值，
+        // _pid/_core_pid/thread_num 全错，decompress 带错误计数继续。fail-closed。
+        if (buf->Read((char*)&u, sizeof(u)) != (int)sizeof(u)) {
+            error("PROCESS block too short (acore corrupt)");
+            return -1;
+        }
         _pid = u;
-        buf->Read((char*)&u, sizeof(u));
+        if (buf->Read((char*)&u, sizeof(u)) != (int)sizeof(u)) {
+            error("PROCESS block too short (acore corrupt)");
+            return -1;
+        }
         _core_pid = u;
-        buf->Read((char*)&u, sizeof(u));
-        thread_num = u; 
+        if (buf->Read((char*)&u, sizeof(u)) != (int)sizeof(u)) {
+            error("PROCESS block too short (acore corrupt)");
+            return -1;
+        }
+        thread_num = u;
     }
     info("pid = %d", _pid);
     info("thread_num = %d", thread_num);
@@ -1436,32 +1501,48 @@ int Coredump::ReadMeta(Lz4Stream& in)
             return -1;
         }
 
-        buf->Read((char*)&td._pid, sizeof(td._pid));
+        // R50-1: 线程块字段读返回未检查——块解压不足时 td 靠 memset 全零仍被
+        // push，产出全零寄存器/pid 的线程。fail-closed。
+        bool tb_ok = (buf->Read((char*)&td._pid, sizeof(td._pid)) == (int)sizeof(td._pid));
 
         if (_arch == ARCH_X64) {
-            buf->Read((char*)&td._regs, sizeof(td._regs.x64));
-            buf->Read((char*)&td._fpregs, sizeof(td._fpregs.x64));
-            buf->Read((char*)&td._siginfo, sizeof(td._siginfo));
-            buf->Read((char*)&td._xstate, sizeof(td._xstate.x64));
+            tb_ok = tb_ok &&
+                buf->Read((char*)&td._regs, sizeof(td._regs.x64)) == (int)sizeof(td._regs.x64) &&
+                buf->Read((char*)&td._fpregs, sizeof(td._fpregs.x64)) == (int)sizeof(td._fpregs.x64) &&
+                buf->Read((char*)&td._siginfo, sizeof(td._siginfo)) == (int)sizeof(td._siginfo) &&
+                buf->Read((char*)&td._xstate, sizeof(td._xstate.x64)) == (int)sizeof(td._xstate.x64);
         } else if (_arch == ARCH_AARCH64) {
-            buf->Read((char*)&td._regs, sizeof(td._regs.arm64));
-            buf->Read((char*)&td._fpregs, sizeof(td._fpregs.arm64));
-            buf->Read((char*)&td._siginfo, sizeof(td._siginfo));
+            tb_ok = tb_ok &&
+                buf->Read((char*)&td._regs, sizeof(td._regs.arm64)) == (int)sizeof(td._regs.arm64) &&
+                buf->Read((char*)&td._fpregs, sizeof(td._fpregs.arm64)) == (int)sizeof(td._fpregs.arm64) &&
+                buf->Read((char*)&td._siginfo, sizeof(td._siginfo)) == (int)sizeof(td._siginfo);
         }
 
         // v3: THREAD 块尾部——FP 有效位(1) + SigPnd/SigBlk(8+8)；v2 及更早无
         // （默认 fp 有效，掩码由 fill_prstatus 回退 stat 字段）。
         if (_acore_version >= 3) {
             char fv = 0;
-            buf->Read((char*)&fv, 1);
+            tb_ok = tb_ok &&
+                buf->Read((char*)&fv, 1) == 1 &&
+                buf->Read((char*)&td._sigpend, sizeof(td._sigpend)) == (int)sizeof(td._sigpend) &&
+                buf->Read((char*)&td._sighold, sizeof(td._sighold)) == (int)sizeof(td._sighold);
             td._fp_valid = (fv != 0);
-            buf->Read((char*)&td._sigpend, sizeof(td._sigpend));
-            buf->Read((char*)&td._sighold, sizeof(td._sighold));
         } else {
             td._fp_valid = 1;
         }
 
+        if (!tb_ok) {
+            error("thread block %d too short (acore corrupt)", i);
+            return -1;
+        }
+
         td._stat = in.GetFile();
+        // R50-1: 线程 stat 的 GetFile 失败（NULL）未检查——后续 ProcStat(NULL)/
+        // fill_prstatus 全零。fail-closed。
+        if (!td._stat) {
+            error("thread %d stat missing (acore corrupt)", td._pid);
+            return -1;
+        }
         _process._threads.push_back(td);
         info("thread: %d", td._pid);
     }
@@ -1590,10 +1671,18 @@ int Coredump::WriteElfHeader(Lz4Stream& out)
 #endif
 
     out.SetBlock(BLOCK_TYPE_ELF);
-    out.Write((const char*)&ehdr, sizeof(ehdr));
+    // R50-1: ehdr/phdr 的 Write 返回原未检查——块满时隐式 Flush 失败（磁盘满）会
+    // 丢该段数据，最终 Flush 若恢复成功则返回 0，但 ELF 块 phdr 有空洞。
+    if (out.Write((const char*)&ehdr, sizeof(ehdr)) < 0) {
+        error("write elf ehdr failed (disk full?)");
+        return -1;
+    }
 
     for (auto& phdr : _phdrs) {
-        out.Write((const char*)&phdr, sizeof(phdr));
+        if (out.Write((const char*)&phdr, sizeof(phdr)) < 0) {
+            error("write elf phdr failed (disk full?)");
+            return -1;
+        }
     }
 
     // B69: 磁盘满时 Flush 的 Compress 失败返回 -1；原实现忽略 → ELF 块缺失的
@@ -1831,7 +1920,14 @@ int Coredump::generate(const char *corefile)
     }
 
     // write acore
-    WriteFileHeader(out);
+    // R50-1: WriteFileHeader 返回未检查——磁盘满时缺 8 字节头的 acore 静默产出，
+    // 解压报 "magic failed"。
+    if (WriteFileHeader(out) != 0) {
+        error("write acore header failed");
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
 
     // attach main thread
     if (pt_attach(_pid) != 0) {
@@ -1857,15 +1953,33 @@ int Coredump::generate(const char *corefile)
     // 解压错位；直接失败。
     if (WriteProcessMeta(out, maps) != 0) {
         error("write process meta failed");
+        // R50-1: 失败路径残留部分 acore + 已 attach 线程未 detach。清理并还原。
+        for (pid_t& tid : _process._thrd_pid) {
+            pt_detach(tid);
+        }
+        out.Close();
+        unlink(corefile);
         return -1;
     }
     // handle  leader first and then rest
-    WriteThreadMeta(out, _pid, true);
+    // R50-1: WriteThreadMeta 现在会因写失败返回 -1；忽略则线程块缺失仍继续
+    // LOADS/ELF → 坏 acore。检查并清理部分产物。
+    if (WriteThreadMeta(out, _pid, true) != 0) {
+        error("write leader thread meta failed");
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
     for(pid_t& tid : _process._thrd_pid) {
         if (tid == _pid)
             continue;
 
-        WriteThreadMeta(out, tid);
+        if (WriteThreadMeta(out, tid) != 0) {
+            error("write thread meta of %d failed", tid);
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
     // write acore
     {
@@ -1873,11 +1987,22 @@ int Coredump::generate(const char *corefile)
         // 静默产出无内存的空 core；显式失败。
         if (WriteLoads(out, _pid, maps) != 0) {
             error("failed to dump memory of %d", _pid);
+            // R50-1: 清理部分 acore + detach 已 attach 线程。
+            for (pid_t& tid : _process._thrd_pid) {
+                pt_detach(tid);
+            }
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         // B69: ELF 块写入失败（磁盘满）时显式失败。
         if (WriteElfHeader(out) != 0) {
             error("failed to write elf header for %d", _pid);
+            for (pid_t& tid : _process._thrd_pid) {
+                pt_detach(tid);
+            }
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         WriteTailMark(out);
@@ -1948,9 +2073,15 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     }
 
     if (!sys_core) {
-        WriteFileHeader(out);
+        // R50-1: WriteFileHeader 返回未检查——缺头 acore 静默产出。检查并清理。
+        if (WriteFileHeader(out) != 0) {
+            error("write acore header failed");
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
-    
+
     TS ts_pause;
     ts_pause.begin();
 
@@ -1982,12 +2113,26 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         return -1;
     }
     // handle  leader first and then rest
-    WriteThreadMeta(out, _pid, true);
+    // R50-1: WriteThreadMeta 现在会因写失败返回 -1；忽略则线程块缺失仍继续
+    // LOADS/ELF → 坏 acore。检查并清理部分产物、还原目标。
+    if (WriteThreadMeta(out, _pid, true) != 0) {
+        error("write leader thread meta failed");
+        restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
     for(pid_t& tid : _process._thrd_pid) {
         if (tid == _pid) {
             continue;
         }
-        WriteThreadMeta(out, tid);
+        if (WriteThreadMeta(out, tid) != 0) {
+            error("write thread meta of %d failed", tid);
+            restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
  
     // we've injected an 'int 3' in child process, that generates a corefile by kernel.
@@ -2028,7 +2173,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 
     // save the program regs
     user_regs64_struct saved_regs;
-    pt_getregs(_pid, &saved_regs);
+    // R50-1: getregs 返回未检查——失败时 saved_regs 未初始化，后面 pt_setregs
+    // 会把垃圾寄存器写回目标。目标处于 stop 正常不会失败，仍检查以 fail-closed。
+    if (pt_getregs(_pid, &saved_regs) != 0) {
+        error("save regs of %d failed (%s)", _pid, strerror(errno));
+        restore_target_after_fail();
+        return -1;
+    }
 
     // get a page for shellcode
     user_regs64_struct regs;
@@ -2111,7 +2262,11 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // munmap injected page.
     {
         uint64_t gv[2] = {inject_page, 0x1000};
-        pt_call(_pid, &regs, r_munmap, 2, gv);
+        // R50-1: 返回未检查——目标中途死亡时 regs 未初始化，下面 get_rc() 读垃圾
+        // 进日志；注入页泄漏。检查并告警（acore 已有效，仅 best-effort 清理）。
+        if (pt_call(_pid, &regs, r_munmap, 2, gv) != 0) {
+            warn("munmap injection failed (target died?)");
+        }
         info("munmap = %d", (int)regs.get_rc());
     }
 
@@ -2208,14 +2363,27 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     }
 
     if (!sys_core) {
-        WriteFileHeader(out);
+        // R50-1: WriteFileHeader 返回未检查——缺头 acore 静默产出。检查并清理。
+        if (WriteFileHeader(out) != 0) {
+            error("write acore header failed");
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
-    
+
     TS ts_pause;
     ts_pause.begin();
 
     // stop tracee
-    pt_int(_pid);
+    // R50-1: pt_int 返回未检查——INTERRUPT 失败（目标已退出 ESRCH / 非 seize 态
+    // EIO）时静默继续，后续在未停住的目标上注入/采集。fail-closed。
+    if (pt_int(_pid) != 0) {
+        error("cannot interrupt %d (%s)", _pid, strerror(errno));
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
@@ -2236,12 +2404,26 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         return -1;
     }
     // handle  leader first and then rest
-    WriteThreadMeta(out, _pid, true);
+    // R50-1: WriteThreadMeta 现在会因写失败返回 -1；忽略则线程块缺失仍继续
+    // LOADS/ELF → 坏 acore。检查并清理部分产物、还原目标。
+    if (WriteThreadMeta(out, _pid, true) != 0) {
+        error("write leader thread meta failed");
+        restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
     for(pid_t& tid : _process._thrd_pid) {
         if (tid == _pid) {
             continue;
         }
-        WriteThreadMeta(out, tid);
+        if (WriteThreadMeta(out, tid) != 0) {
+            error("write thread meta of %d failed", tid);
+            restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
  
     // we've injected an 'int 3' in child process, that generates a corefile by kernel.
@@ -2281,14 +2463,28 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
 
     // save the program regs
     user_regs64_struct saved_regs;
-    pt_getregs(_pid, &saved_regs);
+    // R50-1: getregs 返回未检查——失败时 saved_regs 未初始化，后面 pt_setregs
+    // 会把垃圾寄存器写回目标。目标处于 stop 正常不会失败，仍检查以 fail-closed。
+    if (pt_getregs(_pid, &saved_regs) != 0) {
+        error("save regs of %d failed (%s)", _pid, strerror(errno));
+        restore_target_after_fail();
+        return -1;
+    }
 
     // get a page for shellcode
     user_regs64_struct regs;
     uint64_t inject_page = 0;
     {
         uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
-        pt_call(_pid, &regs, r_mmap, 6, gv);
+        // B57: pt_call 失败（目标中途死亡）时不填充 regs。forkcore 同位置有检查，
+        // 此处漏掉（R50-1）——未检查会在下面把未初始化的 get_rc() 当 inject_page
+        // 继续注入。fail-closed 还原目标。
+        if (pt_call(_pid, &regs, r_mmap, 6, gv) != 0) {
+            error("mmap injection failed (target died?)");
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
         info("mmap = %lx", regs.get_rc());
         inject_page = regs.get_rc();
         // B16 缓解：目标阻塞在可重启 syscall 时，syscall-restart 会覆盖注入，
@@ -2356,7 +2552,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // munmap injected page.
     {
         uint64_t gv[2] = {inject_page, 0x1000};
-        pt_call(_pid, &regs, r_munmap, 2, gv);
+        // R50-1: 返回未检查——目标中途死亡时 regs 未初始化，下面 get_rc() 读垃圾
+        // 进日志；注入页泄漏。检查并告警（acore 已有效，仅 best-effort 清理）。
+        if (pt_call(_pid, &regs, r_munmap, 2, gv) != 0) {
+            warn("munmap injection failed (target died?)");
+        }
         info("munmap = %d", (int)regs.get_rc());
     }
 
@@ -2445,7 +2645,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     } else {
         // now the process becomes zombie,
         // we have to waitpid the forked pid.
-        pt_int(_pid);
+        // R50-1: pt_int 返回未检查——失败时 leader 未停住，注入 waitpid 跑在运行中
+        // 目标上。acore 已有效，告警（child 可能残留 zombie）。
+        if (pt_int(_pid) != 0) {
+            warn("re-interrupt of %d failed (%s); fork child may linger as zombie",
+                 _pid, strerror(errno));
+        }
     }
     pt_getregs(_pid, &saved_regs);
     {
@@ -2508,7 +2713,13 @@ int Coredump::monitor(const char* corefile)
     }
 
     // write acore
-    WriteFileHeader(out);
+    // R50-1: WriteFileHeader 返回未检查——缺头 acore 静默产出。
+    if (WriteFileHeader(out) != 0) {
+        error("write acore header failed");
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
 
     // B57: pt_monitor 失败（目标瞬时退出/无权限）时干净退出，不留空 acore。
     rc = pt_monitor(_pid);
@@ -2656,12 +2867,24 @@ int Coredump::monitor(const char* corefile)
     }
 
     // handle  leader first and then rest
-    WriteThreadMeta(out, _pid, true);
+    // R50-1: WriteThreadMeta 现在会因写失败返回 -1；忽略则线程块缺失仍继续
+    // LOADS/ELF → 坏 acore。检查并清理部分产物。
+    if (WriteThreadMeta(out, _pid, true) != 0) {
+        error("write leader thread meta failed");
+        out.Close();
+        unlink(corefile);
+        return -1;
+    }
     for(pid_t& tid : _process._thrd_pid) {
         if (tid == _pid)
             continue;
 
-        WriteThreadMeta(out, tid);
+        if (WriteThreadMeta(out, tid) != 0) {
+            error("write thread meta of %d failed", tid);
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
     }
     // write acore
     {
@@ -2790,6 +3013,14 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     rc = ReadElfHeader(in);
     if (rc != 0) {
         error("read elf header failed, core incomplete (removed)");
+        return fail_core();
+    }
+    // R50-1: ELF 块 phdr 数超过 maps 预算时，WriteElfHeader 会写穿 makeroom 预留的
+    // hdr_size 覆盖 note 数据。构造 acore 可携带任意多 phdr（p_filesz=0 绕过下面
+    // 的 loads/expected 校验）；校验总 phdr 数 <= maps 条目 + 1（note）。
+    if (_phdrs.size() > _process._d_maps->size() + 1) {
+        error("elf phdr count %zu exceeds maps budget %zu (acore corrupt)",
+              _phdrs.size(), _process._d_maps->size() + 1);
         return fail_core();
     }
 
@@ -2940,24 +3171,33 @@ int Coredump::test_decompress(const char* in_file, const char* out_file)
     }
    
     size_t file_size = 0;
-    BlockHeader hdr; 
+    BlockHeader hdr;
     for (;;) {
         Block* block = in.ReadBlock(hdr);
         if (!block) {
+            // R50-1: ReadBlock NULL 不只是干净 EOF——块头短读/数据截断/size 超限/
+            // 解压失败/真实 I/O 错误都返回 NULL。只有块边界 EOF/尾标（LastReadClean）
+            // 才是正常结束；否则是损坏/截断流，报错返回非零。
+            if (!in.LastReadClean()) {
+                error("decompress stream corrupt or truncated");
+                rc = -1;
+            }
             break;
         }
 
         ssize_t len = fwrite(block->rBuf(), 1, block->Size(), fout);
-        if (len != (int)block->Size()) {
+        if (len != (ssize_t)block->Size()) {
+            error("write failed (disk full?)");
+            rc = -1;
             break;
         }
-        file_size += len; 
+        file_size += len;
     }
     fclose(fout);
     in.Close();
 
     info("write %lu bytes.", file_size);
-    return 0;
+    return rc;
 }
 
 }; // arthur

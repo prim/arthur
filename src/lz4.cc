@@ -25,6 +25,7 @@ Lz4Stream::Lz4Stream(lz4_mode mode) :
     _mode = mode;
     _size_real = 0;
     _size_file = 0;
+    _eof_clean = true;
 }
 
 Lz4Stream::~Lz4Stream()
@@ -309,15 +310,20 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
         // 截断在块头边界：正常 EOF（feof）或损坏 acore，返回 NULL 让调用方结束。
         // b22 (Codex review): fread==0 不只表示 EOF——真实 I/O 错误（ferror）也会
         // 返回 0，不能把它当成干净结束。只有 feof 才是正常 EOF。
+        // R50-1: _eof_clean 标记干净结束（块边界 EOF），短读/错误置 false，供
+        // test_decompress 区分截断。
         if (rc == 0 && !ferror(_file)) {
+            _eof_clean = true;
             return NULL;   // 干净 EOF
         }
+        _eof_clean = false;
         error("read block header failed (%d), acore truncated", rc);
         return NULL;
     }
 
     // tail mark
     if (hdr.isTailMark()) {
+        _eof_clean = true;
         return NULL;
     }
 
@@ -326,6 +332,7 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     // 合法写入者每块最多 BLOCK_SIZE 未压缩字节，压缩后必 ≤ 该值；
     // 损坏/构造的 acore 可把 hdr.size 设成任意值 → fread 越过栈缓冲。
     if (hdr.size > sizeof(buf)) {
+        _eof_clean = false;
         error("block compressed size %u exceeds buffer (%lu), acore corrupt", hdr.size, sizeof(buf));
         return NULL;
     }
@@ -333,15 +340,17 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     // read out compressed data
     rc = fread(buf, 1, hdr.size, _file);
     if (rc != (int)hdr.size) {
+        _eof_clean = false;
         error("read block data failed (%d != %u)", rc, hdr.size);
         return NULL;
     }
 
-    // decompress 
+    // decompress
     rc = LZ4_decompress_safe_continue(_dec, buf, block.wBuf(), hdr.size, BLOCK_SIZE);
     if (rc < 0) {
+        _eof_clean = false;
         error("decode failed rc = %d\n", rc);
-        return NULL; 
+        return NULL;
     }
     block._length = rc;
     dprint("ReadBlock size(%d), type(%d), data(%d)\n", hdr.size, hdr.block_type, rc);
