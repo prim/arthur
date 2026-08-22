@@ -2079,8 +2079,19 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         exit(0);
     }
     // tracee will stop if signaled on exit
+    bool stopped_at_ptrace_event = false;
     if(WIFSTOPPED(s)) {
         sig = WSTOPSIG(s);
+        // B66: dump 窗口（pt_cont 后 TRACEFORK 仍设）内 leader 自己 fork 会触发
+        // PTRACE_EVENT_FORK 停靠，WSTOPSIG 返回 SIGTRAP(5)——但这是 ptrace 事件
+        // 停靠，不是真实信号。返回给 monitor 会被当中继信号投递 → 目标被 SIGTRAP
+        // 杀死（实测 forker 目标 SIGUSR1 后死于 "Trace/breakpoint trap"）。
+        // 事件停靠不算信号：清零，且结尾必须 CONT 清除该事件停靠（否则 leader 冻结）。
+        stopped_at_ptrace_event =
+            ((s >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8)));
+        if (stopped_at_ptrace_event) {
+            sig = 0;
+        }
     } else {
         // now the process becomes zombie,
         // we have to waitpid the forked pid.
@@ -2103,7 +2114,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     if (rc != 0) {
         error("clear TRACEFORK on %d failed", _pid);
     }
-    if(!WIFSTOPPED(s)) {
+    // B66: 事件停靠（PTRACE_EVENT_FORK）也必须 CONT 清除，否则 leader 冻结。
+    // 普通 signal-delivery stop 由 monitor 的 signal_forkcore 中继恢复。
+    if(!WIFSTOPPED(s) || stopped_at_ptrace_event) {
         pt_cont(_pid);
     }
 
