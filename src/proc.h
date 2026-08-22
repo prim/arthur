@@ -197,6 +197,10 @@ struct ProcStat : public ProcDecoder {
 
     char state;         //  012345
     char sname;         // "RSDTZW"
+    // B63: comm（stat 字段 2，括号内）——内核原生 core 的 pr_fname 用
+    // task->comm（可执行名），原实现用 argv[0] 全路径截断 16 字节导致
+    // gdb/ps 显示错误进程名。
+    char comm[16];
 
     pid_t pid;          // id of the process
     pid_t ppid;         // parent pid
@@ -226,7 +230,8 @@ struct ProcStat : public ProcDecoder {
     ProcStat(ProcFile* pf)
         : ProcDecoder(pf), state(0), sname(0), pid(0), ppid(0), pgid(0), sid(0),
           stime(0), utime(0), cstime(0), cutime(0), vsize(0), rss(0),
-          num_threads(0), flags(0), nice(0), pending(0), blocked(0) {}
+          num_threads(0), flags(0), nice(0), pending(0), blocked(0)
+    { comm[0] = '\0'; }
     int Parse();
 };
 

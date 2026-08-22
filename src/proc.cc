@@ -229,6 +229,15 @@ int ProcStat::Parse()
     char *open = strchr(buf, '(');
     char *close = open ? strrchr(open, ')') : NULL;
     if (open && close) {
+        // B63: comm = 括号内文本（内核 task->comm，可执行名）。可能含空格/括号，
+        // 用长度拷贝（不能截到空格）。
+        size_t clen = (size_t)(close - open - 1);
+        if (clen >= sizeof(comm)) {
+            clen = sizeof(comm) - 1;
+        }
+        memcpy(comm, open + 1, clen);
+        comm[clen] = '\0';
+
         // pid 在 '(' 之前
         *open = '\0';
         char *tok = strtok(buf, " ");

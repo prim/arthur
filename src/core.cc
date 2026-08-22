@@ -769,9 +769,14 @@ int Note::fill_prpsinfo(const ProcessData& proc)
     info.pr_zomb = 0;
     info.pr_nice = proc._threads[0]._d_stat->nice;
 
-    // B26: cmdline 为空（如内核线程/异常进程）时 argv[0] 越界。取 argv[0] 或空串。
+    // B63: pr_fname 用 task->comm（stat 括号内文本，可执行名），与内核原生 core
+    // 一致。原实现用 argv[0] 全路径，gdb/ps 显示截断的路径而非进程名。
+    // comm 缺失（损坏 acore）时退回 argv[0]。
     std::string fname;
-    if (proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
+    if (proc._threads[0]._d_stat->comm[0] != '\0') {
+        fname = proc._threads[0]._d_stat->comm;
+    } else if (proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
+        // B26: cmdline 为空时 argv[0] 越界。取 argv[0] 或空串。
         fname = proc._d_cmdline->argv[0];
     }
     strncpy(info.pr_fname, fname.c_str(), sizeof(info.pr_fname));
