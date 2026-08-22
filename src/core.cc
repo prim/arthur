@@ -2086,9 +2086,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // PTRACE_EVENT_FORK 停靠，WSTOPSIG 返回 SIGTRAP(5)——但这是 ptrace 事件
         // 停靠，不是真实信号。返回给 monitor 会被当中继信号投递 → 目标被 SIGTRAP
         // 杀死（实测 forker 目标 SIGUSR1 后死于 "Trace/breakpoint trap"）。
-        // 事件停靠不算信号：清零，且结尾必须 CONT 清除该事件停靠（否则 leader 冻结）。
+        // 泛化到所有 ptrace event（FORK/CLONE/EXEC/VFORK/EXIT）：wait status 的
+        // 高字节含事件码即为事件停靠。事件停靠不算信号：清零，且结尾必须 CONT
+        // 清除该事件停靠（否则 leader 冻结）。
         stopped_at_ptrace_event =
-            ((s >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8)));
+            (WIFSTOPPED(s) &&
+             ((s >> 8) & 0xff) == SIGTRAP &&
+             ((s >> 16) & 0xff) != 0);
         if (stopped_at_ptrace_event) {
             sig = 0;
             // B67: TRACEFORK auto-attach 的 fork 子进程残留在 arthur 上（TracerPid=arthur、
