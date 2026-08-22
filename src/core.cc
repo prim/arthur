@@ -1352,7 +1352,16 @@ int Coredump::ReadMeta(Lz4Stream& in)
     _process._environ = in.GetFile();
     _process._io = in.GetFile();
     _process._limits = in.GetFile();
-   
+
+    // b23/b43 (Codex review): 任一必需 proc 文件读失败（截断 size 前缀、超 64MB
+    // 上限、小 size、块类型不符）都是损坏 acore——fail-closed，而非带 NULL/部分
+    // 数据继续解析，让后续 ParseAll/fill_* 消费堆垃圾。
+    if (!_process._cmdline || !_process._auxv || !_process._maps ||
+        !_process._environ || !_process._io || !_process._limits) {
+        error("a required proc file failed to load, acore corrupt");
+        return -1;
+    }
+
     // B23: thread_num 来自损坏 acore 可为任意值；限定上限避免无限/超长循环
     if (thread_num < 0 || thread_num > 1000000) {
         error("implausible thread_num %d, acore corrupt", thread_num);
@@ -2641,6 +2650,17 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     }
     long p_elf = ftell(fout);
 
+    // b23 (Codex review): 失败会遗留部分输出 core，误导调用方（看起来像有效结果）。
+    // 各失败路径先打印各自的具体错误，再经 fail_core 关流、删除不完整产物并清理。
+    // （完整方案：写同目录临时文件、验证/flush 成功后原子 rename，暂留。）
+    auto fail_core = [&]() -> int {
+        in.Close();
+        fclose(fout);
+        unlink(out_core);
+        cleanup_decompress();
+        return -1;
+    };
+
     // parse  
     _process.ParseAll();
 
@@ -2651,10 +2671,9 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     dprint("room = %d", hdr_size);
     rc = makeroom(fout, hdr_size);
     if (rc < 0) {
-        fclose(fout);
-        cleanup_decompress();
-        return -1;
-    } 
+        error("make room for elf headers failed, core removed");
+        return fail_core();
+    }
     long p_note = ftell(fout);
 
     // makeup notes
@@ -2670,11 +2689,8 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         len = fwrite(nt->_data, 1, nt->_size, fout);
         // B54: 输出磁盘满时 fwrite 可能短写，原 assert 直接 abort。
         if (len != nt->_size) {
-            error("write note failed (%ld != %d), disk full?", len, nt->_size);
-            fclose(fout);
-            in.Close();
-            cleanup_decompress();
-            return -1;
+            error("write note failed (%ld != %d), disk full? core removed", len, nt->_size);
+            return fail_core();
         }
     }
     _offset_load = ftell(fout);
@@ -2685,11 +2701,8 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // dump 若用 int 返回会被截断成负数误判为失败（实证：3.2GB dump 被拒）。
     ssize_t loads_rc = ReadLoads(in, fout);
     if (loads_rc < 0) {
-        error("read loads failed, core incomplete");
-        fclose(fout);
-        in.Close();
-        cleanup_decompress();
-        return -1;
+        error("read loads failed, core incomplete (removed)");
+        return fail_core();
     }
     size_t loads_written = (size_t)loads_rc;
 
@@ -2698,11 +2711,8 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // LOAD 段；检查返回值，报错而非产出残缺 core。
     rc = ReadElfHeader(in);
     if (rc != 0) {
-        error("read elf header failed, core incomplete");
-        fclose(fout);
-        in.Close();
-        cleanup_decompress();
-        return -1;
+        error("read elf header failed, core incomplete (removed)");
+        return fail_core();
     }
 
     // 校验：读侧实际写出的 LOAD 字节数 == acore ELF 块 phdr 声明的 p_filesz 之和。
@@ -2716,21 +2726,15 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         }
     }
     if (loads_written != expected) {
-        error("loads size mismatch: wrote %lu bytes, phdrs declare %lu (acore corrupt)",
+        error("loads size mismatch: wrote %lu bytes, phdrs declare %lu (acore corrupt, core removed)",
               loads_written, expected);
-        fclose(fout);
-        in.Close();
-        cleanup_decompress();
-        return -1;
+        return fail_core();
     }
     fseek(fout, p_elf, SEEK_SET);
     rc = WriteElfHeader(fout);
     if (rc < 0) {
-        error("write elf header to core failed");
-        fclose(fout);
-        in.Close();
-        cleanup_decompress();
-        return -1;
+        error("write elf header to core failed, core removed");
+        return fail_core();
     }
 
     in.Close();
