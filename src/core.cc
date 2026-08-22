@@ -1153,6 +1153,14 @@ void Coredump::restore_target_after_fail()
         ptrace(PTRACE_DETACH, tid, NULL, NULL);
     }
     _process._thrd_pid.clear();
+
+    // N2: forkcore/forkcore_m 开头设过 PTRACE_O_TRACEFORK。fail 路径若只 CONT
+    // 不清理，monitor 继续运行时目标后续每个 fork 都被自动 attach+SIGSTOP 冻结
+    // （实证：fail-closed 后所有新 fork 子进程 TracerPid=arthur）。此刻 leader
+    // 处于 stop（所有调用方都在 pt_call/attach 后调用），SETOPTIONS 生效，先清
+    // TRACEFORK（恢复 _ptrace_options，monitor 下即 TRACEEXIT）再 CONT。
+    ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
+
     ptrace(PTRACE_CONT, _pid, NULL, NULL);
 }
 
@@ -2172,6 +2180,14 @@ int Coredump::monitor(const char* corefile)
 
     info("%s: process %d exit", strsignal(exit_sig), _pid);
     info("Writing out corefile...");
+
+    // N1: 崩溃采集路径必须清空跨调用累积的 _phdrs——SIGUSR1 dump（forkcore_m）
+    // 之后 _phdrs 已有该次 dump 的 LOAD 段；若不清空，本次崩溃 WriteLoads 再
+    // push 一组，ELF 块出现 2× 幻影 phdr，解压时 loads 字节数与 phdr 声明和
+    // 不符直接拒绝（实证：wrote 17739776 / phdrs 35479552）。与 B35 在
+    // generate/forkcore/forkcore_m 入口的清理保持一致。
+    _phdrs.clear();
+    _core_pid = 0;
 
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     collect_threads(_pid);
