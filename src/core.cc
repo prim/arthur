@@ -463,7 +463,12 @@ static inline int pt_setregs(pid_t pid, user_regs64_struct *pregs)
 /* the pt_call put a call frame with return address of ZERO on top of the current thread,
  * and wait the SIGSEGV ocur.
  */
-static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, int argc, uint64_t argv[])
+// B72: out_inject_rsp/out_orig_word 输出注入时写 0 的 [rsp-8] 槽位与原字——
+// fork 注入后子进程（COW 快照）保留注入的 0，父进程恢复了但 dump 读的子进程没有，
+// 调用方可用这两个值把原字写回子进程，消除快照污染。
+static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, int argc,
+                          uint64_t argv[], uint64_t *out_inject_rsp = NULL,
+                          uint64_t *out_orig_word = NULL)
 {
     int rc, status = 0;
     user_regs64_struct regs;
@@ -520,6 +525,9 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     regs.rsp -= 8;
     rc = ptrace(PTRACE_POKEDATA, pid, regs.rsp, 0);
     if (rc != 0) { return fail("poke [rsp-8]"); }
+    // B72: 暴露恢复数据给调用方（fork 后写回子进程快照）
+    if (out_inject_rsp) { *out_inject_rsp = inject_rsp; }
+    if (out_orig_word) { *out_orig_word = orig_stack_word; }
 #endif
 
     // makeup function call and arguments
@@ -1848,7 +1856,9 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
      
         pt_write(_pid, inject_page, (void *)inject_fork, inject_size);
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
-        if (pt_call(_pid, &regs, inject_page, 0, NULL) != 0) {
+        // B72: 记录注入写 0 的 [rsp-8] 槽位与原字，fork 后写回子进程快照。
+        uint64_t inj_rsp = 0, inj_word = 0;
+        if (pt_call(_pid, &regs, inject_page, 0, NULL, &inj_rsp, &inj_word) != 0) {
             error("fork injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
@@ -1861,6 +1871,10 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             return -1;
+        }
+        // B72: 子进程（COW 快照）保留注入的 0；写回原字消除快照污染。
+        if (inj_rsp) {
+            ptrace(PTRACE_POKEDATA, _core_pid, inj_rsp, (void*)inj_word);
         }
     }
 
@@ -2056,7 +2070,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
      
         pt_write(_pid, inject_page, (void *)inject_fork, inject_size);
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
-        if (pt_call(_pid, &regs, inject_page, 0, NULL) != 0) {
+        // B72: 记录注入写 0 的 [rsp-8] 槽位与原字，fork 后写回子进程快照。
+        uint64_t inj_rsp = 0, inj_word = 0;
+        if (pt_call(_pid, &regs, inject_page, 0, NULL, &inj_rsp, &inj_word) != 0) {
             error("fork injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
@@ -2069,6 +2085,10 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             return -1;
+        }
+        // B72: 子进程（COW 快照）保留注入的 0；写回原字消除快照污染。
+        if (inj_rsp) {
+            ptrace(PTRACE_POKEDATA, _core_pid, inj_rsp, (void*)inj_word);
         }
     }
 
