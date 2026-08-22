@@ -306,8 +306,10 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     // read out block size
     rc = fread(&hdr, 1, sizeof(hdr), _file);
     if (rc != (int)sizeof(hdr)) {
-        // 截断在块头边界：正常 EOF 或损坏 acore，返回 NULL 让调用方结束
-        if (rc == 0) {
+        // 截断在块头边界：正常 EOF（feof）或损坏 acore，返回 NULL 让调用方结束。
+        // b22 (Codex review): fread==0 不只表示 EOF——真实 I/O 错误（ferror）也会
+        // 返回 0，不能把它当成干净结束。只有 feof 才是正常 EOF。
+        if (rc == 0 && !ferror(_file)) {
             return NULL;   // 干净 EOF
         }
         error("read block header failed (%d), acore truncated", rc);
@@ -403,6 +405,14 @@ ProcFile* Lz4Stream::GetFile()
         return NULL;
     }
 
+    // b23 (Codex review): size 为 0..3 时 malloc(size) 只分配几个字节，下方
+    // pf->f_size 赋值（4 字节）越过分配边界写堆。合法写入的最小序列化大小是
+    // sizeof(ProcFile)（f_size/f_pid/f_type 头，f_data 可为 0 字节），小于即损坏。
+    if (size < sizeof(ProcFile)) {
+        error("proc file size %u smaller than header, acore corrupt", size);
+        return NULL;
+    }
+
     // malloc
     ProcFile *pf = (ProcFile*)malloc(size);
     if (!pf) {
@@ -413,8 +423,9 @@ ProcFile* Lz4Stream::GetFile()
     // read out the file
     BlockHeader hdr;
     char *p = (char*)pf;
+    uint32_t i = 0;
 
-    for (uint32_t i=0; i<size; ) {
+    for (; i<size; ) {
         Block *block = ReadBlock(hdr);
         if (!block) {
             break;
@@ -434,9 +445,20 @@ ProcFile* Lz4Stream::GetFile()
         i += rc;
     }
 
+    // b23 (Codex review): 块序列截断/损坏时 i 达不到 size，返回部分未初始化的
+    // ProcFile 会让后续 parser/note 消费 malloc 堆垃圾。必须读满 size 才是干净
+    // 成功；否则释放并失败（fail-closed）。干净写入的 FILE 块未压缩字节和恒等于
+    // size，因此严格校验不影响正常 acore。
+    if (i != size) {
+        error("proc file truncated: read %u of %u bytes, acore corrupt", i, size);
+        free(pf);
+        return NULL;
+    }
+
     // B37: 损坏 acore 可让内部 f_size 大于实际 malloc 缓冲（size），后续
     // ProcAuxv/ProcCmdline/ProcStat 按 f_size 读会越界。钳制到真实缓冲大小。
-    pf->f_size = (size > sizeof(ProcFile)) ? (size - sizeof(ProcFile)) : 0;
+    // （size >= sizeof(ProcFile) 已保证上方，f_data 长度即 size - 头部。）
+    pf->f_size = size - sizeof(ProcFile);
 
     return pf;
 }
