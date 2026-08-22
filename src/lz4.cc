@@ -122,9 +122,9 @@ int Lz4Stream::Peek(char *out, size_t n)
 // raw function for file access
 int Lz4Stream::WriteRaw(const char *s, size_t n)
 {
-    size_t rc = fwrite(s, 1, n, _file);
-    assert (rc == n);
-    return rc;
+    // B70: 原 `assert(rc == n)` 在磁盘满短写时 debug 构建 abort（NDEBUG 静默丢）。
+    // 改为返回实际写入数，调用方检查。
+    return (int)fwrite(s, 1, n, _file);
 }
 
 int Lz4Stream::ReadRaw(char *out, size_t n)
@@ -193,8 +193,12 @@ int Lz4Stream::WriteBlock(const char *s, size_t n, BlockType t)
     size_t m = 0;
     
     // get a new block
-    Flush();
-    
+    // B70: Flush 失败（磁盘满）时当前块未密封；继续写会让 acore 错位。传播错误。
+    if (Flush() < 0) {
+        error("flush previous block failed (disk full?)");
+        return -1;
+    }
+
     BlockHeader block_hdr;
     block_hdr.block_type = t;
     for (m = 0; m < n; ) {
@@ -330,14 +334,22 @@ int Lz4Stream::PutFile(ProcFile* pf)
     int rc;
 
     // seal the current block
-    Flush();
+    // B70: Flush 失败（磁盘满）时传播错误。
+    if (Flush() < 0) {
+        error("flush failed in PutFile (disk full?)");
+        return -1;
+    }
 
     // flat size
     uint32_t size = pf->Size();
 
     // TBD: remove the Raw size
     // write file size
-    rc = WriteRaw((const char*)&size, sizeof(size));
+    // B70: WriteRaw 短写（磁盘满）必须检查——原实现返回值被下一行 WriteBlock 覆盖。
+    if (WriteRaw((const char*)&size, sizeof(size)) != (int)sizeof(size)) {
+        error("write proc file size failed (disk full?)");
+        return -1;
+    }
 
     // write file context
     rc = WriteBlock((const char*)pf, size, BLOCK_TYPE_FILE);

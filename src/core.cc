@@ -1003,7 +1003,11 @@ int Coredump::WriteFileHeader(Lz4Stream& out)
 {
     AcoreHeader hdr;
 
-    out.WriteRaw((const char*)&hdr, sizeof(hdr));
+    // B70: 磁盘满时头写失败 → acore 不可用，报错。
+    if (out.WriteRaw((const char*)&hdr, sizeof(hdr)) != (int)sizeof(hdr)) {
+        error("write acore header failed (disk full?)");
+        return -1;
+    }
 
     return 0;
 }
@@ -1447,7 +1451,11 @@ int Coredump::WriteElfHeader(FILE* fout)
 int Coredump::WriteTailMark(Lz4Stream& out)
 {
     BlockHeader mark = BlockHeader::TailMark();
-    out.WriteRaw((const char*)&mark, sizeof(mark));
+    // B70: 磁盘满时尾标写失败 → acore 无结束标记，解压读 EOF 报截断。
+    if (out.WriteRaw((const char*)&mark, sizeof(mark)) != (int)sizeof(mark)) {
+        error("write tail mark failed (disk full?)");
+        return -1;
+    }
     return 0;
 }
 
