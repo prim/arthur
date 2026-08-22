@@ -326,6 +326,12 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
         if (type != ARTHUR_STT_FUNC && type != ARTHUR_STT_NOTYPE) {
             continue;
         }
+        // B79 (Codex B11 review): 未定义符号（st_shndx==SHN_UNDEF，st_value 常为 0）
+        // 若只匹配名字会返回 base+0（非零 libc 基址），绕过调用方 `== 0` 检查，
+        // 把 ELF 头当代码执行。拒绝未定义/零值符号。
+        if (sym.st_shndx == 0 || sym.st_value == 0) {
+            continue;
+        }
         if (sym.st_name == 0) {
             continue;
         }
@@ -1878,7 +1884,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // B16 缓解：目标阻塞在可重启 syscall 时，syscall-restart 会覆盖注入，
         // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
         // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
-        if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000) {
+        if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000 ||
+            inject_page > 0x0000800000000000UL) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
             // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
@@ -1906,7 +1913,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         int inject_size = (inject_end - inject_begin);
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
      
-        pt_write(_pid, inject_page, (void *)inject_fork, inject_size);
+        // B80: pt_write 失败（注入页不可写/短写）时继续注入会执行垃圾代码；fail-closed。
+        if (pt_write(_pid, inject_page, (void *)inject_fork, inject_size) != 0) {
+            error("write inject shellcode to %lx failed", (unsigned long)inject_page);
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
         // B72: 记录注入写 0 的 [rsp-8] 槽位与原字，fork 后写回子进程快照。
         uint64_t inj_rsp = 0, inj_word = 0;
@@ -2110,7 +2123,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // B16 缓解：目标阻塞在可重启 syscall 时，syscall-restart 会覆盖注入，
         // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
         // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
-        if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000) {
+        if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000 ||
+            inject_page > 0x0000800000000000UL) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
             // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
@@ -2138,7 +2152,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         int inject_size = (inject_end - inject_begin);
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
      
-        pt_write(_pid, inject_page, (void *)inject_fork, inject_size);
+        // B80: pt_write 失败（注入页不可写/短写）时继续注入会执行垃圾代码；fail-closed。
+        if (pt_write(_pid, inject_page, (void *)inject_fork, inject_size) != 0) {
+            error("write inject shellcode to %lx failed", (unsigned long)inject_page);
+            pt_setregs(_pid, &saved_regs);
+            restore_target_after_fail();
+            return -1;
+        }
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
         // B72: 记录注入写 0 的 [rsp-8] 槽位与原字，fork 后写回子进程快照。
         uint64_t inj_rsp = 0, inj_word = 0;
