@@ -1350,9 +1350,12 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
         // 只 dump 可执行文件映射的首页以省体积，但仅当磁盘 ELF 可恢复时安全。
         // memfd(/memfd:) 与已删除((deleted)) 映射没有磁盘文件，inode>0 不可信，
         // 必须全量 dump，否则代码段永久缺失且 GDB 无法恢复。
+        // B75 (Codex B4 review): 只匹配精确的 " (deleted)" 后缀——原 rfind 任意
+        // 位置匹配，`/opt/(deleted)/lib.so` 这类正常路径会被误判为已删除并放大 acore。
         bool file_recoverable =
-            !(r.name.rfind("(deleted)") != std::string::npos ||
-              r.name.compare(0, 7, "/memfd:") == 0);
+            !(r.name.size() >= 10 &&
+              r.name.compare(r.name.size() - 10, 10, " (deleted)") == 0) &&
+            !(r.name.compare(0, 7, "/memfd:") == 0);
         if (!(r.perms & PF_R)) { // not readable
             // do nothing
             continue;
