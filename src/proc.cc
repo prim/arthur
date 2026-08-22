@@ -134,7 +134,7 @@ int ProcMaps::Parse()
     // B27: PATH_MAX 在 inc.h 被压到 128，真实映射路径（深容器/长库名）会超，
     // 既有 readline 溢出风险又有路径截断。行缓冲与名字缓冲提到 4096。
     const int MAPS_BUF = 4096;
-    char perm[16];
+    char perm[16] = {0};
     char name[MAPS_BUF];
     char line[MAPS_BUF];
 
@@ -144,7 +144,10 @@ int ProcMaps::Parse()
         MemRegion r = {};
         name[0] = 0;
         int consumed = 0;
-        sscanf(line, "%lx-%lx %4s %8lx %x:%x %lu %n",
+        // R50-5: 偏移字段用 %8lx 会截断 ≥4GiB 的映射偏移（内核打印 %08llx 无上限）——
+        // 9 位十六进制时 %8lx 读 8 位后空格不匹配，整行解析失败（offset/inode/name 全丢）。
+        // 去掉宽度用 %lx 读全。perm[16] 已初始化为 0，格式不匹配时 perms=0 而非垃圾。
+        sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %n",
                 &r.start_addr,
                 &r.end_addr,
                 perm,
@@ -195,7 +198,10 @@ int ProcCmdline::Parse()
     }
     const char* end = _pf->f_data + _pf->f_size;
     const char* p = _pf->f_data;
-    while (p < end) {
+    // R50-5: 无上限——构造的 NUL 密集 cmdline（GetFile 上限 64MB）可产生约 64M 个
+    // 空 argv（数 GB 分配，OOM/DoS）。真实 cmdline 受 ARG_MAX(~2MB) 限制。加数量上限。
+    const size_t MAX_ARGV = 16384;
+    while (p < end && argv.size() < MAX_ARGV) {
         const char* q = p;
         while (q < end && *q) {
             q++;
