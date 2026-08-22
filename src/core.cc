@@ -1716,7 +1716,40 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // 每次采集前清空跨调用累积的 _phdrs
     _phdrs.clear();
     _core_pid = 0;
-    /* forkcore using a forked process for large memory dump, 
+
+    // B74 (Codex B1 review): mode 2 依赖子进程 `int $3` 触发内核 core dump。
+    // RLIMIT_CORE=0（文件型 pattern）或管道型 core_pattern 时不会有可合并的
+    // core 文件，arthur 却静默报成功。预检并明确警告。
+    if (sys_core) {
+        char limpath[64];
+        snprintf(limpath, sizeof(limpath), "/proc/%u/limits", _pid);
+        FILE* lf = fopen(limpath, "r");
+        if (lf) {
+            char line[256];
+            while (fgets(line, sizeof(line), lf)) {
+                if (strncmp(line, "Max core file size", 18) == 0) {
+                    unsigned long soft = 0;
+                    // 格式: "Max core file size <soft> <hard> <unit>"，数值在第 5 个词
+                    if (sscanf(line, "%*s %*s %*s %*s %lu", &soft) == 1 && soft == 0) {
+                        warn("mode 2: target RLIMIT_CORE=0, kernel core dump disabled");
+                    }
+                    break;
+                }
+            }
+            fclose(lf);
+        }
+        FILE* pf = fopen("/proc/sys/kernel/core_pattern", "r");
+        if (pf) {
+            char pat[128] = {0};
+            if (fgets(pat, sizeof(pat), pf) && pat[0] == '|') {
+                warn("mode 2: core_pattern is a pipe (%s), core goes to a helper "
+                     "not a regular file", pat);
+            }
+            fclose(pf);
+        }
+    }
+
+    /* forkcore using a forked process for large memory dump,
      * and all thread Registers Set is collected by this function.
      * 
      * after the function, there two parts of whole corefile.
@@ -1923,6 +1956,14 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         uint64_t gv[3] = { (uint64_t)_core_pid, (uint64_t)NULL, 0 };
         pt_call(_pid, &regs, r_waitpid, 3, gv);
         info("waitpid = %d", (int)regs.get_rc());
+        // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
+        // 会让注入的 waitpid 不执行，返回垃圾/ECHILD → 子进程作为目标 zombie 残留，
+        // 重复采集累积。检查返回值并如实报告。
+        if (regs.get_rc() != (uint64_t)_core_pid) {
+            warn("injected waitpid returned %d (expected %d); child may linger "
+                 "as a zombie (target likely in a restartable syscall)",
+                 (int)regs.get_rc(), (int)_core_pid);
+        }
     }
     pt_setregs(_pid, &saved_regs);
     pt_detach(_pid);
@@ -2191,6 +2232,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         uint64_t gv[3] = {(uint64_t)_core_pid, (uint64_t)NULL, 0};
         pt_call(_pid, &regs, r_waitpid, 3, gv);
         info("waitpid = %d", (int)regs.get_rc());
+        // B73 (Codex B2 review): 注入 waitpid 失败（B16 syscall-restart）时
+        // 子进程作为目标 zombie 残留；如实报告。
+        if (regs.get_rc() != (uint64_t)_core_pid) {
+            warn("injected waitpid returned %d (expected %d); child may linger "
+                 "as a zombie (target likely in a restartable syscall)",
+                 (int)regs.get_rc(), (int)_core_pid);
+        }
     }
     pt_setregs(_pid, &saved_regs);
     // B39: 本函数开头设了 PTRACE_O_TRACEFORK，若不清除则 monitor 继续运行时目标
