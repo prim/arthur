@@ -2091,6 +2091,14 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             ((s >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8)));
         if (stopped_at_ptrace_event) {
             sig = 0;
+            // B67: TRACEFORK auto-attach 的 fork 子进程残留在 arthur 上（TracerPid=arthur、
+            // state=t），monitor 继续运行时不 CONT 它 → 永久冻结。GETEVENTMSG 拿子进程
+            // pid 并 DETACH(SIGCONT) 解冻，让它正常继续运行。
+            unsigned long child_pid = 0;
+            if (ptrace(PTRACE_GETEVENTMSG, _pid, 0, &child_pid) == 0 && child_pid > 0) {
+                ptrace(PTRACE_DETACH, (pid_t)child_pid, NULL, (void*)SIGCONT);
+                info("detached auto-attached fork child %lu", child_pid);
+            }
         }
     } else {
         // now the process becomes zombie,
