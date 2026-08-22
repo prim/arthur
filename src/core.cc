@@ -2143,6 +2143,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     if (WriteProcessMeta(out, maps) != 0) {
         error("write process meta failed");
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
     // handle  leader first and then rest
@@ -2151,6 +2153,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     if (WriteThreadMeta(out, _pid, true) != 0) {
         error("write leader thread meta failed");
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         out.Close();
         unlink(corefile);
         return -1;
@@ -2162,6 +2166,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (WriteThreadMeta(out, tid) != 0) {
             error("write thread meta of %d failed", tid);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             out.Close();
             unlink(corefile);
             return -1;
@@ -2180,6 +2186,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             // B57: 目标可能在 attach/stop 后退出；fail-closed 还原，不 assert。
             error("set TRACEFORK on %d failed (%s)", _pid, strerror(errno));
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
     }
@@ -2198,6 +2206,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // 目标已被 pt_attach/pt_int + collect_threads 停住/attach：先还原再失败，
         // 否则 monitor 场景下兄弟线程永久冻结、leader 无法恢复。
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
     info("remote mmap at %lx", r_mmap);
@@ -2211,6 +2221,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     if (pt_getregs(_pid, &saved_regs) != 0) {
         error("save regs of %d failed (%s)", _pid, strerror(errno));
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -2226,6 +2238,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (pt_call(_pid, &regs, r_mmap, 6, gv) != 0) {
             error("mmap injection failed (target died?)");
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         info("mmap = %lx", regs.get_rc());
@@ -2244,6 +2258,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             // restore_target_after_fail 的 CONT(0) 会让 rip=0 立即重新 fault。
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
     }
@@ -2267,6 +2283,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             error("write inject shellcode to %lx failed", (unsigned long)inject_page);
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
@@ -2276,6 +2294,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             error("fork injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         info("child_pid = %d", (int)regs.get_rc());
@@ -2284,6 +2304,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             error("fork returned implausible child %d", (int)_core_pid);
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         // B72: 子进程（COW 快照）保留注入的 0；写回原字消除快照污染。
@@ -2318,12 +2340,16 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (WriteLoads(out, _core_pid, maps) != 0) {
             error("failed to dump memory of child %d", (int)_core_pid);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         // B69: ELF 块写入失败（磁盘满）时 fail-closed。
         if (WriteElfHeader(out) != 0) {
             error("failed to write elf header");
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         WriteTailMark(out);
@@ -2439,6 +2465,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     if (WriteProcessMeta(out, maps) != 0) {
         error("write process meta failed");
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
     // handle  leader first and then rest
@@ -2447,6 +2475,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     if (WriteThreadMeta(out, _pid, true) != 0) {
         error("write leader thread meta failed");
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         out.Close();
         unlink(corefile);
         return -1;
@@ -2458,6 +2488,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         if (WriteThreadMeta(out, tid) != 0) {
             error("write thread meta of %d failed", tid);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             out.Close();
             unlink(corefile);
             return -1;
@@ -2476,6 +2508,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             // B57: 目标可能在 attach/stop 后退出；fail-closed 还原，不 assert。
             error("set TRACEFORK on %d failed (%s)", _pid, strerror(errno));
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
     }
@@ -2494,6 +2528,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // 目标已被 pt_attach/pt_int + collect_threads 停住/attach：先还原再失败，
         // 否则 monitor 场景下兄弟线程永久冻结、leader 无法恢复。
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
     info("remote mmap at %lx", r_mmap);
@@ -2506,6 +2542,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     if (pt_getregs(_pid, &saved_regs) != 0) {
         error("save regs of %d failed (%s)", _pid, strerror(errno));
         restore_target_after_fail();
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -2521,6 +2559,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             error("mmap injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         info("mmap = %lx", regs.get_rc());
@@ -2539,6 +2579,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             // restore_target_after_fail 的 CONT(0) 会让 rip=0 立即重新 fault。
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
     }
@@ -2562,6 +2604,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             error("write inject shellcode to %lx failed", (unsigned long)inject_page);
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
@@ -2571,6 +2615,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             error("fork injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         info("child_pid = %d", (int)regs.get_rc());
@@ -2579,6 +2625,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             error("fork returned implausible child %d", (int)_core_pid);
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
+            out.Close();
+            unlink(corefile);
             return -1;
         }
         // B72: 子进程（COW 快照）保留注入的 0；写回原字消除快照污染。
