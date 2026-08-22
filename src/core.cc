@@ -1390,19 +1390,24 @@ int Coredump::WriteElfHeader(Lz4Stream& out)
 
     // hard coded the 'machine' by platform
 #ifdef __aarch64__
-    ehdr.e_machine = EM_AARCH64; 
+    ehdr.e_machine = EM_AARCH64;
 #else
-    ehdr.e_machine = EM_X86_64; 
+    ehdr.e_machine = EM_X86_64;
 #endif
 
     out.SetBlock(BLOCK_TYPE_ELF);
     out.Write((const char*)&ehdr, sizeof(ehdr));
-   
+
     for (auto& phdr : _phdrs) {
         out.Write((const char*)&phdr, sizeof(phdr));
     }
 
-    out.Flush(); 
+    // B69: 磁盘满时 Flush 的 Compress 失败返回 -1；原实现忽略 → ELF 块缺失的
+    // acore 静默产出，解压报 "elf block missing"。传播错误。
+    if (out.Flush() < 0) {
+        error("write elf block failed (disk full?)");
+        return -1;
+    }
     return 0;
 }
 
@@ -1654,7 +1659,11 @@ int Coredump::generate(const char *corefile)
             error("failed to dump memory of %d", _pid);
             return -1;
         }
-        WriteElfHeader(out);
+        // B69: ELF 块写入失败（磁盘满）时显式失败。
+        if (WriteElfHeader(out) != 0) {
+            error("failed to write elf header for %d", _pid);
+            return -1;
+        }
         WriteTailMark(out);
     }
     // detach all threads
@@ -1852,7 +1861,12 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             restore_target_after_fail();
             return -1;
         }
-        WriteElfHeader(out);
+        // B69: ELF 块写入失败（磁盘满）时 fail-closed。
+        if (WriteElfHeader(out) != 0) {
+            error("failed to write elf header");
+            restore_target_after_fail();
+            return -1;
+        }
         WriteTailMark(out);
     }
 
@@ -2070,7 +2084,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             restore_target_after_fail();
             return -1;
         }
-            WriteElfHeader(out);
+            // B69: ELF 块写入失败（磁盘满）时 fail-closed。
+            if (WriteElfHeader(out) != 0) {
+                error("failed to write elf header");
+                restore_target_after_fail();
+                return -1;
+            }
             WriteTailMark(out);
         }
     }
@@ -2306,7 +2325,13 @@ int Coredump::monitor(const char* corefile)
             unlink(corefile);
             return -1;
         }
-        WriteElfHeader(out);
+        // B69: ELF 块写入失败时清理。
+        if (WriteElfHeader(out) != 0) {
+            error("failed to write elf header for crashed process");
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
         WriteTailMark(out);
     }
 
