@@ -1240,9 +1240,14 @@ void Coredump::restore_target_after_fail()
     // （实证：fail-closed 后所有新 fork 子进程 TracerPid=arthur）。此刻 leader
     // 处于 stop（所有调用方都在 pt_call/attach 后调用），SETOPTIONS 生效，先清
     // TRACEFORK（恢复 _ptrace_options，monitor 下即 TRACEEXIT）再 CONT。
-    ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
-
-    ptrace(PTRACE_CONT, _pid, NULL, NULL);
+    // b39 (Codex review): SETOPTIONS/CONT 返回值要检查——恢复失败时目标仍残留
+    // TRACEFORK/停靠，monitor 继续运行会把之后每个 fork 冻结；如实告警。
+    if (ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options) != 0) {
+        error("restore: set options on %d failed (%s)", _pid, strerror(errno));
+    }
+    if (ptrace(PTRACE_CONT, _pid, NULL, NULL) != 0) {
+        error("restore: cont %d failed (%s)", _pid, strerror(errno));
+    }
 }
 
 int Coredump::VerifyFileHeader(Lz4Stream& in)
@@ -1704,13 +1709,19 @@ int Coredump::generate(const char *corefile)
     // attach main thread
     if (pt_attach(_pid) != 0) {
         // 目标不存在/无权限：干净报错而非深层 assert 崩溃
+        // b41 (Codex review): 只依赖析构关文件会留下 8 字节空 acore；显式清理，
+        // 避免无效/无权限 pid 产出误导性文件。
         error("cannot attach to process %d", _pid);
+        out.Close();
+        unlink(corefile);
         return -1;
     }
     // get all threads pid（attach 全部非主线程，剔除已退出的）
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -1819,7 +1830,10 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // attach main thread
     if (pt_attach(_pid) != 0) {
         // 目标不存在/无权限：干净报错而非深层 assert 崩溃
+        // b41 (Codex review): 失败路径要清理已打开的空 acore（8 字节 header）。
         error("cannot attach to process %d", _pid);
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -1827,6 +1841,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -2075,6 +2091,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
     if (collect_threads(_pid) != 0) {
         error("failed to collect threads of %d", _pid);
+        // b41 (Codex review): 清理已打开的空 acore（8 字节 header），不残留假文件。
+        out.Close();
+        unlink(corefile);
         return -1;
     }
 
@@ -2333,7 +2352,10 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     out.Close();
 
     // clean pending signal generated above by tracee
+    // b38 (Codex review): sigset_t 未 sigemptyset 就在未初始化位图上 sigaddset 是
+    // UB——除 SIGCHLD 外的垃圾位会进入 sigwaitinfo 集合，monitor 状态机可能等错信号。
     sigset_t mask;
+    sigemptyset(&mask);
     //siginfo_t sig_info;
     sigaddset(&mask, SIGCHLD);
     sigwaitinfo(&mask, NULL);
@@ -2371,7 +2393,10 @@ int Coredump::monitor(const char* corefile)
     info("Launched in monitor mode");
 
     // block all signals
+    // b38 (Codex review): 未 sigemptyset 的 sigset_t 直接 sigaddset 是 UB，
+    // 垃圾位会被 SIG_BLOCK 阻塞任意信号并进入 sigwaitinfo 等待集合。
     sigset_t mask;
+    sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD); // signal from tracee
     sigaddset(&mask, SIGUSR1); // signal for generating corefile while monitor
     sigprocmask(SIG_BLOCK, &mask, NULL);
@@ -2416,13 +2441,24 @@ int Coredump::monitor(const char* corefile)
                     // B38: 进程死于致命信号但未产生 leader 的 signal-delivery-stop
                     // （通常是非 leader 线程崩溃，进程已死，内存/寄存器已消失，
                     // 无法采集现场）。如实报告并清掉开头写的空 acore。
+                    // b38 (Codex review): 崩溃且无 core 是失败而非成功——返回非零，
+                    // 避免自动化把"目标崩溃、没产出 core"判成成功；unlink 结果要检查。
                     error("%s: process %d crashed (likely a non-leader thread); "
                           "no core written", strsignal(status), _pid);
                     out.Close();
-                    unlink(corefile);
+                    if (unlink(corefile) != 0) {
+                        error("failed to remove empty acore %s (%s)", corefile, strerror(errno));
+                    }
+                    return -1;
                 } else {
                     info("%s: process %d terminated by signal", strsignal(status), _pid);
                     ptrace(PTRACE_DETACH, _pid, NULL, (uintptr_t) status);
+                }
+                // b38 (Codex review): 正常退出/非捕获信号终止都没产出 core——
+                // 统一清掉开头写的 8 字节空 acore，不残留误导性假文件。
+                out.Close();
+                if (unlink(corefile) != 0) {
+                    error("failed to remove empty acore %s (%s)", corefile, strerror(errno));
                 }
                 return 0;
             } else if (status == SIGILL || status == SIGABRT || status == SIGSEGV) {
