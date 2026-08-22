@@ -666,12 +666,15 @@ int makeroom(FILE* fout, size_t n)
         size_t len = MIN(PAGE_SIZE, n-m);
         ssize_t rc = fwrite(zero, 1, len, fout);
         if (rc <= 0) {
-            break;
+            // B68: 磁盘满时 fwrite 短写/失败；原实现 break 后仍返回 0，
+            // decompress 的 `rc<0` 检查是死代码，部分预留被静默接受。
+            error("makeroom: disk full, reserved %lu of %lu bytes", m, n);
+            return -1;
         }
         m += rc;
     }
 
-    return 0; 
+    return 0;
 }
 
 int ProcessData::ParseAll()
@@ -1340,7 +1343,15 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
 
             for (ssize_t i=0; i<len; i+= BLOCK_SIZE) {
                 size_t j = MIN(len - i, BLOCK_SIZE);
-                size += out.WriteBlock((const char*)(buf+i), j, BLOCK_TYPE_LOADS);
+                // B68: WriteBlock 失败（压缩错误）返回 -1；直接 `size += rc` 会让
+                // size_t 下溢成巨大值，ph.p_filesz 声明巨额 → 解压被一致性检查拒。
+                int wrc = out.WriteBlock((const char*)(buf+i), j, BLOCK_TYPE_LOADS);
+                if (wrc < 0) {
+                    error("write loads block failed (%d)", wrc);
+                    close(fd);
+                    return -1;
+                }
+                size += wrc;
             }
 
             // update file size
