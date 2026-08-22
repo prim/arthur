@@ -1637,7 +1637,12 @@ int Coredump::generate(const char *corefile)
     }
     // write acore
     {
-        WriteLoads(out, _pid, maps); // write maps content
+        // B65: WriteLoads 失败（/proc/pid/mem 打不开，dumpable=0/进程消失）时
+        // 静默产出无内存的空 core；显式失败。
+        if (WriteLoads(out, _pid, maps) != 0) {
+            error("failed to dump memory of %d", _pid);
+            return -1;
+        }
         WriteElfHeader(out);
         WriteTailMark(out);
     }
@@ -1830,7 +1835,12 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 
     if (!sys_core) {
         // write acore
-        WriteLoads(out, _core_pid, maps);
+        // B65: 读子进程内存失败（child 消失/dumpable=0）时 fail-closed，还原目标。
+        if (WriteLoads(out, _core_pid, maps) != 0) {
+            error("failed to dump memory of child %d", (int)_core_pid);
+            restore_target_after_fail();
+            return -1;
+        }
         WriteElfHeader(out);
         WriteTailMark(out);
     }
@@ -2043,7 +2053,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     if (!sys_core) {
         // write acore
         {
-            WriteLoads(out, _core_pid, maps);
+            // B65: 读子进程内存失败（child 消失/dumpable=0）时 fail-closed，还原目标。
+        if (WriteLoads(out, _core_pid, maps) != 0) {
+            error("failed to dump memory of child %d", (int)_core_pid);
+            restore_target_after_fail();
+            return -1;
+        }
             WriteElfHeader(out);
             WriteTailMark(out);
         }
@@ -2248,7 +2263,13 @@ int Coredump::monitor(const char* corefile)
     }
     // write acore
     {
-        WriteLoads(out, _pid, maps);
+        // B65: 崩溃路径 /proc/pid/mem 读不到时报错并清理，不产出空 core。
+        if (WriteLoads(out, _pid, maps) != 0) {
+            error("failed to dump memory of crashed process %d", _pid);
+            out.Close();
+            unlink(corefile);
+            return -1;
+        }
         WriteElfHeader(out);
         WriteTailMark(out);
     }
