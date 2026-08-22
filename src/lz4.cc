@@ -230,7 +230,6 @@ int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
         return 0;
     }
 
-    int rc;
     // B49: LZ4_compress_fast_continue 返回 int；原用 size_t 存导致 `len < 0`
     // 恒假（-Wall 报 type-limits），错误返回值被当巨大正数写进块头。
     int len = LZ4_compress_fast_continue(_enc, block.rBuf(), buf, block.Length(), sizeof(buf), 1);
@@ -244,14 +243,16 @@ int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
 
     // write block header
     hdr.size = len;
-    rc = fwrite(&hdr, 1, sizeof(hdr), _file);
-    if (rc < 0) {
+    // B64: `rc < 0` 恒假——fwrite 返回 size_t（实际写入数），磁盘满时短写返回
+    // 正数而不是负，原检查检测不到，acore 静默截断。改完整长度比较。
+    if (fwrite(&hdr, 1, sizeof(hdr), _file) != sizeof(hdr)) {
+        error("write block header failed (disk full?)");
         return -1;
     }
 
     // write compressed data
-    rc = fwrite(buf, 1, len, _file);
-    if (rc < 0) {
+    if (fwrite(buf, 1, len, _file) != (size_t)len) {
+        error("write block data failed (disk full?)");
         return -1;
     }
 
