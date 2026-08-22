@@ -39,7 +39,7 @@ struct AcoreHeader {
      * 2: support arch and introduced aarch64 arch.
      */
 
-#define ACORE_VERSION 2
+#define ACORE_VERSION 3
     struct {
         uint16_t version:12;
         uint16_t arch:4;        // ARCHTYPE
@@ -119,8 +119,14 @@ struct ThreadData {
         x64_xstatereg               x64;           
     } _xstate; 
 
-    siginfo_t _siginfo;   // SigInfo 
-    
+    siginfo_t _siginfo;   // SigInfo
+
+    // v3: THREAD 块尾部——FP/扩展寄存器读取是否成功（填 pr_fpvalid）+
+    // 全 64 位 SigPnd/SigBlk 掩码（stat 字段 31/32 被内核掩成 31 位，丢 RT 信号）。
+    char _fp_valid;
+    uint64_t _sigpend;
+    uint64_t _sighold;
+
     ProcFile *_stat;
     ProcStat *_d_stat;
 
@@ -329,6 +335,7 @@ private:
     pid_t _pid;             // target pid
     pid_t _core_pid;        // forked core's pid
     int _arch;              // ARCHTYPE
+    int _acore_version;     // v3: 读到的 acore 版本（THREAD 块尾部 FP 有效位仅 v3+）
     // 内核没有 PTRACE_GETOPTIONS；arthur 需要自己跟踪给目标设过的 ptrace
     // options（pt_monitor 设 TRACEEXIT，forkcore_m 临时叠加 TRACEFORK），
     // 以便在清除 TRACEFORK 时把 TRACEEXIT 恢复回去（B39）。

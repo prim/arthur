@@ -984,9 +984,11 @@ int Note::fill_prstatus(const ThreadData& thr)
         jiffies_to_timeval(thr._d_stat->cutime, info.pr_cutime.tv_sec, info.pr_cutime.tv_usec);
         jiffies_to_timeval(thr._d_stat->cstime, info.pr_cstime.tv_sec, info.pr_cstime.tv_usec);
         // B25: 填充 pr_sigpend/pr_sighold/pr_fpvalid（内核原生 core 会填）
-        info.pr_sigpend = thr._d_stat->pending;
-        info.pr_sighold = thr._d_stat->blocked;
-        info.pr_fpvalid = 1;
+        // b25: v3 用 status 源的全 64 位 SigPnd/SigBlk（stat 字段 31/32 被内核
+        // & 0x7fffffff 掩掉 RT 信号）；v2 无则回退 stat 字段（低 31 位，旧行为）。
+        info.pr_sigpend = thr._sigpend ? thr._sigpend : thr._d_stat->pending;
+        info.pr_sighold = thr._sighold ? thr._sighold : thr._d_stat->blocked;
+        info.pr_fpvalid = thr._fp_valid ? 1 : 0;
         char *p = allocate(sizeof(info));
         memcpy(p, &info, sizeof(info));
     }
@@ -1007,9 +1009,11 @@ int Note::fill_prstatus(const ThreadData& thr)
         jiffies_to_timeval(thr._d_stat->cutime, info.pr_cutime.tv_sec, info.pr_cutime.tv_usec);
         jiffies_to_timeval(thr._d_stat->cstime, info.pr_cstime.tv_sec, info.pr_cstime.tv_usec);
         // B25: 填充 pr_sigpend/pr_sighold/pr_fpvalid（内核原生 core 会填）
-        info.pr_sigpend = thr._d_stat->pending;
-        info.pr_sighold = thr._d_stat->blocked;
-        info.pr_fpvalid = 1;
+        // b25: v3 用 status 源的全 64 位 SigPnd/SigBlk（stat 字段 31/32 被内核
+        // & 0x7fffffff 掩掉 RT 信号）；v2 无则回退 stat 字段（低 31 位，旧行为）。
+        info.pr_sigpend = thr._sigpend ? thr._sigpend : thr._d_stat->pending;
+        info.pr_sighold = thr._sighold ? thr._sighold : thr._d_stat->blocked;
+        info.pr_fpvalid = thr._fp_valid ? 1 : 0;
         char *p = allocate(sizeof(info));
         memcpy(p, &info, sizeof(info));
     }
@@ -1078,6 +1082,7 @@ Coredump::Coredump(pid_t pid)
 #else
       _arch(ARCH_X64),
 #endif
+      _acore_version(ACORE_VERSION),
       // 按 core.h 成员声明顺序（_ptrace_options 在 _ehdr/_note_phdr 之前）
       _ptrace_options(0),
       _ehdr(),
@@ -1171,6 +1176,24 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
     return 0;
 }
 
+// b25: 从 /proc/<tid>/status 文本解析 SigPnd:/SigBlk: 的 64 位十六进制掩码。
+// f_data 已 NUL 结尾（B17），strstr/strtoull 有界。未找到返回 0。
+static uint64_t parse_status_mask(const char *data, const char *key)
+{
+    if (!data) {
+        return 0;
+    }
+    const char *p = strstr(data, key);
+    if (!p) {
+        return 0;
+    }
+    p += strlen(key);
+    while (*p == ':' || *p == '\t' || *p == ' ') {
+        p++;
+    }
+    return strtoull(p, NULL, 16);
+}
+
 int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     info("thread: %d", pid); // thread info
     int rc;
@@ -1181,15 +1204,28 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     // 下一个 LOADS/ELF 块当 THREAD 块，整体错位。改为写零化块保持计数一致
     // （该线程现场确已消失，零寄存器是诚实近似）。
     ThreadData i;   // 构造器 memset 为零
+    int fp_ok = 1;
     rc = pt_getregs(pid, (user_regs64_struct*)&i._regs);
     if (rc != 0) { warn("getregs thread %d failed, zeroed block", pid); }
     rc = pt_getfpregs(pid, (user_fpregs64_struct*)&i._fpregs);
-    if (rc != 0) { warn("getfpregs thread %d failed, zeroed block", pid); }
+    if (rc != 0) { warn("getfpregs thread %d failed, zeroed block", pid); fp_ok = 0; }
     rc = ptrace(PTRACE_GETSIGINFO, pid, 0, &i._siginfo);
     if (rc != 0) { warn("getsiginfo thread %d failed, zeroed block", pid); }
     if (_arch == ARCH_X64) {
         rc = pt_getxstateregs(pid, (x64_xstatereg*)&i._xstate);
-        if (rc != 0) { warn("getxstateregs thread %d failed, zeroed block", pid); }
+        if (rc != 0) { warn("getxstateregs thread %d failed, zeroed block", pid); fp_ok = 0; }
+    }
+    // v3: FP/扩展状态读取成功才有 pr_fpvalid=1；失败（线程退出）时写 0。
+    i._fp_valid = (fp_ok != 0);
+
+    // b25: /proc/<tid>/status 的 SigPnd/SigBlk 是全 64 位掩码。stat 字段 31/32
+    // 被内核 `& 0x7fffffff` 掩成 31 位，丢 RT 信号（32-64）——pr_sigpend/pr_sighold
+    // 会缺失。解析后随 THREAD 块写入，解压端填 pr_sigpend。
+    char buf[BUFFER_SIZE];
+    ProcFile *spf = ProcFile::ReadPid(buf, BUFFER_SIZE, pid, PROC_TYPE_STATUS);
+    if (spf) {
+        i._sigpend = parse_status_mask(spf->f_data, "SigPnd:");
+        i._sighold = parse_status_mask(spf->f_data, "SigBlk:");
     }
 
     // write thread meta
@@ -1210,11 +1246,16 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     if (_arch == ARCH_X64) {
         out.Write((const char*)&i._xstate.x64, sizeof(i._xstate.x64));
     }
+    // v3: THREAD 块尾部——FP 有效位(1) + 全 64 位 SigPnd/SigBlk(8+8)；解压端据此填
+    // pr_fpvalid/pr_sigpend/pr_sighold。合法 v2 读取器不消费这些字节。
+    out.Write((const char*)&i._fp_valid, sizeof(i._fp_valid));
+    out.Write((const char*)&i._sigpend, sizeof(i._sigpend));
+    out.Write((const char*)&i._sighold, sizeof(i._sighold));
 
     out.Flush();
     // read /proc/<pid>/stat；读失败时写最小合法 ProcFile（f_size=0），
     // 避免把未初始化 buf 当 ProcFile 写出（解压端 GetFile 读垃圾 size）。
-    char buf[BUFFER_SIZE];
+    // （buf 复用：上方 status 已解析完，这里覆盖。）
     ProcFile *pf = ProcFile::ReadPid(buf, BUFFER_SIZE, pid, PROC_TYPE_STAT);
     if (!pf) {
         warn("read /proc/%d/stat failed, empty stat", pid);
@@ -1318,6 +1359,8 @@ int Coredump::VerifyFileHeader(Lz4Stream& in)
 
     // for version 1, the arch is always x64.
     _arch = hdr.m.arch;
+    // v3: THREAD 块尾部有 FP 有效位；读侧按版本决定是否消费
+    _acore_version = hdr.m.version;
 
     return 0;
 }
@@ -1404,6 +1447,18 @@ int Coredump::ReadMeta(Lz4Stream& in)
             buf->Read((char*)&td._regs, sizeof(td._regs.arm64));
             buf->Read((char*)&td._fpregs, sizeof(td._fpregs.arm64));
             buf->Read((char*)&td._siginfo, sizeof(td._siginfo));
+        }
+
+        // v3: THREAD 块尾部——FP 有效位(1) + SigPnd/SigBlk(8+8)；v2 及更早无
+        // （默认 fp 有效，掩码由 fill_prstatus 回退 stat 字段）。
+        if (_acore_version >= 3) {
+            char fv = 0;
+            buf->Read((char*)&fv, 1);
+            td._fp_valid = (fv != 0);
+            buf->Read((char*)&td._sigpend, sizeof(td._sigpend));
+            buf->Read((char*)&td._sighold, sizeof(td._sighold));
+        } else {
+            td._fp_valid = 1;
         }
 
         td._stat = in.GetFile();

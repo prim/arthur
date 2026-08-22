@@ -15,6 +15,7 @@ namespace arthur {
 #define PROC_TYPE_LIST(v) \
     v(PROC_TYPE_CMDLINE, "cmdline") \
     v(PROC_TYPE_STAT, "stat") \
+    v(PROC_TYPE_STATUS, "status") \
     v(PROC_TYPE_AUXV, "auxv") \
     v(PROC_TYPE_MAPS, "maps") \
     v(PROC_TYPE_IO, "io") \
