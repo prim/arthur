@@ -2599,7 +2599,18 @@ int Coredump::monitor(const char* corefile)
                 // 中继目标用 sig_info.si_pid：TRACEFORK 自动 attach 的子进程
                 // 或非 leader 线程的停靠，si_pid 才是正确的恢复目标；固定 _pid
                 // 会恢复错误线程，让真正的停靠者永久冻结（问题2）。
-                ptrace(PTRACE_CONT, sig_info.si_pid, NULL, (uintptr_t) status);
+                // b39 (Codex review): 事件停靠（PTRACE_EVENT_XXX，含 TRACEEXIT 的
+                // EVENT_EXIT）与组停靠（PTRACE_EVENT_STOP）的 WSTOPSIG 是 SIGTRAP/
+                // SIGSTOP——把 si_status 当中继信号注入会用 SIGTRAP/SIGSTOP 误杀或
+                // 冻结目标。事件编号在 wait status 高 16 位，非零即事件/组停靠，
+                // 用信号 0 恢复，让 EVENT_EXIT 之后正常走到 CLD_EXITED。
+                int pt_event = status >> 16;
+                if (pt_event != 0) {
+                    info("ptrace event-stop (%d) on %d, resume with 0", pt_event, sig_info.si_pid);
+                    ptrace(PTRACE_CONT, sig_info.si_pid, NULL, 0);
+                } else {
+                    ptrace(PTRACE_CONT, sig_info.si_pid, NULL, (uintptr_t) status);
+                }
             }
             signal_forkcore = 0; // reset signal 
         } else {
@@ -2837,6 +2848,11 @@ void Coredump::cleanup_decompress()
     }
     _process._cmdline = _process._auxv = _process._maps = NULL;
     _process._environ = _process._io = _process._limits = NULL;
+
+    // b50 (Codex review): 未清空 _threads/_phdrs——同一 Coredump 重复 decompress()
+    // 会保留上一次的线程向量与段头，第二次采集叠加出幻影 phdr/线程。清空以便复用。
+    _process._threads.clear();
+    _phdrs.clear();
 }
 
 int Coredump::test_compress(const char* in_file, const char* out_file)
