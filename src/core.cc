@@ -858,8 +858,21 @@ int Note::fill_file(const ProcessData& proc)
     // descsz = 16 + count*24 + 精确文件名长度，末尾补齐由 note 对齐处理。
     char *p = allocate(block.Size());
     memcpy(p, block.rBuf(), block.Size());
-    
+
     return 0;
+}
+
+// B62: /proc/<pid>/stat 的 utime/stime 是 jiffies（CLK_TCK/秒，通常 100），
+// 内核原生 core 的 pr_utime 是 timeval（秒+微秒）。原实现把 jiffies 直接当
+// tv_sec——CPU 时间显示放大 ~100 倍（0.8s 写成 80s）。转成秒+微秒。
+static void jiffies_to_timeval(unsigned long jiffies, uint64_t& tv_sec, uint64_t& tv_usec)
+{
+    static long clk_tck = sysconf(_SC_CLK_TCK);
+    if (clk_tck <= 0) {
+        clk_tck = 100;
+    }
+    tv_sec = jiffies / (unsigned long)clk_tck;
+    tv_usec = (jiffies % (unsigned long)clk_tck) * (1000000UL / (unsigned long)clk_tck);
 }
 
 // NT_PRSTATUS
@@ -881,10 +894,11 @@ int Note::fill_prstatus(const ThreadData& thr)
         info.pr_ppid = thr._d_stat->ppid;
         info.pr_pgrp = thr._d_stat->pgid;
         info.pr_sid = thr._d_stat->sid;
-        info.pr_utime.tv_sec = thr._d_stat->utime;
-        info.pr_stime.tv_sec = thr._d_stat->stime;
-        info.pr_cutime.tv_sec = thr._d_stat->cutime;
-        info.pr_cstime.tv_sec = thr._d_stat->cstime;
+        // B62: jiffies → 秒+微秒（内核原生 core 的 pr_utime 是 timeval）
+        jiffies_to_timeval(thr._d_stat->utime, info.pr_utime.tv_sec, info.pr_utime.tv_usec);
+        jiffies_to_timeval(thr._d_stat->stime, info.pr_stime.tv_sec, info.pr_stime.tv_usec);
+        jiffies_to_timeval(thr._d_stat->cutime, info.pr_cutime.tv_sec, info.pr_cutime.tv_usec);
+        jiffies_to_timeval(thr._d_stat->cstime, info.pr_cstime.tv_sec, info.pr_cstime.tv_usec);
         // B25: 填充 pr_sigpend/pr_sighold/pr_fpvalid（内核原生 core 会填）
         info.pr_sigpend = thr._d_stat->pending;
         info.pr_sighold = thr._d_stat->blocked;
@@ -903,10 +917,11 @@ int Note::fill_prstatus(const ThreadData& thr)
         info.pr_ppid = thr._d_stat->ppid;
         info.pr_pgrp = thr._d_stat->pgid;
         info.pr_sid = thr._d_stat->sid;
-        info.pr_utime.tv_sec = thr._d_stat->utime;
-        info.pr_stime.tv_sec = thr._d_stat->stime;
-        info.pr_cutime.tv_sec = thr._d_stat->cutime;
-        info.pr_cstime.tv_sec = thr._d_stat->cstime;
+        // B62: jiffies → 秒+微秒（内核原生 core 的 pr_utime 是 timeval）
+        jiffies_to_timeval(thr._d_stat->utime, info.pr_utime.tv_sec, info.pr_utime.tv_usec);
+        jiffies_to_timeval(thr._d_stat->stime, info.pr_stime.tv_sec, info.pr_stime.tv_usec);
+        jiffies_to_timeval(thr._d_stat->cutime, info.pr_cutime.tv_sec, info.pr_cutime.tv_usec);
+        jiffies_to_timeval(thr._d_stat->cstime, info.pr_cstime.tv_sec, info.pr_cstime.tv_usec);
         // B25: 填充 pr_sigpend/pr_sighold/pr_fpvalid（内核原生 core 会填）
         info.pr_sigpend = thr._d_stat->pending;
         info.pr_sighold = thr._d_stat->blocked;
