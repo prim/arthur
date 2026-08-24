@@ -842,6 +842,16 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
                 }
                 break;
             }
+            if (WSTOPSIG(status) == SIGABRT || WSTOPSIG(status) == SIGILL) {
+                // B171: 注入期间目标 abort/illegal（SIGABRT/SIGILL delivery-stop）。
+                // 注入的 syscall 包装函数（mmap/fork/waitpid）不 abort/不执行非法指令，
+                // 这两个信号只来自目标自身的真实崩溃（异步 kill -ABRT/-ILL 或内部
+                // assert）。原实现对这些信号只 CONT(0) 抑制——崩溃被静默吞掉、目标
+                // 继续运行（与 B158 的 kill-SEGV 同类未覆盖）。fail-closed。
+                error("%s during injection (real crash, not completion)",
+                      strsignal(WSTOPSIG(status)));
+                return fail("crash during injection");
+            }
             if ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8))) {
                 unsigned long msg;
                 rc = ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
@@ -3546,6 +3556,16 @@ int Coredump::monitor(const char* corefile)
                         exit_sig = st;
                         break;   // 走崩溃采集路径
                     }
+                    // B170: leader 停在**非崩溃**停靠（pending 的可中继信号、组停靠
+                    // SIGCHLD 尚未被主循环处理等）——forkcore_m 的 pt_int 对已停
+                    // tracee 的 INTERRUPT 不产生新停靠（实证），pt_wait 轮询 10s 超时、
+                    // 失败路径还不 CONT → leader 冻结 + SIGUSR1 dump 静默跳过。
+                    // 这里消费掉 wait status 后跳过 dump，让 pending 的 SIGCHLD 由
+                    // 主循环中继（CONT(sig)/LISTEN），leader 保持正确状态。
+                    info("leader stopped at %s; skipping SIGUSR1 dump "
+                         "(relay via main loop)", strsignal(st));
+                    signal_forkcore = 0;
+                    continue;
                 }
             }
             // B19: 原实现 `char out[17]; sprintf(out, "acore.%u\n", ...)`——
