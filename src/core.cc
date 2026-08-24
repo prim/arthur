@@ -890,7 +890,12 @@ static inline int pt_attach(pid_t pid)
         // 线程可能已退出（ESRCH）：返回错误让调用方容错，而非 abort
         return rc;
     }
-    pt_wait(pid);
+    // R50-22: pt_wait 超时（线程 D 态不可停，SIGSTOP 无法交付）时 attach 虽成功但
+    // tracee 未停靠——若当成功，WriteThreadMeta 写零化块、结尾 DETACH 失败残留
+    // PT_PTRACED+SIGSTOP，D 态解除后线程永久冻结。传播失败让调用方 fail-closed。
+    if (pt_wait(pid) < 0) {
+        return -1;
+    }
 
     return rc;
 }
@@ -903,7 +908,10 @@ static inline int pt_int(pid_t pid)
     if (rc != 0) {
         return rc;
     }
-    pt_wait(pid);
+    // R50-22: 同 pt_attach——INTERRUPT 后未停靠（D 态）时传播超时失败。
+    if (pt_wait(pid) < 0) {
+        return -1;
+    }
 
     return rc;
 }
@@ -1541,18 +1549,22 @@ int Coredump::collect_threads(pid_t leader)
     struct dirent *dp = NULL;
     while ((dp = readdir(dirp)) != NULL) {
         if (dp->d_name[0] == '.') continue;
-        int tid = atoi(dp->d_name);
-        if (tid == 0 || tid == leader) continue;
+        // R50-22: atoi 对超长数字串溢出是 UB（真实 /proc/task 由内核生成不可触发，
+        // 防伪造/损坏 /proc）。strtol + 全串校验。
+        char *end = NULL;
         errno = 0;
-        if (pt_attach(tid) != 0) {
+        long tid = strtol(dp->d_name, &end, 10);
+        if (end == dp->d_name || *end != '\0' || tid <= 0 || tid == leader) continue;
+        errno = 0;
+        if (pt_attach((pid_t)tid) != 0) {
             // B77 (Codex B7 review): 线程可能在枚举与 attach 间退出（ESRCH，跳过）；
             // 但 EPERM/tracer 冲突等非 ESRCH 错误是真实故障，跳过会静默产出不完整
             // dump。fail-closed。
             if (errno == ESRCH) {
-                error("attach thread %d failed (exited), skipped", tid);
+                error("attach thread %ld failed (exited), skipped", tid);
                 continue;
             }
-            error("attach thread %d failed (%s), aborting collection", tid, strerror(errno));
+            error("attach thread %ld failed (%s), aborting collection", tid, strerror(errno));
             closedir(dirp);
             return -1;
         }
