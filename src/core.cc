@@ -3119,24 +3119,39 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
                  _pid, strerror(errno));
         }
     }
-    pt_getregs(_pid, &saved_regs);
-    {
-        uint64_t gv[3] = {(uint64_t)_core_pid, (uint64_t)NULL, 0};
-        // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc() 读垃圾。
-        if (pt_call(_pid, &regs, r_waitpid, 3, gv) != 0) {
-            warn("waitpid injection failed (target died?)");
-        } else {
-            info("waitpid = %d", (int)regs.get_rc());
-            // B73 (Codex B2 review): 注入 waitpid 失败（B16 syscall-restart）时
-            // 子进程作为目标 zombie 残留；如实报告。
-            if (regs.get_rc() != (uint64_t)_core_pid) {
-                warn("injected waitpid returned %d (expected %d); child may linger "
-                     "as a zombie (target likely in a restartable syscall)",
-                     (int)regs.get_rc(), (int)_core_pid);
+    // B151: 目标在 dump 窗口内崩溃（真实信号 delivery-stop，非 ptrace 事件）。
+    // 若仍做 waitpid 注入，pt_call 的 CONT(0) 会把 pending 的崩溃信号抑制掉
+    // （与 H2 入口同机制），随后崩溃采集的 NT_SIGINFO 变成注入完成的假 SIGSEGV
+    // ——实测 0xdeadbeef 崩溃 → core 报 si_addr=0、si_code 变注入值。崩溃停靠时
+    // 跳过注入，保留真实崩溃现场（寄存器 + si_addr/si_code）供崩溃采集读取。
+    // fork 子进程已在上方 SIGKILL，leader 崩溃后由其 reaper（init）收尸，无需注入。
+    bool crashed_in_window =
+        WIFSTOPPED(s) && !stopped_at_ptrace_event &&
+        (sig == SIGILL || sig == SIGABRT || sig == SIGSEGV);
+    if (crashed_in_window) {
+        info("leader %d crashed in %s delivery-stop during dump; "
+             "skipping waitpid injection to preserve crash stop",
+             _pid, strsignal(sig));
+    } else {
+        pt_getregs(_pid, &saved_regs);
+        {
+            uint64_t gv[3] = {(uint64_t)_core_pid, (uint64_t)NULL, 0};
+            // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc() 读垃圾。
+            if (pt_call(_pid, &regs, r_waitpid, 3, gv) != 0) {
+                warn("waitpid injection failed (target died?)");
+            } else {
+                info("waitpid = %d", (int)regs.get_rc());
+                // B73 (Codex B2 review): 注入 waitpid 失败（B16 syscall-restart）时
+                // 子进程作为目标 zombie 残留；如实报告。
+                if (regs.get_rc() != (uint64_t)_core_pid) {
+                    warn("injected waitpid returned %d (expected %d); child may linger "
+                         "as a zombie (target likely in a restartable syscall)",
+                         (int)regs.get_rc(), (int)_core_pid);
+                }
             }
         }
+        pt_setregs(_pid, &saved_regs);
     }
-    pt_setregs(_pid, &saved_regs);
     // B39: 本函数开头设了 PTRACE_O_TRACEFORK，若不清除则 monitor 继续运行时目标
     // 后续每个 fork 的子进程都被自动 attach+SIGSTOP 冻结（实证：state=t、
     // TracerPid=arthur）。SETOPTIONS 需 tracee 停止——此刻 leader 刚被 pt_attach
