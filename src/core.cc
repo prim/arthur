@@ -1403,6 +1403,11 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
     }
     maps.setpf(_maps);
     maps.Parse();
+    // R50-27: _maps 指向本函数栈上 buf，函数返回即失效。Parse 已把数据深拷贝进
+    // ProcMaps 的 std::vector（std::string name 自包含），WriteLoads 只迭代向量、
+    // 不再解引用 _pf。置 NULL 防未来任何在返回后调用 Parse/readline 的路径读到
+    // 悬垂指针（_pf==NULL 时 readline/Parse 安全返回 0）。
+    maps.setpf(NULL);
 
     if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_ENVIRON)) {
         error("read environ of %d failed", _pid); return -1;
