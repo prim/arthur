@@ -2371,7 +2371,17 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
                                  "child will run its handler instead of dumping a "
                                  "clean snapshot");
                         }
-                        break;
+                    } else if (strncmp(line, "SigBlk:", 7) == 0) {
+                        // R50-30 (D4): 目标阻塞 SIGTRAP 时，子进程 `int $3` 的 SIGTRAP
+                        // 挂起不投递，子进程继续执行到 exit(0) 干净退出——不触发内核
+                        // core，mode 2 静默产出无用的 meta 文件。与 SigCgt 同风格告警。
+                        unsigned long long sigblk = 0;
+                        if (sscanf(line + 7, "%llx", &sigblk) == 1 &&
+                            (sigblk & (1ULL << (SIGTRAP - 1)))) {
+                            warn("mode 2: target blocks SIGTRAP; the forked child's "
+                                 "int $3 will be held pending and no kernel core will "
+                                 "be generated");
+                        }
                     }
                 }
                 fclose(sf);
@@ -2604,8 +2614,14 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             return -1;
         }
         // B72: 子进程（COW 快照）保留注入的 0；写回原字消除快照污染。
+        // R50-30: mode 0（TRACEFORK auto-attach）下子进程是 tracee，POKE 生效；
+        // mode 2（sys_core）不设 TRACEFORK，子进程非 tracee，POKE 必 ESRCH 失败
+        //（内核 core 的 [rsp-8] 残留 0）——检查返回并如实告警。
         if (inj_rsp) {
-            ptrace(PTRACE_POKEDATA, _core_pid, inj_rsp, (void*)inj_word);
+            if (ptrace(PTRACE_POKEDATA, _core_pid, inj_rsp, (void*)inj_word) != 0) {
+                warn("restore [rsp-8] in fork child %d failed (%s) - child not traced "
+                     "(mode 2?), snapshot keeps injected 0", _core_pid, strerror(errno));
+            }
         }
     }
 
@@ -2940,8 +2956,14 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             return -1;
         }
         // B72: 子进程（COW 快照）保留注入的 0；写回原字消除快照污染。
+        // R50-30: mode 0（TRACEFORK auto-attach）下子进程是 tracee，POKE 生效；
+        // mode 2（sys_core）不设 TRACEFORK，子进程非 tracee，POKE 必 ESRCH 失败
+        //（内核 core 的 [rsp-8] 残留 0）——检查返回并如实告警。
         if (inj_rsp) {
-            ptrace(PTRACE_POKEDATA, _core_pid, inj_rsp, (void*)inj_word);
+            if (ptrace(PTRACE_POKEDATA, _core_pid, inj_rsp, (void*)inj_word) != 0) {
+                warn("restore [rsp-8] in fork child %d failed (%s) - child not traced "
+                     "(mode 2?), snapshot keeps injected 0", _core_pid, strerror(errno));
+            }
         }
     }
 
