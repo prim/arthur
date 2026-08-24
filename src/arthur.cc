@@ -51,10 +51,12 @@ void help()
     "Mode (as a getopt option, not a positional argument),\n"
     " -0 : forkcore and lz4 compressed. (default)\n"
     " -1 : same as gcore but lz4 compressed, less file size.\n"
-    " -2 : same as (1) but corefile by kernel, merge a corefile afterwise.\n"
-    "      NOTE: merge (-m) is not implemented; the kernel core alone is usable,\n"
-    "      but the metadata file cannot be merged into a final GNU corefile.\n"
-    " -3 : attach to process, write gcore with lz4 compressed on SIGSIL, SIGABRT and SIGSEGV\n"
+    " -2 : kernel generates a core from the forked child; -o writes a metadata\n"
+    "      file (NOT a standalone acore) holding registers/threads. The kernel\n"
+    "      core lands in the TARGET's cwd (core_pattern), not here.\n"
+    "      NOTE: merge (-m) is not implemented; the metadata file cannot be\n"
+    "      merged into a final GNU corefile, so thread/reg data is unrecoverable.\n"
+    " -3 : attach to process, write gcore with lz4 compressed on SIGILL, SIGABRT and SIGSEGV\n"
     "      able to write out acorefile when monitoring"
     "\n"
     "Convert acore to corefile,\n"
@@ -62,6 +64,10 @@ void help()
     "\n"
     "Merge support for Mode(2) -- NOT IMPLEMENTED,\n"
     "  arthur -m <acore> <core> -o <corefile>\n"
+    "\n"
+    "Internal test tools (no -p),\n"
+    "  arthur -1 <file>          compress <file> to <file>.z4\n"
+    "  arthur -2 <in.z4> <out>   decompress <in.z4> to <out>\n"
     "\n"
     ;
 
@@ -83,11 +89,13 @@ int main(int argc, char *argv[])
 
     int ch;
     int mode_set = 0;   // R50-6: 记录 mode 选项个数，冲突检测
+    int pid_set = 0;    // R50-29: 是否显式给了 -p（区分"没给"与"给了非法值"）
     while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
         switch (ch) {
 
         case 'p':   // pid
             cfg.pid = atoi(optarg);
+            pid_set = 1;
             break;
 
         case 'm':   // merge
@@ -142,6 +150,18 @@ int main(int argc, char *argv[])
     if (mode_set > 1) {
         error("conflicting mode options (-0/-1/-2/-3 are mutually exclusive)");
         return -1;
+    }
+    // R50-29: -p 与 -c/-m 冲突（capture vs decompress/merge）——原实现分支优先级
+    // 静默决定，-c/-m 被无视，用户输入错误却执行了另一件事。显式拒绝。
+    if (cfg.pid && cfg.op != ARTHUR_OP_GENERATE) {
+        error("-p (capture) conflicts with -c/-m (convert/merge)");
+        return 2;
+    }
+    // R50-29: -p 0 / -p abc（atoi 得 0）被静默当"无 -p"，落到 test_compress/
+    // test_decompress，操作类型被切换。非法 pid 显式拒绝。
+    if (pid_set && cfg.pid <= 0) {
+        error("invalid pid %d (must be > 0)", cfg.pid);
+        return 2;
     }
 
     Coredump dump(cfg.pid);
