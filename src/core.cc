@@ -150,12 +150,16 @@ uint64_t get_module_address(pid_t pid, const char* so_path)
         name[cur-start] = 0;
         //printf("%s\n", name);
 
-        // find
+        // find (R50-9: 只匹配路径 basename 开头——原 strstr 在父目录含
+        // "libc-"/"libc." 前缀时误中，把该目录下文件基址当 libc 返回；
+        // 反之父目录 "libc6" 等会整行误负。要求 so_path 即 basename 开头）
         int find_len = strlen(so_path);
-        char *find = strstr(name, so_path);
+        char *slash = strrchr(name, '/');
+        char *bname = slash ? slash + 1 : name;
+        char *find = (strncmp(bname, so_path, find_len) == 0) ? bname : NULL;
         if (!find || (find[find_len]!='-' && find[find_len]!='.' )) {
             continue;
-        } 
+        }
 
         // read base address
         cur = 0;
@@ -198,6 +202,14 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
 #define ARTHUR_DT_SYMTAB    6
 #define ARTHUR_DT_SYMENT    11
 #define ARTHUR_DT_GNU_HASH  0x6ffffef5
+    // R50-9: 从目标读出的符号计数/哈希表尺寸全部设硬上限——损坏/恶意目标可把
+    // nchain/nbuckets/bloom_size 设成巨大值并让映射可读，arthur 在符号解析里
+    // 无超时逐条 pread 空转（真实 libc 符号 ~5k、bucket ~4k、bloom ~数百，
+    // 1M 上限已远高于任何合法 ELF，同时把攻击从分钟级收敛到亚秒级）。
+#define ARTHUR_MAX_SYM      (1<<20)   // 最大符号数
+#define ARTHUR_MAX_NBUCKETS (1<<20)   // 最大 GNU hash bucket 数
+#define ARTHUR_MAX_BLOOM    (1<<20)   // 最大 bloom 字数（8MB）
+#define ARTHUR_MAX_CHAIN    (1<<20)   // 单链最大步数
     if (base == 0 || func_name == NULL) {
         return 0;
     }
@@ -281,7 +293,8 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
             close(fd);
             return 0;
         }
-        sym_count = nchain;
+        // R50-9: nchain 目标可控（最大 0xFFFFFFFF）——设上限，防逐条 pread 空转。
+        sym_count = (nchain <= ARTHUR_MAX_SYM) ? nchain : ARTHUR_MAX_SYM;
     } else if (gnu_hash != 0) {
         uint32_t hdr[4];
         if (pread(fd, hdr, sizeof(hdr), gnu_hash) != (ssize_t)sizeof(hdr)) {
@@ -289,6 +302,13 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
             return 0;
         }
         uint32_t nbuckets = hdr[0], symoffset = hdr[1], bloom_size = hdr[2];
+        // R50-9: nbuckets/bloom_size 目标可控——过大时 buckets/chains 偏移会
+        // 指向任意可读映射，遍历空转。设上限后直接失败。
+        if (nbuckets > ARTHUR_MAX_NBUCKETS || bloom_size > ARTHUR_MAX_BLOOM ||
+            symoffset > ARTHUR_MAX_SYM) {
+            close(fd);
+            return 0;
+        }
         uint64_t buckets = gnu_hash + 16 + (uint64_t)bloom_size * 8;
         uint64_t chains = buckets + (uint64_t)nbuckets * 4;
         uint32_t max_chain = 0;
@@ -298,7 +318,8 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
                 close(fd);
                 return 0;
             }
-            while (idx >= symoffset) {
+            uint32_t steps = 0;
+            while (idx >= symoffset && steps < ARTHUR_MAX_CHAIN) {
                 uint32_t c = idx - symoffset;
                 if (c > max_chain) max_chain = c;
                 uint32_t chain;
@@ -308,9 +329,13 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
                 }
                 if (chain & 1) break;
                 idx++;
+                steps++;
             }
         }
         sym_count = symoffset + max_chain + 1;
+        if (sym_count > ARTHUR_MAX_SYM) {
+            sym_count = ARTHUR_MAX_SYM;
+        }
     }
     if (sym_count == 0) {
         close(fd);
@@ -357,6 +382,10 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
 #undef ARTHUR_DT_SYMTAB
 #undef ARTHUR_DT_SYMENT
 #undef ARTHUR_DT_GNU_HASH
+#undef ARTHUR_MAX_SYM
+#undef ARTHUR_MAX_NBUCKETS
+#undef ARTHUR_MAX_BLOOM
+#undef ARTHUR_MAX_CHAIN
 }
 
 /* pt_ functions, for ptrace_ calls.
