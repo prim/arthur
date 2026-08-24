@@ -1577,6 +1577,12 @@ int Coredump::ReadMeta(Lz4Stream& in)
     if (!buf) {
         return -1;
     }
+    // R50-12: 与 GetFile/ReadLoads/ReadElfHeader 对齐——PROCESS 块类型校验，
+    // 损坏 acore 把块类型写错时 fail-closed 而非按定长硬读。
+    if (hdr.block_type != BLOCK_TYPE_PROCESS) {
+        error("expected PROCESS block, got type %u (acore corrupt)", hdr.block_type);
+        return -1;
+    }
 
     // process data
     int u = 0;
@@ -1641,6 +1647,12 @@ int Coredump::ReadMeta(Lz4Stream& in)
             // break 后带不完整线程集当成功返回——fail-closed 返回 -1，让
             // decompress 统一清理并报错。
             error("thread block %d missing (truncated acore)", i);
+            return -1;
+        }
+        // R50-12: 与 GetFile 对齐——THREAD 块类型校验，损坏 acore 把块类型
+        // 写错时 fail-closed 而非按定长硬读。
+        if (hdr.block_type != BLOCK_TYPE_THREAD) {
+            error("expected THREAD block %d, got type %u (acore corrupt)", i, hdr.block_type);
             return -1;
         }
 
