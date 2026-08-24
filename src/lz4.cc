@@ -355,8 +355,11 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     }
 
     // decompress
+    // R50-15 (T3): `rc < 0` 只拒负值——构造的块可解出 0 字节（rc==0），空块被当
+    // 成功返回（写侧 Compress 对空块提前返回、从不写 0 字节块，故 rc==0 恒异常）。
+    // ReadLoads 会静默写 0 字节继续（最终靠 loads/expected 校验兜底）；统一拒。
     rc = LZ4_decompress_safe_continue(_dec, buf, block.wBuf(), hdr.size, BLOCK_SIZE);
-    if (rc < 0) {
+    if (rc <= 0) {
         _eof_clean = false;
         error("decode failed rc = %d\n", rc);
         return NULL;

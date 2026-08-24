@@ -2000,8 +2000,11 @@ ssize_t Coredump::ReadLoads(Lz4Stream& in, FILE* fout)
 
     BlockHeader hdr;
     for (;;) {
+        // R50-15 (T2): 块头在 1~2 字节处截断时 Peek 返回正数短读（rc>0），
+        // 旧 `rc <= 0` 不 break，读垃圾 block_type——若垃圾恰为 LOADS 会报错，
+        // 否则静默当 LOADS 段结束（截断被下游捕获）。统一严格 == sizeof。
         rc = in.Peek((char*)&hdr, sizeof(hdr));
-        if (rc <= 0) {
+        if (rc != (int)sizeof(hdr)) {
             break;
         }
 
