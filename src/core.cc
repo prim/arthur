@@ -1836,6 +1836,14 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
  */
 int Coredump::WriteElfHeader(Lz4Stream& out)
 {
+    // R50-13: e_phnum 是 uint16_t，>0xFFFF 个 phdr 时静默截断（对 65536 取模），
+    // gdb 读到的段数错误、大部分 LOAD 段丢失，core 静默损坏无报错。高 vm.max_map_count
+    // 生产环境（≥1M）可读 VMA 数可超 65535。未实现 PN_XNUM 扩展编号，fail-closed。
+    if (_phdrs.size() > 0xFFFF) {
+        error("phdr count %zu exceeds uint16 e_phnum limit (acore too fragmented)",
+              _phdrs.size());
+        return -1;
+    }
     Elf64_Ehdr ehdr;
     ehdr.e_phnum = _phdrs.size();
 
@@ -1874,8 +1882,14 @@ int Coredump::WriteElfHeader(FILE* fout)
 {
     int rc = 0;
     ssize_t len;
+    // R50-13: 同压缩侧——>0xFFFF 个 phdr 时 e_phnum 静默截断，gdb 读段数错误。
+    if (_phdrs.size() > 0xFFFF) {
+        error("phdr count %zu exceeds uint16 e_phnum limit (core too fragmented)",
+              _phdrs.size());
+        return -1;
+    }
     Elf64_Ehdr ehdr;
-   
+
     ehdr.e_machine = _ehdr.e_machine;
     ehdr.e_phnum = _phdrs.size();
 
@@ -3432,6 +3446,17 @@ int Coredump::decompress(const char* in_file, const char* out_core)
                 return fail_core();
             }
             expected = next;
+            // R50-13: 校验单个 LOAD 的 p_offset 边界——构造 acore 可把 p_offset
+            // 设成接近 2^64 的值，`p_offset += _offset_load` 回绕后指向输出 core 的
+            // ehdr/note 区（gdb 把 note 当内存读）。真实写侧 p_offset 恒 < loads 流长。
+            // 用 uint64 溢出检测：p_offset 是 uint64，_offset_load 是 long（恒 ≥0）。
+            if (phdr.p_offset > loads_written ||
+                phdr.p_filesz > loads_written - (size_t)phdr.p_offset) {
+                error("phdr p_offset %lu + filesz %lu exceeds loads %lu (acore corrupt, core removed)",
+                      (unsigned long)phdr.p_offset, (unsigned long)phdr.p_filesz,
+                      (unsigned long)loads_written);
+                return fail_core();
+            }
         }
     }
     if (loads_written != expected) {
