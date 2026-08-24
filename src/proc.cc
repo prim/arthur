@@ -324,7 +324,12 @@ int ProcStat::Parse()
 
     /* kernel mm_struct, rss is anon_rss + file_rss pages
      */
-    rss = strtoul(fld(23), NULL, 10) * PAGE_SIZE / 1024;
+    // R50-25: rss 以内核 MMU 页计——PAGE_SIZE 宏硬编码 4096 在 64K 页 aarch64
+    // 上偏小 16 倍。用真实页大小（采集侧==宿主，ptrace 同架构）。
+    {
+        static long page_size = sysconf(_SC_PAGESIZE);
+        rss = strtoul(fld(23), NULL, 10) * (unsigned long)page_size / 1024;
+    }
 
     // num_threads
     num_threads = strtoul(fld(19), NULL, 10);
