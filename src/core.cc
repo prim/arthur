@@ -33,16 +33,40 @@ static_assert(BUFFER_SIZE >= 1*1024*1024, "buffer size should more than 1MB.");
 
 #define roundup(x,n) (((x)+((n)-1))&(~((n)-1)))
 
-// R50-40: mmap 注入结果的用户态地址上限——x86-64 是 47 位 VA（用户空间 < 2^47，
-// 原硬编码 0x0000800000000000 正确）；aarch64 是 48 位 VA（TASK_SIZE=2^48，
-// 默认 top-down mmap 返回 ~0x0000FFFF_xxxx_xxxx > 2^47，原检查会误拒所有合法
-// 结果、全部 forkcore 模式在 aarch64 失败）。B16 缓释只拒"明显垃圾"（0/未对齐/
-// 过低），上限按编译架构取。x86-64 LA57（5 级页表，56 位 VA）同样受益。
+// R50-40: mmap 注入结果的用户态地址上限。B16 缓释只拒"明显垃圾"（0/未对齐/过低），
+// 上限按用户空间 TASK_SIZE 取。原编译架构常量在 aarch64（48 位 VA，top-down mmap
+// 返回 ~0x0000FFFF_xxxx_xxxx > 2^47）误拒所有合法结果。
+// R50-50: 固定常量仍不够——x86-64 LA57（5 级页表）用户空间 56 位，合法 mmap 结果
+// 高于 2^47，47 位常量全误拒、forkcore/forkcore_m 在 LA57 内核上不可用；aarch64
+// LVA（52 位 VA）同理。top-down mmap 返回地址必低于进程现有最高映射（栈顶/
+// mmap_base），故以 /proc/self/maps 的最高 end 为合法结果上界（采集侧与目标同内核
+// 同架构，即目标 TASK_SIZE），编译架构常量兜底解析失败/低 VA 配置。
+static uint64_t arthur_max_user_va()
+{
+    static uint64_t bound = 0;
+    if (bound != 0) {
+        return bound;
+    }
+    uint64_t hi = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            uint64_t a = 0, b = 0;
+            if (sscanf(line, "%lx-%lx", &a, &b) == 2 && b > hi) {
+                hi = b;
+            }
+        }
+        fclose(f);
+    }
+    // 编译架构常量兜底（47 位 x86-64 / 48 位 aarch64）
+    uint64_t arch_lo = 0x00007FFFFFFFFFFFUL;
 #ifdef __aarch64__
-static const uint64_t ARTHUR_MAX_USER_VA = 0x0000FFFFFFFFFFFFUL;   // 48-bit VA 用户空间上限
-#else
-static const uint64_t ARTHUR_MAX_USER_VA = 0x00007FFFFFFFFFFFUL;   // 47-bit VA 用户空间上限 (x86-64)
+    arch_lo = 0x0000FFFFFFFFFFFFUL;
 #endif
+    bound = (hi > arch_lo) ? hi : arch_lo;
+    return bound;
+}
 
 // R50-20 (#2): 输入输出同路径时 fopen("wb") 先截断输入 → 静默数据丢失。
 // strcmp 覆盖同字符串；stat 比较覆盖 "./x" vs "x"、符号链接等殊途同归。
@@ -644,12 +668,29 @@ static inline int pt_setregs(pid_t pid, user_regs64_struct *pregs)
 /* the pt_call put a call frame with return address of ZERO on top of the current thread,
  * and wait the SIGSEGV ocur.
  */
+// R50-50: 捕获的寄存器 rax 若是 syscall-restart 返回值（-ERESTARTSYS=-512、
+// -ERESTARTNOINTR=-513、-ERESTARTNOHAND=-514、-ERESTART_RESTARTBLOCK=-516，
+// 内核 exit_to_user_mode_loop 检测 -512..-516），CONT(0) 会让内核做 regs->ip -= 2
+// 重启——注入的 waitpid 不执行，目标从 waitpid-2 跑垃圾代码（B16 的 mmap 路径靠
+// 返回值 fail-closed，waitpid 收尾注入只有 B73 告警，且垃圾执行本身有栈践踏风险）。
+// 此时跳过 best-effort 注入（fork 子进程可能残留 zombie，如实告警）。范围保守含
+// -515（非真实 errno，跳过无害）。
+static inline bool regs_has_restart_return(user_regs64_struct &regs)
+{
+    long long rax = (long long)regs.get_rc();
+    return rax <= -512 && rax >= -516;
+}
 // B72: out_inject_rsp/out_orig_word 输出注入时写 0 的 [rsp-8] 槽位与原字——
 // fork 注入后子进程（COW 快照）保留注入的 0，父进程恢复了但 dump 读的子进程没有，
 // 调用方可用这两个值把原字写回子进程，消除快照污染。
+// R50-50: out_fork_child 输出 TRACEFORK auto-attach 的 fork 子进程 pid——fork 注入
+// 中 fork 已成功（子进程冻结在 EVENT_FORK stop）但 pt_call 之后失败时，调用方据此
+// SIGKILL 回收，否则子进程残留为 arthur 的 tracee（arthur 退出才释放并执行注入
+// 壳代码尾部，int $3 崩溃/exit）。
 static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, int argc,
                           uint64_t argv[], uint64_t *out_inject_rsp = NULL,
-                          uint64_t *out_orig_word = NULL)
+                          uint64_t *out_orig_word = NULL,
+                          uint64_t *out_fork_child = NULL)
 {
     int rc, status = 0;
     user_regs64_struct regs;
@@ -857,6 +898,9 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
                 rc = ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
                 if (rc != 0) { return fail("geteventmsg"); }
                 dprint("child pid = %lu", msg);
+                // R50-50: 记录 auto-attach 的 fork 子进程——pt_call 后续若失败
+                //（目标中途死亡/超时/崩溃），调用方据此 SIGKILL 回收冻结子进程。
+                if (out_fork_child) { *out_fork_child = (uint64_t)msg; }
             }
         }
         rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
@@ -2666,7 +2710,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
         // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
         if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000 ||
-            inject_page > ARTHUR_MAX_USER_VA) {
+            inject_page > arthur_max_user_va()) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
             // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
@@ -2718,8 +2762,17 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
         // B72: 记录注入写 0 的 [rsp-8] 槽位与原字，fork 后写回子进程快照。
         uint64_t inj_rsp = 0, inj_word = 0;
-        if (pt_call(_pid, &regs, inject_page, 0, NULL, &inj_rsp, &inj_word) != 0) {
+        uint64_t fork_child = 0;
+        if (pt_call(_pid, &regs, inject_page, 0, NULL, &inj_rsp, &inj_word, &fork_child) != 0) {
             error("fork injection failed (target died?)");
+            // R50-50: fork 已成功（TRACEFORK auto-attach 子进程冻结在 EVENT_FORK
+            // stop）但 pt_call 后续失败（目标中途死亡/超时）——子进程残留为 arthur
+            // 的 tracee（TracerPid=arthur, state=t），arthur 退出时释放并继续执行
+            // 注入壳代码尾部（int $3 → SIGTRAP 崩溃 / exit(0)）。明确 SIGKILL 回收。
+            if (fork_child > 0) {
+                ptrace(PTRACE_DETACH, (pid_t)fork_child, NULL, SIGKILL);
+                info("killed auto-attached fork child %lu from failed injection", fork_child);
+            }
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             out.Close();
@@ -2824,7 +2877,16 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
              "fork child", _pid);
     } else {
         pt_getregs(_pid, &saved_regs);
-        {
+        // R50-50: leader 停靠时若处于可重启 syscall 的 -ERESTART* 返回点，CONT(0)
+        // 会触发 syscall-restart（内核 ip-=2），注入的 waitpid 不执行、目标从
+        // waitpid-2 跑垃圾代码（与 B16 的 mmap 注入同机制，但 waitpid 收尾路径
+        // 只有 B73 的返回值告警、无 fail-closed）。跳过注入，fork 子进程可能
+        // 残留 zombie（目标自身 waitpid 或退出时回收）。
+        if (regs_has_restart_return(saved_regs)) {
+            warn("leader %d captured in restartable syscall (rax=%lld); skipping "
+                 "waitpid injection (fork child may linger as a zombie)",
+                 _pid, (long long)saved_regs.get_rc());
+        } else {
             uint64_t gv[3] = { (uint64_t)_core_pid, (uint64_t)NULL, 0 };
             // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc()
             // 读垃圾进日志/告警。检查并告警（acore 已有效，best-effort 收尸）。
@@ -3039,7 +3101,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
         // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
         if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000 ||
-            inject_page > ARTHUR_MAX_USER_VA) {
+            inject_page > arthur_max_user_va()) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
             // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
@@ -3091,8 +3153,17 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // B57: 注入 fork 失败（目标中途死亡）时 regs 未填充，_core_pid 会读垃圾。
         // B72: 记录注入写 0 的 [rsp-8] 槽位与原字，fork 后写回子进程快照。
         uint64_t inj_rsp = 0, inj_word = 0;
-        if (pt_call(_pid, &regs, inject_page, 0, NULL, &inj_rsp, &inj_word) != 0) {
+        uint64_t fork_child = 0;
+        if (pt_call(_pid, &regs, inject_page, 0, NULL, &inj_rsp, &inj_word, &fork_child) != 0) {
             error("fork injection failed (target died?)");
+            // R50-50: fork 已成功（TRACEFORK auto-attach 子进程冻结在 EVENT_FORK
+            // stop）但 pt_call 后续失败（目标中途死亡/超时）——子进程残留为 arthur
+            // 的 tracee（TracerPid=arthur, state=t），arthur 退出时释放并继续执行
+            // 注入壳代码尾部（int $3 → SIGTRAP 崩溃 / exit(0)）。明确 SIGKILL 回收。
+            if (fork_child > 0) {
+                ptrace(PTRACE_DETACH, (pid_t)fork_child, NULL, SIGKILL);
+                info("killed auto-attached fork child %lu from failed injection", fork_child);
+            }
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             out.Close();
@@ -3249,6 +3320,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     }
     // tracee will stop if signaled on exit
     bool stopped_at_ptrace_event = false;
+    // R50-50: SEIZE 下组停靠（SIGSTOP/TSTP/TTIN/TTOU）报为 PTRACE_EVENT_STOP（事件
+    // 128），WSTOPSIG=SIGTRAP——与 FORK/CLONE 同属 ptrace 事件。B66 把"所有事件→
+    // CONT 清除"泛化，对组停靠错误：CONT 会静默解除作业控制停靠（Ctrl+Z 后目标
+    // 继续跑），且 monitor 的 leader_in_group_stop 不会置位。组停靠须 PTRACE_LISTEN
+    // 保持停靠，等目标自身的 SIGCONT 恢复。
+    bool group_stop_event = false;
     if(WIFSTOPPED(s)) {
         sig = WSTOPSIG(s);
         // B66: dump 窗口（pt_cont 后 TRACEFORK 仍设）内 leader 自己 fork 会触发
@@ -3264,13 +3341,16 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
              ((s >> 16) & 0xff) != 0);
         if (stopped_at_ptrace_event) {
             sig = 0;
+            // R50-50: 识别 PTRACE_EVENT_STOP（组停靠）——见 stopped_at_ptrace_event
+            // 声明处注释，与 FORK/CLONE 的事件处理分开。
+            int ev = (int)((s >> 16) & 0xff);
+            group_stop_event = (ev == PTRACE_EVENT_STOP);
             // B67: TRACEFORK auto-attach 的 fork 子进程残留在 arthur 上（TracerPid=arthur、
             // state=t），monitor 继续运行时不 CONT 它 → 永久冻结。GETEVENTMSG 拿子进程
             // pid 并 DETACH(SIGCONT) 解冻，让它正常继续运行。
             // R50-1: 只有 FORK/CLONE/VFORK（事件 1/2/3）才有 auto-attach 的子进程要
             // detach。EVENT_EXIT 的 GETEVENTMSG 是退出码（实测 exit(42)→0x2a00），
             // 把它当 pid 去 DETACH 会对无关进程发伪 ptrace 调用。
-            int ev = (int)((s >> 16) & 0xff);
             if (ev == PTRACE_EVENT_FORK || ev == PTRACE_EVENT_VFORK || ev == PTRACE_EVENT_CLONE) {
                 unsigned long child_pid = 0;
                 if (ptrace(PTRACE_GETEVENTMSG, _pid, 0, &child_pid) == 0 && child_pid > 0) {
@@ -3298,13 +3378,28 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     bool crashed_in_window =
         WIFSTOPPED(s) && !stopped_at_ptrace_event &&
         (sig == SIGILL || sig == SIGABRT || sig == SIGSEGV);
-    if (crashed_in_window) {
+    if (group_stop_event) {
+        // R50-50: 组停靠 leader——waitpid 注入的 pt_call CONT(0) 会解除作业控制
+        // 停靠。跳过注入，末尾用 LISTEN 保持停靠；fork 子进程已 SIGKILL（可能
+        // 残留 zombie，等目标 SIGCONT 后自身 waitpid 回收，同 B73 告警情形）。
+        info("leader %d in job-control group-stop during dump; skipping waitpid "
+             "injection to preserve the stop", _pid);
+    } else if (crashed_in_window) {
         info("leader %d crashed in %s delivery-stop during dump; "
              "skipping waitpid injection to preserve crash stop",
              _pid, strsignal(sig));
     } else {
         pt_getregs(_pid, &saved_regs);
-        {
+        // R50-50: leader 停靠时若处于可重启 syscall 的 -ERESTART* 返回点，CONT(0)
+        // 会触发 syscall-restart（内核 ip-=2），注入的 waitpid 不执行、目标从
+        // waitpid-2 跑垃圾代码（与 B16 的 mmap 注入同机制，但 waitpid 收尾路径
+        // 只有 B73 的返回值告警、无 fail-closed）。跳过注入，fork 子进程可能
+        // 残留 zombie（目标自身 waitpid 或退出时回收）。
+        if (regs_has_restart_return(saved_regs)) {
+            warn("leader %d captured in restartable syscall (rax=%lld); skipping "
+                 "waitpid injection (fork child may linger as a zombie)",
+                 _pid, (long long)saved_regs.get_rc());
+        } else {
             uint64_t gv[3] = {(uint64_t)_core_pid, (uint64_t)NULL, 0};
             // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc() 读垃圾。
             if (pt_call(_pid, &regs, r_waitpid, 3, gv) != 0) {
@@ -3334,7 +3429,15 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     }
     // B66: 事件停靠（PTRACE_EVENT_FORK）也必须 CONT 清除，否则 leader 冻结。
     // 普通 signal-delivery stop 由 monitor 的 signal_forkcore 中继恢复。
-    if(!WIFSTOPPED(s) || stopped_at_ptrace_event) {
+    if (group_stop_event) {
+        // R50-50: 组停靠用 PTRACE_LISTEN 消费事件停靠并保持停靠（等目标自身的
+        // SIGCONT 恢复），不是 CONT（CONT 会解除作业控制停靠、目标继续跑）。
+        // 组停靠的 SIGCHLD 仍在队列，monitor 主循环会经 LISTEN 中继并置
+        // leader_in_group_stop，后续 SIGUSR1 dump 被 H2 预检跳过。
+        if (ptrace(PTRACE_LISTEN, _pid, NULL, NULL) != 0) {
+            error("group-stop leader %d: PTRACE_LISTEN failed (%s)", _pid, strerror(errno));
+        }
+    } else if(!WIFSTOPPED(s) || stopped_at_ptrace_event) {
         pt_cont(_pid);
     }
 
@@ -3350,12 +3453,18 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // monitor 主循环再也等不到该崩溃通知 → leader 冻结 + monitor 永久挂起。
     // 改 sigtimedwait 零超时：只 drain 已 pending 的噪音 SIGCHLD，不阻塞等待，
     // 之后的真实崩溃 SIGCHLD 留给主循环。
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    struct timespec zero_ts = {0, 0};
-    while (sigtimedwait(&mask, NULL, &zero_ts) > 0) {
-        // drain all already-pending noise SIGCHLD; 无则立即返回
+    if (!group_stop_event) {
+        // R50-50: 组停靠时保留该 SIGCHLD（leader 组停靠的 CLD_STOPPED 通知），供
+        // monitor 主循环的 stop-class LISTEN 中继路径置 leader_in_group_stop；否则
+        // 后续对已停 leader 的 SIGUSR1 dump 不被 H2 预检跳过，forkcore_m 的 pt_int
+        // 在已停 tracee 上不产生新停靠、卡 10s 超时。非组停靠仍照旧 drain 噪音。
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGCHLD);
+        struct timespec zero_ts = {0, 0};
+        while (sigtimedwait(&mask, NULL, &zero_ts) > 0) {
+            // drain all already-pending noise SIGCHLD; 无则立即返回
+        }
     }
 
     return sig;
