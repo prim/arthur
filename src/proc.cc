@@ -185,6 +185,16 @@ int ProcMaps::Parse()
         }
         r.name = name;
 
+        // B163: region 数无上限——构造 acore 的 maps 文件（GetFile 上限 64MB）可用
+        // 2 字节短行（"x\n"）塞入海量 region，每 region 48 字节 + SSO string ≈ 42x
+        // 内存放大（实测 2M 行 → 165MB），64MB 上限 → ~2.7GB → OOM abort；且
+        // size() 同步放大 decompress 的 hdr_size/makeroom 磁盘写。与 argv MAX_ARGV
+        // 线程数上限同 class，maps 此前无对应上限。2^20 远超任何真实进程（默认
+        // max_map_count 65530、B128 已限 phdr ≤0xFFFF），超限 fail-closed。
+        if (size() >= (1 << 20)) {
+            error("maps regions exceed 2^20, acore corrupt");
+            return -1;
+        }
         emplace_back(r);
     }
 

@@ -1008,7 +1008,11 @@ int ProcessData::ParseAll()
 {
     _d_maps = new ProcMaps(_maps);
     assert(_d_maps);
-    _d_maps->Parse();
+    // B163: maps Parse 超 region 上限（构造 acore）时返回 -1——fail-closed 传播，
+    // 不让海量 region 放大内存/hdr_size 后继续。
+    if (_d_maps->Parse() < 0) {
+        return -1;
+    }
 
     _d_cmdline = new ProcCmdline(_cmdline);
     assert(_d_cmdline);
@@ -3645,8 +3649,12 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         return -1;
     };
 
-    // parse  
-    _process.ParseAll();
+    // parse
+    // B163: ParseAll 失败（maps 超 region 上限等损坏 acore）时 fail-closed。
+    if (_process.ParseAll() != 0) {
+        error("parse /proc data failed (acore corrupt), core removed");
+        return fail_core();
+    }
 
     // make room for elf headers
     int phnum = _process._d_maps->size() + 1;
