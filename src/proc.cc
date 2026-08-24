@@ -26,8 +26,8 @@ const char* szProcType(ProcType type)
     return NULL;
 }
 
-ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path)
-{   
+ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path, bool *out_truncated)
+{
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         error("open %s failed", path);
@@ -46,6 +46,7 @@ ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path)
         // 原实现读满后仍继续写，left 变负仍 read，堆/栈缓冲区溢出。
         if (left <= 0) {
             warn("buffer too small for %s, truncating at %d bytes", path, len);
+            if (out_truncated) { *out_truncated = true; }
             break;
         }
 
@@ -60,6 +61,7 @@ ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path)
 
     if (left == 0) {
         warn("buffer may be too small for %s", path);
+        if (out_truncated) { *out_truncated = true; }
     }
 
     close(fd);
@@ -70,16 +72,16 @@ ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path)
     return pf;
 }
 
-ProcFile* ProcFile::Read(char* buf, int buf_len, const char *fmt, ...)
+ProcFile* ProcFile::Read(bool *out_truncated, char* buf, int buf_len, const char *fmt, ...)
 {
     char path[PATH_MAX];
-   
+
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(path, sizeof(path), fmt, ap);
     va_end(ap);
-   
-    return ReadPath(buf, buf_len, path);
+
+    return ReadPath(buf, buf_len, path, out_truncated);
 }
 
 int ProcDecoder::readline(int& cur, char *out, size_t n)

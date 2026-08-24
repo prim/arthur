@@ -49,9 +49,10 @@ struct ProcFile {
     char f_data[0];     // begin the file contents
 
 public:
-    static ProcFile* ReadPid(char* buf, int buf_len, pid_t pid, ProcType type) {
-        ProcFile *f = Read(buf, buf_len, "/proc/%u/%s", pid, szProcType(type));
-        if (!f) { 
+    static ProcFile* ReadPid(char* buf, int buf_len, pid_t pid, ProcType type,
+                             bool *out_truncated = NULL) {
+        ProcFile *f = Read(out_truncated, buf, buf_len, "/proc/%u/%s", pid, szProcType(type));
+        if (!f) {
             return f;
         }
         f->f_pid = pid;
@@ -65,8 +66,8 @@ public:
     }
 
 private:
-    static ProcFile* ReadPath(char* buf, int buf_len, const char *path);
-    static ProcFile* Read(char* buf, int buf_len, const char *fmt, ...);
+    static ProcFile* ReadPath(char* buf, int buf_len, const char *path, bool *out_truncated = NULL);
+    static ProcFile* Read(bool *out_truncated, char* buf, int buf_len, const char *fmt, ...);
 };
 #pragma pack(pop)
 

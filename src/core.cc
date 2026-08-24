@@ -1392,9 +1392,16 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
         return -1;
     }
 
-    ProcFile* _maps = ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_MAPS);
+    bool maps_truncated = false;
+    ProcFile* _maps = ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_MAPS, &maps_truncated);
     if (!_maps) {
         error("read maps of %d failed", _pid);
+        return -1;
+    }
+    // R50-31: maps 超 1MB 缓冲截断时，WriteLoads/NT_FILE 只覆盖截断前的映射——
+    // dump 自洽但尾部映射静默缺失（数据丢失）。fail-closed 而非产出不完整 core。
+    if (maps_truncated) {
+        error("maps of %d exceeds buffer (%ld bytes), refusing incomplete dump", _pid, (long)BUFFER_SIZE);
         return -1;
     }
     if (out.PutFile(_maps) < 0) {
