@@ -2131,6 +2131,32 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             }
             fclose(pf);
         }
+        // R50-8: `int $3` 触发内核 core 依赖 SIGTRAP 的默认处置。目标若安装了
+        // SIGTRAP handler（SigCgt 位 4 置位），fork 子进程继承该 handler，int $3
+        // 改走 handler（实证：写 "TRAP!" 后继续执行 diverge 到零填充页 SIGSEGV），
+        // 产出垃圾信号/错误的 core 而非目标快照，且 arthur 无法察觉（注入的
+        // waitpid 用 NULL status）。B74 同类预检：明确警告。
+        {
+            char statpath[64];
+            snprintf(statpath, sizeof(statpath), "/proc/%u/status", _pid);
+            FILE* sf = fopen(statpath, "r");
+            if (sf) {
+                char line[256];
+                while (fgets(line, sizeof(line), sf)) {
+                    if (strncmp(line, "SigCgt:", 7) == 0) {
+                        unsigned long long sigcgt = 0;
+                        if (sscanf(line + 7, "%llx", &sigcgt) == 1 &&
+                            (sigcgt & (1ULL << (SIGTRAP - 1)))) {
+                            warn("mode 2: target catches SIGTRAP; the forked core "
+                                 "child will run its handler instead of dumping a "
+                                 "clean snapshot");
+                        }
+                        break;
+                    }
+                }
+                fclose(sf);
+            }
+        }
     }
 
     /* forkcore using a forked process for large memory dump,
