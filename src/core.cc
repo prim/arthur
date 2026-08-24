@@ -1510,6 +1510,24 @@ static uint64_t parse_status_mask(const char *data, const char *key)
     return strtoull(p, NULL, 16);
 }
 
+// B168: 目标是否捕获了 sig（/proc/<pid>/status 的 SigCgt 掩码，位 sig-1）。
+// monitor 崩溃判定用：捕获的 SIGSEGV/SIGILL/SIGABRT 应中继（CONT 让 handler 跑）
+// 而非当致命崩溃采集——否则写出假 core、kill_crashed 重投走 handler 进程不死，
+// monitor 还静默放弃监控。/proc 读失败时保守按未捕获（致命）处理。
+static bool signal_is_caught(pid_t pid, int sig)
+{
+    if (sig < 1 || sig > 64) {
+        return false;
+    }
+    char buf[BUFFER_SIZE];
+    ProcFile *spf = ProcFile::ReadPid(buf, BUFFER_SIZE, pid, PROC_TYPE_STATUS);
+    if (!spf) {
+        return false;
+    }
+    uint64_t mask = parse_status_mask(spf->f_data, "SigCgt:");
+    return (mask & (1ULL << (sig - 1))) != 0;
+}
+
 int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     info("thread: %d", pid); // thread info
     int rc;
@@ -1958,8 +1976,19 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
     printf("compressed %lu into %lu Bytes, ratio %0.2f%\n", mem_size, file_size, ((double)file_size / mem_size * 100));
 #endif
 
+    // B169: pread 全部失败（进程在 dump 窗口被外部 SIGKILL/看门狗杀掉、mm 已拆除）
+    // 时 mem_size==0——原实现无条件 return 0，产出"寄存器抓到、内存全缺"的假成功
+    // core（gdb 能加载但 Cannot access memory）。单 region 的 EIO（栈 guard 页）仍
+    // 只告警成洞（合法快照常见），只有整块内存都没读到才 fail-closed。真实进程恒有
+    // 可读映射（栈/堆），mem_size==0 只来自进程消失。
+    if (mem_size == 0) {
+        error("no memory readable for %d (process vanished during dump?)", pid);
+        close(fd);
+        return -1;
+    }
+
     close(fd);
-    return 0; 
+    return 0;
 }
 
 /* write elf header to stream
@@ -3441,6 +3470,20 @@ int Coredump::monitor(const char* corefile)
                 }
                 return 0;
             } else if (status == SIGILL || status == SIGABRT || status == SIGSEGV) {
+                // B168: 崩溃类信号的 delivery-stop 不必然是致命崩溃——目标可能装了
+                // handler（Node.js/V8/JVM 装 SIGSEGV/SIGABRT handler 做 safepoint/
+                // 崩溃上报）。原实现只看裸信号号就 break 进崩溃采集 + kill_crashed
+                // 重投：handler 目标收到重投信号走 handler 不死，却写出假崩溃 core、
+                // 返回 0、静默放弃监控（实证：core 显示致命 SIGSEGV 但进程活着继续跑）。
+                // 查 SigCgt：捕获则中继（CONT 让 handler 跑）继续监控；未捕获才是
+                // 致命崩溃。同步 fault 的 handler 若 return 会指令重放——那是目标
+                // 自身行为，arthur 只正确中继。
+                if (signal_is_caught(_pid, status)) {
+                    info("signal %s caught by target handler; relaying (not crash collection)",
+                         strsignal(status));
+                    ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) status);
+                    continue;
+                }
                 // write out corefile under SIGILL, SIGABRT, SIGSEGV
                 exit_sig = status;
                 break;
