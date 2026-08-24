@@ -461,6 +461,17 @@ ProcFile* Lz4Stream::GetFile()
             return NULL;
         }
 
+        // B162: FILE 块解压字节多于文件剩余需求——声明 size 小于实际数据
+        //（损坏/恶意 acore）。合法写侧 WriteBlock 把文件切成恰 size 字节，块
+        // 内未压缩字节和恒等于 size，多余字节只会来自 bit-flip/伪造。原实现
+        // 只读前缀、多余字节静默丢弃（fail-open 不对称：只验"过少"不验"过多"）。
+        size_t need = size - i;
+        if ((size_t)block->Size() > need) {
+            error("FILE block %lu bytes over-provides file size %u (acore corrupt)",
+                  (unsigned long)block->Size(), size);
+            free(pf);
+            return NULL;
+        }
         rc = block->Read(p+i, MIN(size-i, BLOCK_SIZE));
         if (rc <= 0) {
             break;   // 读不动了，防死循环

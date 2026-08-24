@@ -2053,6 +2053,14 @@ int Coredump::ReadElfHeader(Lz4Stream& in, size_t max_phdrs)
         error("elf block missing (truncated acore)");
         return -1;
     }
+    // B160: 首个 ELF 块的 block_type 必须校验（续块已校验，B127 的"ReadElfHeader
+    // 都校验块类型"对首块不成立）——构造 acore 把 LOADS 后的块类型写成 THREAD 等
+    // 非 ELF，解压字节仍可凑成合法 Elf64_Ehdr+PT_LOAD 过 e_machine/PT_LOAD/p_offset
+    // 校验，decompress 产出攻击者控制的 ELF 元数据 core 且返回 0（实证）。fail-closed。
+    if (hdr.block_type != BLOCK_TYPE_ELF) {
+        error("first ELF block type %u (not ELF), acore corrupt", hdr.block_type);
+        return -1;
+    }
 
     rc = block->Read((char*)&_ehdr, sizeof(_ehdr));
     if (rc != sizeof(_ehdr)) {
@@ -3751,6 +3759,19 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     if (rc < 0) {
         error("write elf header to core failed, core removed");
         return fail_core();
+    }
+
+    // B161: decompress 校验尾标——ReadElfHeader 在 ELF 块后 break 未消费尾标，
+    // 生产路径从不验证 acore 以 TailMark 收尾（test_decompress 已要求 TailSeen，
+    // B135）。缺尾标（截断在尾标边界/损坏）的 acore 被静默当完整接受（实证：去掉
+    // 末尾 3 字节仍返回 0）。此处显式读尾标，缺失/类型错即 fail-closed。
+    {
+        BlockHeader tail_hdr;
+        Block* tail_block = in.ReadBlock(tail_hdr);
+        if (tail_block != NULL || !in.TailSeen()) {
+            error("acore missing tail mark (truncated), core removed");
+            return fail_core();
+        }
     }
 
     in.Close();
