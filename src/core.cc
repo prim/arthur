@@ -3988,6 +3988,15 @@ int Coredump::test_decompress(const char* in_file, const char* out_file)
     fclose(fout);
     in.Close();
 
+    // B167: 失败时遗留部分输出（损坏输入/磁盘满短写）——脚本按"文件存在+size>0"
+    // 误判为有效产物。test_compress 已在 R50-20 (#3) 对齐 fail_core 清理，这里
+    // 是同一 class 的遗漏。失败即删（fopen(fout) 失败路径无文件，无需删）。
+    if (rc != 0) {
+        if (unlink(out_file) != 0) {
+            error("failed to remove partial %s (%s)", out_file, strerror(errno));
+        }
+    }
+
     info("write %lu bytes.", file_size);
     return rc;
 }
