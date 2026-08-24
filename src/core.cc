@@ -627,6 +627,13 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     int stack_saved = 0;
     uint64_t orig_stack_word = 0;
     uint64_t inject_rsp = 0;
+    // R50-17: waitpid 注入多线程目标走 glibc wait4 慢路径（__libc_single_threaded==0），
+    // 在目标原红区 [R-0x48, R-8) 分配 0x28 栈帧并存参——pt_call 原只保存 [rsp-8] 一个
+    // 字，注入后目标红区其余 40~56 字节保留 wait4 垃圾，叶函数红区局部变量被破坏。
+    // 保存/恢复整个 128 字节红区 [R-128, R)。
+    uint64_t red_base = 0;
+    uint64_t red_zone[16];
+    int red_saved = 0;
 
     auto fail = [&](const char* msg) -> int {
         error("pt_call: %s %d failed (%s)", msg, pid, strerror(errno));
@@ -635,6 +642,13 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
         if (stack_saved) {
             errno = 0;
             ptrace(PTRACE_POKEDATA, pid, inject_rsp, (void*)orig_stack_word);
+        }
+        // R50-17: wait4 慢路径践踏目标红区（见 save 处注释）——恢复整个 128 字节红区。
+        if (red_saved) {
+            for (int i = 0; i < 16; i++) {
+                errno = 0;
+                ptrace(PTRACE_POKEDATA, pid, red_base + i * 8, (void*)red_zone[i]);
+            }
         }
         if (xstate_saved && pt_setxstateregs(pid, &xstate, xstate_len) != 0) {
             error("pt_call: restore xstate %d failed (%s)", pid, strerror(errno));
@@ -693,6 +707,18 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     }
     stack_saved = 1;
     orig_stack_word = (uint64_t)peeked;
+    // R50-17: 保存整个 128 字节红区 [rsp-128, rsp)——wait4 多线程慢路径会写
+    // [R-0x48, R-8)，单字保存覆盖不到。PEEKDATA 失败（栈槽不可读）时 fail-closed。
+    red_base = regs.rsp - 128;
+    for (int i = 0; i < 16; i++) {
+        errno = 0;
+        long w = ptrace(PTRACE_PEEKDATA, pid, red_base + i * 8, NULL);
+        if (errno != 0) {
+            return fail("peek red zone");
+        }
+        red_zone[i] = (uint64_t)w;
+    }
+    red_saved = 1;
     regs.rsp -= 8;
     rc = ptrace(PTRACE_POKEDATA, pid, regs.rsp, 0);
     if (rc != 0) { return fail("poke [rsp-8]"); }
@@ -791,6 +817,13 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     if (stack_saved) {
         errno = 0;
         ptrace(PTRACE_POKEDATA, pid, inject_rsp, (void*)orig_stack_word);
+    }
+    // R50-17: 恢复整个 128 字节红区（wait4 慢路径践踏的部分）
+    if (red_saved) {
+        for (int i = 0; i < 16; i++) {
+            errno = 0;
+            ptrace(PTRACE_POKEDATA, pid, red_base + i * 8, (void*)red_zone[i]);
+        }
     }
     if (xstate_saved && pt_setxstateregs(pid, &xstate, xstate_len) != 0) {
         error("pt_call: restore xstate %d failed (%s)", pid, strerror(errno));
