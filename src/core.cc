@@ -458,6 +458,24 @@ static inline int pt_detach(pid_t pid)
     return rc;
 }
 
+/* B152: 注入超时时 tracee 仍在运行（pt_wait WNOHANG 轮询 10s 无停靠）——
+ * fail() 的 POKEDATA/SETREGSET 与调用方 pt_setregs/restore_target_after_fail
+ * 的 SETOPTIONS/CONT 对运行中 tracee 全 ESRCH（实证），恢复全失效，目标会继续
+ * 执行注入代码 → ret-to-0 假 SIGSEGV 崩溃。先停住它再让恢复路径生效。
+ * SEIZE-attach（forkcore_m）用 PTRACE_INTERRUPT；ATTACH-attach（forkcore，
+ * INTERRUPT 返回 EIO）回退 kill(SIGSTOP)。D 态 tracee 两种都停不住（SIGSTOP
+ * 挂起到唤醒），此时注入代码未执行、恢复无意义，返回 -1 维持原状。
+ */
+static inline int pt_stop_if_running(pid_t pid)
+{
+    if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) != 0) {
+        if (kill(pid, SIGSTOP) != 0) {
+            return -1;
+        }
+    }
+    return pt_wait(pid);
+}
+
 // read all general purpose registers
 static inline int pt_getregs(pid_t pid, user_regs64_struct *pregs)
 {
@@ -789,6 +807,10 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     const long INJECT_TIMEOUT_MS = 10000;
     for (;;) {
         if (monotonic_ms() - t0 > INJECT_TIMEOUT_MS) {
+            // B152: 超时时 tracee 仍在运行，fail() 与调用方的 POKEDATA/SETREGSET/
+            // setregs 恢复全 ESRCH 失效（R50-1/R50-21 的注释假设 tracee 已停）。
+            // 先停住它，恢复才生效；D 态停不住则维持原状（注入代码未执行）。
+            pt_stop_if_running(pid);
             return fail("inject timeout");
         }
         if (WIFSTOPPED(status)) {
@@ -3059,7 +3081,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // in case any signal generated above
     // 目标可能仍被 SIGUSR1 的 forkcore_m 停住；s 未初始化会被 WIFSIGNALED/WIFSTOPPED 误读
     int s = 0, sig = 0;
-    waitpid(_pid, &s, WNOHANG);
+    // B153: 必须带 WUNTRACED——不加时 waitpid 不报告组停靠（SIGSTOP/SIGTSTP/
+    // SIGTTIN/SIGTTOU，实证），leader 在 dump 窗口内被作业控制停止会走 else
+    // 分支对已停 tracee 做 pt_int：INTERRUPT 不产生新停靠 → pt_wait 卡 10s
+    // 超时 → 注入把组停靠的 leader 恢复运行（本应保持停靠）。加 WUNTRACED 让
+    // 组停靠进 WIFSTOPPED 分支，sig=SIGSTOP 由 monitor 的 LISTEN/CONT 中继恢复。
+    waitpid(_pid, &s, WUNTRACED | WNOHANG);
     // R50-11: 目标在 dump 窗口内死于信号（崩溃/被 kill）。原 `exit(0)` 三错：
     // ① 目标崩溃却以 0（成功）退出，绕过 B38 的"崩溃无 core→非零"语义；
     // ② exit() 不跑栈对象析构，monitor 的 -o 空 acore（只写了 8 字节头）永不
