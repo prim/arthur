@@ -271,6 +271,9 @@ public:
     // R50-1: 最近一次 ReadBlock 返回 NULL 是否因"干净结束"（块边界 EOF / 尾标）。
     // 短读命中 EOF 也会置 feof，不能用 IsEof() 判断；由 ReadBlock 内部标记。
     bool LastReadClean() { return _eof_clean; }
+    // R50-20: 是否确实读到过尾标——test_decompress 用此区分"读到尾标的干净结束"
+    // 与"块边界 EOF 但尾标缺失"（整块截断误判为成功）。合法 -1 输出恒以尾标收尾。
+    bool TailSeen() { return _tail_seen; }
 
     // file position
     long Tell();
@@ -318,6 +321,8 @@ private:
 
     // R50-1: 最近一次 ReadBlock 是否为干净结束（块边界 EOF/尾标）
     bool _eof_clean;
+    // R50-20: 是否读到过尾标（test_decompress 区分干净结束与整块截断）
+    bool _tail_seen;
 };
 
 };

@@ -33,6 +33,20 @@ static_assert(BUFFER_SIZE >= 1*1024*1024, "buffer size should more than 1MB.");
 
 #define roundup(x,n) (((x)+((n)-1))&(~((n)-1)))
 
+// R50-20 (#2): 输入输出同路径时 fopen("wb") 先截断输入 → 静默数据丢失。
+// strcmp 覆盖同字符串；stat 比较覆盖 "./x" vs "x"、符号链接等殊途同归。
+static bool same_file(const char* a, const char* b)
+{
+    if (strcmp(a, b) == 0) {
+        return true;
+    }
+    struct stat sa, sb;
+    if (stat(a, &sa) == 0 && stat(b, &sb) == 0) {
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+    }
+    return false;
+}
+
 extern "C" {
 
 // the function is only for compile asm code.
@@ -3386,7 +3400,13 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     char fpath[PATH_MAX];
     if (!out_core) {
         snprintf(fpath, sizeof(fpath), "core.%u", _pid);
-        out_core = fpath; 
+        out_core = fpath;
+    }
+    // R50-20 (#2): 同路径时 fopen(out,"wb") 截断输入 acore。
+    if (same_file(in_file, out_core)) {
+        error("decompress: input and output are the same file (%s)", in_file);
+        cleanup_decompress();
+        return -1;
     }
     FILE *fout = fopen(out_core, "wb");
     if (!fout) {
@@ -3556,7 +3576,12 @@ void Coredump::cleanup_decompress()
 int Coredump::test_compress(const char* in_file, const char* out_file)
 {
     int rc = 0;
-    FILE *fin = fopen(in_file, "rb"); 
+    // R50-20 (#2): 同路径时 out.Open("wb") 会把输入截成 0 字节。
+    if (same_file(in_file, out_file)) {
+        error("test_compress: input and output are the same file (%s)", in_file);
+        return -1;
+    }
+    FILE *fin = fopen(in_file, "rb");
     if (!fin) {
         error("Fail to open file %s", in_file);
         return -1;
@@ -3622,6 +3647,14 @@ flush_and_close:
     out.Close();
     fclose(fin);
 
+    // R50-20 (#3): 失败时遗留带尾标的部分 .z4——脚本按"文件存在+size>0"误判为有效
+    // 产物。与 decompress 的 fail_core 对齐，失败即删。
+    if (rc != 0) {
+        if (unlink(out_file) != 0) {
+            error("failed to remove partial %s (%s)", out_file, strerror(errno));
+        }
+    }
+
     info(" %lu => %lu ", data_size, file_size);
 
     return rc;
@@ -3630,6 +3663,11 @@ flush_and_close:
 int Coredump::test_decompress(const char* in_file, const char* out_file)
 {
     int rc = 0;
+    // R50-20 (#2): 同路径时 fopen(out,"wb") 截断输入 → 静默数据丢失。
+    if (same_file(in_file, out_file)) {
+        error("test_decompress: input and output are the same file (%s)", in_file);
+        return -1;
+    }
     Lz4Stream in(Lz4Stream::LZ4_Decompress);
     rc = in.Open(in_file);
     if (rc < 0) {
@@ -3650,8 +3688,12 @@ int Coredump::test_decompress(const char* in_file, const char* out_file)
             // R50-1: ReadBlock NULL 不只是干净 EOF——块头短读/数据截断/size 超限/
             // 解压失败/真实 I/O 错误都返回 NULL。只有块边界 EOF/尾标（LastReadClean）
             // 才是正常结束；否则是损坏/截断流，报错返回非零。
-            if (!in.LastReadClean()) {
-                error("decompress stream corrupt or truncated");
+            // R50-20: LastReadClean 还不够——块边界 EOF（尾标缺失 / 0 字节文件）也
+            // 置 clean。合法 test_compress 输出恒以尾标收尾；块边界 EOF 只来自整块
+            // 截断。要求确实读到尾标才算成功（空输入往返也满足：空压缩产物有尾标）。
+            if (!in.LastReadClean() || !in.TailSeen()) {
+                error("decompress stream corrupt or truncated%s",
+                      in.LastReadClean() ? " (tail mark missing)" : "");
                 rc = -1;
             }
             break;

@@ -26,6 +26,7 @@ Lz4Stream::Lz4Stream(lz4_mode mode) :
     _size_real = 0;
     _size_file = 0;
     _eof_clean = true;
+    _tail_seen = false;
     // R50-5: _block_type 原未初始化——test_compress 走 Write/Flush 不调 SetBlock，
     // Flush 把垃圾类型写进块头（未定义值）。初始化安全默认值。
     _block_type = BLOCK_TYPE_PROCESS;
@@ -333,6 +334,7 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     // tail mark
     if (hdr.isTailMark()) {
         _eof_clean = true;
+        _tail_seen = true;
         return NULL;
     }
 
