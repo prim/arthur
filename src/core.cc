@@ -2915,11 +2915,22 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 目标可能仍被 SIGUSR1 的 forkcore_m 停住；s 未初始化会被 WIFSIGNALED/WIFSTOPPED 误读
     int s = 0, sig = 0;
     waitpid(_pid, &s, WNOHANG);
-    // tracee will be killed if signaled on termination (SIGKILL)
-    // arthur will exit here
-    if(WIFSIGNALED(s)) {
-        info("%s: process %d terminated", strsignal(WTERMSIG(s)), _pid);
-        exit(0);
+    // R50-11: 目标在 dump 窗口内死于信号（崩溃/被 kill）。原 `exit(0)` 三错：
+    // ① 目标崩溃却以 0（成功）退出，绕过 B38 的"崩溃无 core→非零"语义；
+    // ② exit() 不跑栈对象析构，monitor 的 -o 空 acore（只写了 8 字节头）永不
+    //    Close/unlink，残留解压必拒的假文件（B38/B111 专门清理被绕过）；
+    // ③ 崩溃漏抓，调用方从退出码无从得知。
+    // 改为：清理本次 SIGUSR1 dump 的部分 acore + 返回该信号。崩溃信号会让
+    // monitor break 进崩溃采集（目标已死 → collect_threads 失败 → kill_crashed
+    // 清理 -o 空 acore 并返回 -1，正确 fail-closed）。
+    if (WIFSIGNALED(s)) {
+        error("%s: process %d died during dump (no core written)",
+              strsignal(WTERMSIG(s)), _pid);
+        out.Close();
+        if (unlink(corefile) != 0) {
+            error("failed to remove partial acore %s (%s)", corefile, strerror(errno));
+        }
+        return WTERMSIG(s);
     }
     // tracee will stop if signaled on exit
     bool stopped_at_ptrace_event = false;
@@ -3004,11 +3015,18 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // clean pending signal generated above by tracee
     // b38 (Codex review): sigset_t 未 sigemptyset 就在未初始化位图上 sigaddset 是
     // UB——除 SIGCHLD 外的垃圾位会进入 sigwaitinfo 集合，monitor 状态机可能等错信号。
+    // R50-11 (M3): 原 sigwaitinfo 阻塞等待——forkcore_m 收尾窗口内若 leader 崩溃
+    // 进入 SIGSEGV delivery-stop，其 SIGCHLD 会被这里消费掉（siginfo 丢弃），
+    // monitor 主循环再也等不到该崩溃通知 → leader 冻结 + monitor 永久挂起。
+    // 改 sigtimedwait 零超时：只 drain 已 pending 的噪音 SIGCHLD，不阻塞等待，
+    // 之后的真实崩溃 SIGCHLD 留给主循环。
     sigset_t mask;
     sigemptyset(&mask);
-    //siginfo_t sig_info;
     sigaddset(&mask, SIGCHLD);
-    sigwaitinfo(&mask, NULL);
+    struct timespec zero_ts = {0, 0};
+    while (sigtimedwait(&mask, NULL, &zero_ts) > 0) {
+        // drain all already-pending noise SIGCHLD; 无则立即返回
+    }
 
     return sig;
 }
@@ -3141,13 +3159,34 @@ int Coredump::monitor(const char* corefile)
             signal_forkcore = 0; // reset signal 
         } else {
             // signal SIGUSR1 to arthur
+            // R50-11 (H2): SIGUSR1 与崩溃同刻到达时出队顺序不定——若 leader 此刻
+            // 已停在崩溃信号（SIGSEGV/SIGILL/SIGABRT）的 delivery-stop，forkcore_m
+            // 的 pt_int 无法区分"干净停靠"与"崩溃停靠"，pt_call 的 CONT(0) 会把
+            // pending 的崩溃信号以信号 0 抑制掉：同步 fault 重放 / 异步 kill 目标
+            // "复活"，随后产出寄存器全零、内存竞态的垃圾 dump。先 WNOHANG 查 leader
+            // 停靠原因，已是崩溃停靠则直接走崩溃采集（跳过注入）。
+            {
+                int ws = 0;
+                if (waitpid(_pid, &ws, WNOHANG) > 0 && WIFSTOPPED(ws) &&
+                    ((ws >> 16) & 0xff) == 0) {   // 非 ptrace event 停靠
+                    int st = WSTOPSIG(ws);
+                    if (st == SIGILL || st == SIGABRT || st == SIGSEGV) {
+                        info("leader already in %s delivery-stop; skipping SIGUSR1 dump",
+                             strsignal(st));
+                        exit_sig = st;
+                        break;   // 走崩溃采集路径
+                    }
+                }
+            }
             // B19: 原实现 `char out[17]; sprintf(out, "acore.%u\n", ...)`——
             // 10 位时间戳时写 18 字节（含 NUL）溢出 1 字节；格式串还带换行。
             // B58: 秒级 time(NULL) 做文件名，同一秒内多次 SIGUSR1 互相覆盖丢数据
             // （实证：3 次 dump 只留 2 个文件）。加单调序号保证唯一。
-            char out[40];
-            snprintf(out, sizeof(out), "acore.%u.%u",
-                     (unsigned)time(NULL), dump_seq++);
+            // R50-11 (M4): 加目标 pid——两个 monitor 同 CWD 各收到 SIGUSR1 时
+            // 各自 dump_seq 从 0 开始，同秒内都写 acore.<sec>.0 互相覆盖。
+            char out[48];
+            snprintf(out, sizeof(out), "acore.%u.%u.%u",
+                     (unsigned)_pid, (unsigned)time(NULL), dump_seq++);
             info("writing out %s...", out);
             signal_forkcore = forkcore_m(out, false);
             info("writing out acore finished, resume monitoring");
