@@ -815,6 +815,20 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
         }
         if (WIFSTOPPED(status)) {
             if (WSTOPSIG(status) == SIGSEGV) {
+                // B158: 区分注入完成的 SIGSEGV 与注入期间目标的真实崩溃。完成是
+                // 注入函数/壳代码 ret 到模拟返回地址 0 产生的**页面 fault**（fetch
+                // 0 或执行 NX 栈页——实测 fork 壳代码的完成 fault si_addr 是栈地址、
+                // si_code=SEGV_ACCERR，因此 si_addr 不可靠）。kill 投递的 SIGSEGV
+                // 无 fault，si_code=SI_USER(0)。注入函数是 syscall 包装不内部 fault，
+                // 故注入期间唯一非 fault 的 SIGSEGV 就是 kill 投递的真实崩溃——
+                // 用 si_code==SI_USER 判定（实证：mmap 注入期间 kill -SEGV → 原实现
+                // 把崩溃当完成、mmap 返回 0x1、目标"复活"崩溃漏抓）。
+                siginfo_t si;
+                if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) != 0 || si.si_code == SI_USER) {
+                    error("SIGSEGV si_code=%d during injection (real crash, not completion)",
+                          si.si_code);
+                    return fail("crash during injection");
+                }
                 break;
             }
             if ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8))) {
@@ -3094,7 +3108,6 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 分支对已停 tracee 做 pt_int：INTERRUPT 不产生新停靠 → pt_wait 卡 10s
     // 超时 → 注入把组停靠的 leader 恢复运行（本应保持停靠）。加 WUNTRACED 让
     // 组停靠进 WIFSTOPPED 分支，sig=SIGSTOP 由 monitor 的 LISTEN/CONT 中继恢复。
-    waitpid(_pid, &s, WUNTRACED | WNOHANG);
     // R50-11: 目标在 dump 窗口内死于信号（崩溃/被 kill）。原 `exit(0)` 三错：
     // ① 目标崩溃却以 0（成功）退出，绕过 B38 的"崩溃无 core→非零"语义；
     // ② exit() 不跑栈对象析构，monitor 的 -o 空 acore（只写了 8 字节头）永不
@@ -3103,7 +3116,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 改为：清理本次 SIGUSR1 dump 的部分 acore + 返回该信号。崩溃信号会让
     // monitor break 进崩溃采集（目标已死 → collect_threads 失败 → kill_crashed
     // 清理 -o 空 acore 并返回 -1，正确 fail-closed）。
-    if (WIFSIGNALED(s)) {
+    // B156: waitpid 可能返回 0（leader 仍在运行、无 pending 状态）——此时 s 保持
+    // 初始 0，WIFEXITED(0) 恒真（(0&0x7f)==0）会误报"退出"（实证：组停靠/运行中
+    // leader 的 SIGUSR1 dump 被误判为 exit(0)、monitor 错误退出）。必须用 waitpid
+    // 返回值 >0 判断确有状态。WIFSIGNALED(0) 不误报（(0&0x7f)!=0x7f 恒假），
+    // 但统一加 `wr > 0` 更严谨。
+    pid_t wr = waitpid(_pid, &s, WUNTRACED | WNOHANG);
+    if (wr > 0 && WIFSIGNALED(s)) {
         error("%s: process %d died during dump (no core written)",
               strsignal(WTERMSIG(s)), _pid);
         out.Close();
@@ -3111,6 +3130,19 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             error("failed to remove partial acore %s (%s)", corefile, strerror(errno));
         }
         return WTERMSIG(s);
+    }
+    // B156: 目标在 dump 期间正常退出（exit()/main 返回，非信号）。原实现只查
+    // WIFSIGNALED，WIFEXITED 落入下方 else 对已死 pid 做 pt_int/注入全失败、
+    // return sig=0；末尾 drain 把已 pending 的目标退出 SIGCHLD 消费掉，monitor
+    // 的 sigwaitinfo 永远等不到目标状态 → 永久挂起（实证 wchan=do_sigtimedwait）。
+    // 显式清理部分 acore + 返回哨兵 -2，让 monitor 走清理退出路径。
+    if (wr > 0 && WIFEXITED(s)) {
+        error("process %d exited (code %d) during dump", _pid, WEXITSTATUS(s));
+        out.Close();
+        if (unlink(corefile) != 0) {
+            error("failed to remove partial acore %s (%s)", corefile, strerror(errno));
+        }
+        return -2;
     }
     // tracee will stop if signaled on exit
     bool stopped_at_ptrace_event = false;
@@ -3274,9 +3306,23 @@ int Coredump::monitor(const char* corefile)
     int signal_forkcore = 0; // signal generated due to free section in forkcore
     unsigned dump_seq = 0;   // B58: SIGUSR1 dump 单调序号，避免同秒文件名覆盖
     siginfo_t sig_info;
+    // B157: leader 是否处于组停靠（SIGSTOP/TSTP/TTIN/TTOU）。SIGCHLD handler 在
+    // LISTEN 组停靠时置位、中继/恢复时清零；H2 预检据此跳过 SIGUSR1 dump（waitpid
+    // 查不到：组停靠 wait status 已被 LISTEN 消费）。
+    bool leader_in_group_stop = false;
     while(1) {
         if(signal_forkcore) {
             if (signal_forkcore < 0) {
+                if (signal_forkcore == -2) {
+                    // B156: 目标在 SIGUSR1 dump 期间正常退出（exit/main 返回）——
+                    // 清理 -o 空 acore 并返回（与正常退出路径一致），不再挂起等待。
+                    info("process %d exited during SIGUSR1 dump", _pid);
+                    out.Close();
+                    if (unlink(corefile) != 0) {
+                        error("failed to remove empty acore %s (%s)", corefile, strerror(errno));
+                    }
+                    return 0;
+                }
                 // forkcore_m 失败（fail-closed）：restore_target_after_fail 已 resume
                 // leader，无需、也不应把 -1 当中继信号注入。跳过。
                 info("forkcore failed (%d), continue monitoring", signal_forkcore);
@@ -3347,7 +3393,17 @@ int Coredump::monitor(const char* corefile)
                 if ((sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) &&
                     ptrace(PTRACE_LISTEN, sig_info.si_pid, NULL, NULL) == 0) {
                     // 组停靠：已 LISTEN，保持停靠等 SIGCONT。不重投信号。
+                    // B157: 记录 leader 组停靠状态（H2 预检据此跳过 SIGUSR1 dump，
+                    // 避免 forkcore_m 的 pt_int/注入把组停靠消费掉、leader 被恢复）。
+                    if (sig_info.si_pid == _pid) {
+                        leader_in_group_stop = true;
+                    }
                 } else {
+                    // B157: 中继/恢复（CONT(sig)）——若 leader 被 SIGCONT 恢复，
+                    // 清除组停靠标志。
+                    if (sig_info.si_pid == _pid) {
+                        leader_in_group_stop = false;
+                    }
                     ptrace(PTRACE_CONT, sig_info.si_pid, NULL, (uintptr_t) status);
                 }
             }
@@ -3361,8 +3417,20 @@ int Coredump::monitor(const char* corefile)
             // "复活"，随后产出寄存器全零、内存竞态的垃圾 dump。先 WNOHANG 查 leader
             // 停靠原因，已是崩溃停靠则直接走崩溃采集（跳过注入）。
             {
+                // B157: 组停靠检测靠 monitor 侧标志位 leader_in_group_stop（SIGCHLD
+                // handler 在 LISTEN 时维护）——waitpid 查不到：组停靠的 wait status
+                // 已被主循环的 LISTEN 消费（实证 h2 waitpid=0），且 SEIZE 下组停靠
+                // 报为 PTRACE_EVENT_STOP。组停靠时跳过 dump，避免 forkcore_m 的
+                // pt_int/注入把组停靠消费掉、leader 被静默恢复运行（实证 State t→R）。
+                // SIGUSR1 被消费，用户 SIGCONT 后可重试。
+                if (leader_in_group_stop) {
+                    info("leader in group-stop; skipping SIGUSR1 dump "
+                         "(resume with SIGCONT and retry)");
+                    signal_forkcore = 0;
+                    continue;
+                }
                 int ws = 0;
-                if (waitpid(_pid, &ws, WNOHANG) > 0 && WIFSTOPPED(ws) &&
+                if (waitpid(_pid, &ws, WUNTRACED | WNOHANG) > 0 && WIFSTOPPED(ws) &&
                     ((ws >> 16) & 0xff) == 0) {   // 非 ptrace event 停靠
                     int st = WSTOPSIG(ws);
                     if (st == SIGILL || st == SIGABRT || st == SIGSEGV) {
