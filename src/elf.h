@@ -205,6 +205,10 @@ struct arm64_user_regs64_struct
         printf("sp = %lx\n", r->sp);
     }
 };
+// R50-10: 内核 `struct user_pt_regs`（regs[31]+sp+pc+pstate）= 34×8 = 272 字节，
+// pt_getregs/pt_setregs 用 sizeof 作 NT_PRSTATUS 的 iov_len——布局是内核 ABI 硬
+// 约束，未来加字段会静默破坏 PTRACE 读写。补编译期校验。
+static_assert(sizeof(arm64_user_regs64_struct)==272, "invalid arm64 regs");
 
 // fp and simd register for arm64
 struct arm64_user_fpsimd64_struct

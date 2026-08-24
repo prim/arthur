@@ -489,6 +489,61 @@ static inline int pt_setfpregs(pid_t pid, user_fpregs64_struct *pregs)
     return rc;
 }
 
+// R50-10 (aarch64): 注入恢复若用 NT_FPREGSET 会把 TIF_SVE 任务的 SVE 状态清空
+//（内核 fpsimd_set 对 TIF_SVE 任务 test_and_clear TIF_SVE + sve_free，z/p/FFR
+// 全部丢失）——本机 x86 无法实测，按内核 arch/arm64/kernel/ptrace.c sve_get/
+// sve_set 语义实现。优先用 NT_ARM_SVE 保存/恢复（SVE 使能内核上可用，含 FPSIMD
+// 视图），内核无 SVE 时回退 NT_FPREGSET（此时无 SVE 状态可丢，FPSIMD 完整）。
+// 返回 0 表示 SVE 已保存（*out_buf malloc，调用方 free）；-1 表示需回退 FPSIMD。
+#ifdef __aarch64__
+#define ARTHUR_NT_ARM_SVE 0x405
+static inline int pt_save_sve(pid_t pid, char **out_buf, size_t *out_len)
+{
+    // struct user_sve_header（arm64 uapi <asm/ptrace.h>）：16 字节定长
+    struct {
+        uint32_t size;
+        uint32_t max_size;
+        uint16_t vl;
+        uint16_t max_vl;
+        uint16_t flags;
+        uint16_t reserved;
+    } hdr;
+    struct iovec iov;
+    iov.iov_base = &hdr;
+    iov.iov_len = sizeof(hdr);
+    if (ptrace(PTRACE_GETREGSET, pid, ARTHUR_NT_ARM_SVE, &iov) != 0) {
+        return -1;   // 内核无 SVE（EINVAL）→ 回退 FPSIMD
+    }
+    // 防御：size 是内核算出的总 dump 大小（FPSIMD 视图 ~272B / SVE 随 VL 到几 KB），
+    // 异常大说明目标/内核异常，拒用。
+    if (hdr.size < sizeof(hdr) || hdr.size > 64*1024) {
+        return -1;
+    }
+    char *buf = (char*)malloc(hdr.size);
+    if (!buf) {
+        return -1;
+    }
+    iov.iov_base = buf;
+    iov.iov_len = hdr.size;
+    if (ptrace(PTRACE_GETREGSET, pid, ARTHUR_NT_ARM_SVE, &iov) != 0) {
+        free(buf);
+        return -1;
+    }
+    *out_buf = buf;
+    *out_len = hdr.size;
+    return 0;
+}
+
+static inline int pt_restore_sve(pid_t pid, const char *buf, size_t len)
+{
+    struct iovec iov;
+    iov.iov_base = (void*)buf;
+    iov.iov_len = len;
+    return ptrace(PTRACE_SETREGSET, pid, ARTHUR_NT_ARM_SVE, &iov);
+}
+#undef ARTHUR_NT_ARM_SVE
+#endif
+
 // read all xstate registers (x64)
 static inline int pt_getxstateregs(pid_t pid, x64_xstatereg *pregs, size_t *out_len = NULL)
 {
@@ -554,6 +609,11 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
 #ifdef __aarch64__
     user_fpregs64_struct fpregs;
     int fp_saved = 0;
+    // R50-10: NT_FPREGSET 恢复会清空 TIF_SVE 任务的 SVE 状态；有 SVE 时改用
+    // NT_ARM_SVE 保存/恢复（pt_save_sve 成功则 sve_saved=1，buf 需 free）。
+    char *sve_buf = NULL;
+    size_t sve_len = 0;
+    int sve_saved = 0;
 #endif
 #ifndef __aarch64__
     // b3 (Codex review): 注入真实 libc 函数按 SysV ABI 践踏 caller-saved 扩展
@@ -580,7 +640,14 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
             error("pt_call: restore xstate %d failed (%s)", pid, strerror(errno));
         }
 #else
-        if (fp_saved) {
+        if (sve_saved) {
+            // R50-10: 恢复 SVE（不清 TIF_SVE）；失败告警
+            if (pt_restore_sve(pid, sve_buf, sve_len) != 0) {
+                error("pt_call: restore SVE %d failed (%s)", pid, strerror(errno));
+            }
+            free(sve_buf);
+            sve_buf = NULL;
+        } else if (fp_saved) {
             pt_setfpregs(pid, &fpregs);
         }
 #endif
@@ -599,9 +666,14 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     if (rc != 0) { return fail("getxstateregs"); }
     xstate_saved = 1;
 #else
-    rc = pt_getfpregs(pid, &fpregs);
-    if (rc != 0) { return fail("getfpregs"); }
-    fp_saved = 1;
+    // R50-10: 优先 NT_ARM_SVE 保存（含 SVE 时不清状态）；无 SVE 回退 FPSIMD。
+    if (pt_save_sve(pid, &sve_buf, &sve_len) == 0) {
+        sve_saved = 1;
+    } else {
+        rc = pt_getfpregs(pid, &fpregs);
+        if (rc != 0) { return fail("getfpregs"); }
+        fp_saved = 1;
+    }
 #endif
 
     // simulate call instruction
@@ -705,8 +777,16 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     // B3: 恢复被注入践踏的状态。ret 已把 rsp 还原，[inject_rsp] 仍存 0；
     // 写回原返回地址字，并恢复 FP/SIMD（x86-64 用 XSTATE 全量含 AVX-512）。
 #ifdef __aarch64__
-    // 无 [rsp-8] 模拟；仅恢复 FP
-    pt_setfpregs(pid, &fpregs);
+    // 无 [rsp-8] 模拟；仅恢复 FP。R50-10: 有 SVE 时用 NT_ARM_SVE 恢复（不清 TIF_SVE）。
+    if (sve_saved) {
+        if (pt_restore_sve(pid, sve_buf, sve_len) != 0) {
+            error("pt_call: restore SVE %d failed (%s)", pid, strerror(errno));
+        }
+        free(sve_buf);
+        sve_buf = NULL;
+    } else if (fp_saved) {
+        pt_setfpregs(pid, &fpregs);
+    }
 #else
     if (stack_saved) {
         errno = 0;
