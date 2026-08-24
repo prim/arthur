@@ -987,15 +987,17 @@ char* Note::allocate(size_t payload_size)
     }
  
     size_t size = roundup((sizeof(Elf64_Nhdr) + 8 + payload_size), 4);
+    // assert 在此构建（-O0 -g 无 NDEBUG）下 OOM 即 abort——fail-closed；改 NULL 返回
+    // 需同步护住 6 处 memcpy 调用点，收益低。保持 assert。
     char *note = (char*)malloc(size);
     assert(note);
     memset(note, 0, size);
-    
+
     Elf64_Nhdr *nhdr = (Elf64_Nhdr*)note;
     nhdr->n_namesz = name_size;
     nhdr->n_descsz = payload_size;
     nhdr->n_type = _type;
-    
+
     strncpy(note+sizeof(Elf64_Nhdr), name, 8);
 
     _data = note;
@@ -3358,6 +3360,10 @@ int Coredump::monitor(const char* corefile)
 int Coredump::decompress(const char* in_file, const char* out_core)
 {
     int rc = 0;
+    // R50-18: 与采集函数入口风格一致——同一 Coredump 先 generate() 再 decompress()
+    // 时 _phdrs 残留陈旧 LOAD 段（cleanup_decompress 只在末尾清）。预算校验能兜底，
+    // 但入口清空避免幻影 phdr 混入。
+    _phdrs.clear();
     Lz4Stream in(Lz4Stream::LZ4_Decompress);
     rc = in.Open(in_file);
     if (rc < 0) {
@@ -3430,8 +3436,8 @@ int Coredump::decompress(const char* in_file, const char* out_core)
         ssize_t len;
         len = fwrite(nt->_data, 1, nt->_size, fout);
         // B54: 输出磁盘满时 fwrite 可能短写，原 assert 直接 abort。
-        if (len != nt->_size) {
-            error("write note failed (%ld != %d), disk full? core removed", len, nt->_size);
+        if (len != (ssize_t)nt->_size) {
+            error("write note failed (%ld != %zu), disk full? core removed", len, nt->_size);
             return fail_core();
         }
     }

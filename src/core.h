@@ -185,7 +185,9 @@ private:
     Note();
     int _type;
     char* _data;
-    int _size;
+    // R50-18: int→size_t——note 长度理论可超 2GB（int 截断成负数，fwrite 转
+    // size_t 巨量越界）。当前受 GetFile 64MB 上限约束不可触发，改类型消除隐患。
+    size_t _size;
 
     friend class Coredump;
 };
