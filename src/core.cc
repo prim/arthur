@@ -47,6 +47,16 @@ static bool same_file(const char* a, const char* b)
     return false;
 }
 
+// R50-21: 单调钟毫秒——超时截止必须用 CLOCK_MONOTONIC。原 gettimeofday 是墙钟：
+// NTP 回拨时 tv_sec 差值变负 → 截止永不触发（R50-1 的 hang 收敛失效、无限挂起）；
+// 前跳则误超时。
+static long long monotonic_ms()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 extern "C" {
 
 // the function is only for compile asm code.
@@ -412,13 +422,11 @@ static inline int pt_wait(pid_t pid)
     // R50-1: 阻塞 waitpid 会无限挂起——多线程目标 fork 注入实测：auto-attach 的
     // child 停住未回收，leader 在 EVENT_FORK 后不再停靠，waitpid 永不返回。改用
     // WNOHANG 轮询 + 截止时间，卡死时返回 -1（调用方 fail-closed）。
-    struct timeval t0;
-    gettimeofday(&t0, NULL);
+    // R50-21: 截止用单调钟——墙钟 NTP 回拨会使超时永不触发，hang 收敛失效。
+    long long t0 = monotonic_ms();
     const long WAIT_TIMEOUT_MS = 10000;
     for (;;) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        if ((tv.tv_sec - t0.tv_sec) * 1000 + (tv.tv_usec - t0.tv_usec) / 1000 > WAIT_TIMEOUT_MS) {
+        if (monotonic_ms() - t0 > WAIT_TIMEOUT_MS) {
             error("pt_wait: %d did not stop within %ld ms (target stuck?)", pid, WAIT_TIMEOUT_MS);
             return -1;
         }
@@ -776,13 +784,11 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
     // 停靠（auto-attach 的 child 停住未回收，leader 在注入页运行却不 fault），pt_wait
     // 无限阻塞，arthur 永久挂起。加超时，卡死时 fail-closed（fail() 恢复 xstate/
     // [rsp-8]），调用方还原目标。
-    struct timeval t0;
-    gettimeofday(&t0, NULL);
+    // R50-21: 截止用单调钟（墙钟 NTP 回拨会永不触发）。
+    long long t0 = monotonic_ms();
     const long INJECT_TIMEOUT_MS = 10000;
     for (;;) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        if ((tv.tv_sec - t0.tv_sec) * 1000 + (tv.tv_usec - t0.tv_usec) / 1000 > INJECT_TIMEOUT_MS) {
+        if (monotonic_ms() - t0 > INJECT_TIMEOUT_MS) {
             return fail("inject timeout");
         }
         if (WIFSTOPPED(status)) {
@@ -2492,8 +2498,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
         // B57: pt_call 失败（目标中途死亡）时不填充 regs；不检查会在下面读未初始化的
         // inject_page 当垃圾地址继续注入。
+        // R50-21 (D1): 与 forkcore_m 同路径对齐——pt_call 失败时 fail() 只恢复
+        // xstate/[rsp-8]/红区不恢复 GPR；若目标是注入超时而非死亡（存活），
+        // 直接 restore_target_after_fail 的 CONT 会让目标从被注入的 rip/rsp 继续
+        // 执行 → 乱跑/崩溃。先恢复注入前完整寄存器。
         if (pt_call(_pid, &regs, r_mmap, 6, gv) != 0) {
             error("mmap injection failed (target died?)");
+            pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
             out.Close();
             unlink(corefile);
