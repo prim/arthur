@@ -2073,6 +2073,14 @@ int Coredump::ReadElfHeader(Lz4Stream& in, size_t max_phdrs)
                 error("decode phdr failed.");
                 return -1;
             }
+            // B154: 写侧 WriteLoads 只产出 PT_LOAD phdr——非 PT_LOAD 必是损坏/
+            // 恶意 acore。不拒绝时 decompress 把其 p_offset（不加 _offset_load）
+            // 当绝对偏移写进输出 core，gdb 解析垃圾段拒绝整个 core（实证
+            // "not a core dump"）。fail-closed。
+            if (phdr.p_type != PT_LOAD) {
+                error("elf phdr type %u (not PT_LOAD), acore corrupt", phdr.p_type);
+                return -1;
+            }
             _phdrs.push_back(phdr);
         }
 
@@ -3609,6 +3617,11 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // R50-7: 构造 phdr 可声明 p_filesz=2^64-1，多个求和回绕后撞上真实 loads_written
     // 绕过校验——用溢出检测代替裸累加（真实 dump 的字节和远小于 2^64）。
     size_t expected = 0;
+    // B155: 连续 LOAD 的 p_offset 必须与前一个的 p_offset+p_filesz 相接（首个为 0）。
+    // 写侧 p_offset 是累计未压缩字节恒连续；构造 acore 可误报各 region 的 p_filesz
+    // 使总和仍等于 loads_written（过 B117/上面的和校验），但 gdb 无报错加载时区域
+    // 内容错位/成洞（实证：region 尾部填下个 region 字节）。fail-closed。
+    uint64_t prev_load_end = 0;
     for (const auto& phdr : _phdrs) {
         if (phdr.p_type == PT_LOAD) {
             size_t next;
@@ -3628,6 +3641,13 @@ int Coredump::decompress(const char* in_file, const char* out_core)
                       (unsigned long)loads_written);
                 return fail_core();
             }
+            if (phdr.p_offset != prev_load_end ||
+                phdr.p_offset + phdr.p_filesz < phdr.p_offset) {
+                error("phdr p_offset %lu not contiguous after prev end %lu (acore corrupt, core removed)",
+                      (unsigned long)phdr.p_offset, (unsigned long)prev_load_end);
+                return fail_core();
+            }
+            prev_load_end = phdr.p_offset + phdr.p_filesz;
         }
     }
     if (loads_written != expected) {
