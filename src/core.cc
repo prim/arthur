@@ -2011,6 +2011,16 @@ int Coredump::ReadElfHeader(Lz4Stream& in, size_t max_phdrs)
         error("decode ehdr failed.");
         return -1;
     }
+    // R50-23 (defect 3): acore 头 arch 与 ELF 块 e_machine 一致性校验——合法 acore
+    // 两者恒一致（写侧均由编译平台决定）；损坏/恶意 acore 可构造为 arch=AARCH64 但
+    // e_machine=EM_X86_64，ReadMeta 按 arm64 读、输出 core 却标 x86 → gdb 按 x86 解析
+    // 0x188 prstatus 全错。fail-closed。
+    if ((_arch == ARCH_X64 && _ehdr.e_machine != EM_X86_64) ||
+        (_arch == ARCH_AARCH64 && _ehdr.e_machine != EM_AARCH64)) {
+        error("acore arch %d mismatches ELF machine %u (acore corrupt)",
+              _arch, _ehdr.e_machine);
+        return -1;
+    }
 
     while (block) {
 
