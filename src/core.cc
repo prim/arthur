@@ -2779,7 +2779,14 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc()
             // 读垃圾进日志/告警。检查并告警（acore 已有效，best-effort 收尸）。
             if (pt_call(_pid, &regs, r_waitpid, 3, gv) != 0) {
-                warn("waitpid injection failed (target died?)");
+                // R50-38: 注入 waitpid 失败不必然是"target died"——mode 2 下
+                // fork 子进程非 tracee，DETACH+SIGKILL 无效，子进程靠 int $3 内核
+                // core 后自行死亡；大目标内核 core dump 可 >10s，pt_call 超时
+                // 触发同一失败路径。两种情况都会让子进程 zombie 残留（目标退出或
+                // 自行 waitpid 才回收）。如实区分告警，不再误导为"target died"。
+                warn("waitpid injection failed (target died, or mode-2 kernel "
+                     "core dump exceeded 10s); fork child %d may linger as a "
+                     "zombie until the target exits", (int)_core_pid);
             } else {
                 info("waitpid = %d", (int)regs.get_rc());
                 // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
@@ -2799,6 +2806,17 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     info("Process %u paused %0.3f ms.", _pid, ts_pause.timediff()*1000);
     out.PrintStat();
     out.Close();
+    // R50-38: mode 2（sys_core）的元数据 acore 无 magic/LOADS/ELF/尾标
+    //（WriteFileHeader/WriteLoads/WriteElfHeader/WriteTailMark 被跳过），且
+    // merge(-m) 未实现——产出物（元数据 + 内核 core）无法合并成可用 core，
+    // 内核 core 还是注入子进程的单线程快照（寄存器是注入态）。exit 0 会误导
+    // 自动化判成功；如实告警。
+    if (sys_core) {
+        warn("mode 2: metadata acore '%s' cannot be merged into a usable core "
+             "(merge -m not implemented); kernel core is a single-threaded "
+             "snapshot of the injected child with injection-state registers",
+             corefile);
+    }
     return 0;
 }
 
