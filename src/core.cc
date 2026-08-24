@@ -2633,9 +2633,19 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 #endif
         int inject_size = (inject_end - inject_begin);
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
-     
+        // B159: 必须从 inject_begin 拷贝，不能从 inject_fork（函数首）——inject_size
+        // 只量 asm 块（inject_end - inject_begin），而函数首在 -O0 下多 4 字节前导
+        //（x86: push rbp; mov rsp,rbp；aarch64 同理）。原实现拷贝错位：前 4 字节
+        // 前导注入 + 末尾 4 字节截断。后果（实证）：
+        //   ① 前导 push rbp 把目标 rbp 写进 [rsp-16]，B72 只恢复 [rsp-8]——每次
+        //      mode-0/2 dump 的栈都残留一个错字；
+        //   ② 父进程 ret 弹的是 push 的 rbp（栈地址）而非注入的 0，完成 fault 落在
+        //      rbp（B158 观察到的"si_addr 是栈地址"实为此根因）——execstack 目标会
+        //      执行栈字节（代码执行危害）；
+        //   ③ 子进程 exit 路径的末尾 syscall 被截断，SIGTRAP 被捕获/阻塞时子进程
+        //      SIGSEGV 而非干净 exit(0)（mode 2 边角）。
         // B80: pt_write 失败（注入页不可写/短写）时继续注入会执行垃圾代码；fail-closed。
-        if (pt_write(_pid, inject_page, (void *)inject_fork, inject_size) != 0) {
+        if (pt_write(_pid, inject_page, (void *)inject_begin, inject_size) != 0) {
             error("write inject shellcode to %lx failed", (unsigned long)inject_page);
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
@@ -2708,7 +2718,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (WriteLoads(out, _core_pid, maps) != 0) {
             error("failed to dump memory of child %d", (int)_core_pid);
             kill_fork_child();
-            restore_target_after_fail();
+            // 目标已在上方 detach（2704），TRACEFORK 随 DETACH 清除；
+            // restore_target_after_fail 会对未跟踪 leader 报 ESRCH 误导，跳过。
             out.Close();
             unlink(corefile);
             return -1;
@@ -2717,7 +2728,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (WriteElfHeader(out) != 0) {
             error("failed to write elf header");
             kill_fork_child();
-            restore_target_after_fail();
+            // 目标已在上方 detach（2704），TRACEFORK 随 DETACH 清除；
+            // restore_target_after_fail 会对未跟踪 leader 报 ESRCH 误导，跳过。
             out.Close();
             unlink(corefile);
             return -1;
@@ -2726,7 +2738,8 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         if (WriteTailMark(out) != 0) {
             error("failed to write tail mark (disk full?)");
             kill_fork_child();
-            restore_target_after_fail();
+            // 目标已在上方 detach（2704），TRACEFORK 随 DETACH 清除；
+            // restore_target_after_fail 会对未跟踪 leader 报 ESRCH 误导，跳过。
             out.Close();
             unlink(corefile);
             return -1;
@@ -2975,9 +2988,19 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
 #endif        
         int inject_size = (inject_end - inject_begin);
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
-     
+        // B159: 必须从 inject_begin 拷贝，不能从 inject_fork（函数首）——inject_size
+        // 只量 asm 块（inject_end - inject_begin），而函数首在 -O0 下多 4 字节前导
+        //（x86: push rbp; mov rsp,rbp；aarch64 同理）。原实现拷贝错位：前 4 字节
+        // 前导注入 + 末尾 4 字节截断。后果（实证）：
+        //   ① 前导 push rbp 把目标 rbp 写进 [rsp-16]，B72 只恢复 [rsp-8]——每次
+        //      mode-0/2 dump 的栈都残留一个错字；
+        //   ② 父进程 ret 弹的是 push 的 rbp（栈地址）而非注入的 0，完成 fault 落在
+        //      rbp（B158 观察到的"si_addr 是栈地址"实为此根因）——execstack 目标会
+        //      执行栈字节（代码执行危害）；
+        //   ③ 子进程 exit 路径的末尾 syscall 被截断，SIGTRAP 被捕获/阻塞时子进程
+        //      SIGSEGV 而非干净 exit(0)（mode 2 边角）。
         // B80: pt_write 失败（注入页不可写/短写）时继续注入会执行垃圾代码；fail-closed。
-        if (pt_write(_pid, inject_page, (void *)inject_fork, inject_size) != 0) {
+        if (pt_write(_pid, inject_page, (void *)inject_begin, inject_size) != 0) {
             error("write inject shellcode to %lx failed", (unsigned long)inject_page);
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
