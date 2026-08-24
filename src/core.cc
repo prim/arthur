@@ -33,6 +33,17 @@ static_assert(BUFFER_SIZE >= 1*1024*1024, "buffer size should more than 1MB.");
 
 #define roundup(x,n) (((x)+((n)-1))&(~((n)-1)))
 
+// R50-40: mmap 注入结果的用户态地址上限——x86-64 是 47 位 VA（用户空间 < 2^47，
+// 原硬编码 0x0000800000000000 正确）；aarch64 是 48 位 VA（TASK_SIZE=2^48，
+// 默认 top-down mmap 返回 ~0x0000FFFF_xxxx_xxxx > 2^47，原检查会误拒所有合法
+// 结果、全部 forkcore 模式在 aarch64 失败）。B16 缓释只拒"明显垃圾"（0/未对齐/
+// 过低），上限按编译架构取。x86-64 LA57（5 级页表，56 位 VA）同样受益。
+#ifdef __aarch64__
+static const uint64_t ARTHUR_MAX_USER_VA = 0x0000FFFFFFFFFFFFUL;   // 48-bit VA 用户空间上限
+#else
+static const uint64_t ARTHUR_MAX_USER_VA = 0x00007FFFFFFFFFFFUL;   // 47-bit VA 用户空间上限 (x86-64)
+#endif
+
 // R50-20 (#2): 输入输出同路径时 fopen("wb") 先截断输入 → 静默数据丢失。
 // strcmp 覆盖同字符串；stat 比较覆盖 "./x" vs "x"、符号链接等殊途同归。
 static bool same_file(const char* a, const char* b)
@@ -2616,7 +2627,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
         // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
         if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000 ||
-            inject_page > 0x0000800000000000UL) {
+            inject_page > ARTHUR_MAX_USER_VA) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
             // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
@@ -2989,7 +3000,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // mmap 结果变垃圾（如 rax=0xdb）。合法结果必是页对齐、非零、用户态地址。
         // 否则 fail-closed 还原目标，避免用垃圾 inject_page 继续注入。
         if (inject_page == 0 || (inject_page & 0xfff) != 0 || inject_page < 0x10000 ||
-            inject_page > 0x0000800000000000UL) {
+            inject_page > ARTHUR_MAX_USER_VA) {
             error("remote mmap returned implausible %#lx "
                   "(target likely in a restartable syscall); aborting", inject_page);
             // B16 续: 注入失败时 pt_call 已在目标栈 [rsp-8] 写 0、把 rip 推向
