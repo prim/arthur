@@ -836,7 +836,8 @@ static inline void pt_child_skip_int3(pid_t child, uint64_t inject_page,
 static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, int argc,
                           uint64_t argv[], uint64_t *out_inject_rsp = NULL,
                           uint64_t *out_orig_word = NULL,
-                          uint64_t *out_fork_child = NULL)
+                          uint64_t *out_fork_child = NULL,
+                          int *out_death = NULL)
 {
     int rc, status = 0;
     user_regs64_struct regs;
@@ -1052,10 +1053,22 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
         rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
         if (rc < 0) {
             // 目标在注入过程中死亡（兄弟线程 SIGKILL 等）
+            // B198: CONT 失败（ESRCH）说明目标已死——死亡状态未被下方 pt_wait
+            // 返回（在本次 stop 与 CONT 之间死亡），记录供调用方返回 -2 清理退出
+            //（否则 monitor 继续监控死进程挂起）。
+            if (out_death) {
+                *out_death = -2;
+            }
             return fail("cont");
         }
 
         status = pt_wait(pid);
+        // B198: 捕获注入期间目标的死亡/退出——waitpid 状态被本函数消费后调用方
+        //（detect_leader_death）拿不到，死亡 SIGCHLD 又被 dump 噪音 first-wins 合并
+        // 吞掉，monitor 会继续监控死进程（挂起）。记录供调用方返回 -2 清理退出。
+        if (out_death && (WIFSIGNALED(status) || WIFEXITED(status))) {
+            *out_death = WIFSIGNALED(status) ? WTERMSIG(status) : -2;
+        }
     }
     
     if (oregs) {
@@ -3288,7 +3301,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // B57: pt_call 失败（目标中途死亡）时不填充 regs。forkcore 同位置有检查，
         // 此处漏掉（R50-1）——未检查会在下面把未初始化的 get_rc() 当 inject_page
         // 继续注入。fail-closed 还原目标。
-        if (pt_call(_pid, &regs, r_mmap, 6, gv) != 0) {
+        int mmap_death = 0;
+        if (pt_call(_pid, &regs, r_mmap, 6, gv, NULL, NULL, NULL, &mmap_death) != 0) {
             // B197: 并发崩溃（B158 "crash during injection"）时 leader 停在崩溃
             // delivery-stop——restore_target_after_fail 的 CONT(0) 会抑制崩溃信号、
             // 目标"复活"崩溃丢失（实证：失败 dump 窗口 kill-SEGV 后目标存活、无
@@ -3315,6 +3329,26 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
                 out.Close();
                 unlink(corefile);
                 return crash;
+            }
+            // B198: 目标在注入期间被杀（SIGKILL/OOM/看门狗）——死亡 SIGCHLD 被
+            // dump 噪音 first-wins 合并吞掉（实证：monitor 继续监控死进程、8s 不
+            // 退出、额外 SIGUSR1 无效）。pt_call 内 waitpid 已消费死亡状态（本函数
+            // detect_leader_death 拿不到），用 out_death 捕获；返回 -2 让 monitor
+            // 清理 -o 并退出。
+            int death = mmap_death ? mmap_death : detect_leader_death(_pid);
+            if (death != 0) {
+                if (death == SIGILL || death == SIGABRT || death == SIGSEGV) {
+                    // 崩溃 stop（probe_crash_stop 之后新到）——按崩溃返回，monitor 采集。
+                    out.Close();
+                    unlink(corefile);
+                    return death;
+                }
+                // WIFSIGNALED（如 SIGKILL=9）或 WIFEXITED(-2)——目标已死。
+                info("leader %d died during failed injection (death=%d); exiting monitor",
+                     _pid, death);
+                out.Close();
+                unlink(corefile);
+                return -2;
             }
             error("mmap injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
