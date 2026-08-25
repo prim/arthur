@@ -1052,14 +1052,20 @@ static inline int pt_attach(pid_t pid)
     // R50-22: pt_wait 超时（线程 D 态不可停，SIGSTOP 无法交付）时 attach 虽成功但
     // tracee 未停靠——若当成功，WriteThreadMeta 写零化块、结尾 DETACH 失败残留
     // PT_PTRACED+SIGSTOP，D 态解除后线程永久冻结。传播失败让调用方 fail-closed。
-    // B179: 仅传播失败仍把 tracee 留在 PT_PTRACED+SIGSTOP——arthur 退出后内核自动
-    // detach 不恢复 TASK_STOPPED，D 态线程解除后 SIGSTOP 交付、永久冻结。撤销已成功
-    // 的 attach：DETACH 清 PT_PTRACED（对运行中/D 态 tracee 同样有效），SIGCONT 取消
-    // pending SIGSTOP。best-effort——失败则维持原状（与不修等价），正常路径不受影响。
+    // B179/C131: 仅传播失败仍把 tracee 留在 PT_PTRACED+SIGSTOP——arthur 退出后内核
+    // 自动 detach 不恢复 TASK_STOPPED，D 态线程解除后 SIGSTOP 交付、永久冻结。
+    // 注意：PTRACE_DETACH 对运行中/D 态（未停靠）tracee 返回 -ESRCH（实证），无法
+    // 撤销 attach；有效手段是 kill(SIGCONT) 直接投递 SIGCONT 取消 pending SIGSTOP
+    //（SIGCONT 是续跑信号，不产生 ptrace delivery-stop，tracer 无需处理；D 态解除
+    // 后 SIGCONT 先于 SIGSTOP 处理并取消它，线程继续运行，不再冻结）。best-effort：
+    // 正常路径（tracee 及时停靠）不触发，无副作用。
     if (pt_wait(pid) < 0) {
-        if (ptrace(PTRACE_DETACH, pid, NULL, (void*)SIGCONT) != 0) {
-            warn("pt_attach: detach %d after timeout failed (%s)", pid, strerror(errno));
+        if (kill(pid, SIGCONT) != 0) {
+            warn("pt_attach: SIGCONT %d after timeout failed (%s)", pid, strerror(errno));
         }
+        // 顺带 best-effort DETACH（tracee 若碰巧已停靠则清 PT_PTRACED；运行中/D 态
+        // 返回 ESRCH，无副作用）。
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return -1;
     }
 
