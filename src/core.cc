@@ -3468,6 +3468,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 继续跑），且 monitor 的 leader_in_group_stop 不会置位。组停靠须 PTRACE_LISTEN
     // 保持停靠，等目标自身的 SIGCONT 恢复。
     bool group_stop_event = false;
+    // B189: 注入期间 leader 崩溃（B158 fail-closed 检测到）后保留 delivery-stop——
+    // 置位后下方 pt_cont 跳过（CONT(0) 会抑制崩溃信号、目标复活、崩溃丢失）。
+    bool crash_preserved = false;
     if(WIFSTOPPED(s)) {
         sig = WSTOPSIG(s);
         // B66: dump 窗口（pt_cont 后 TRACEFORK 仍设）内 leader 自己 fork 会触发
@@ -3570,6 +3573,30 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             }
         }
         pt_setregs(_pid, &saved_regs);
+        // B189: 注入期间 leader 崩溃——B158 fail-closed 检测到 kill-SIGSEGV/ABRT/ILL
+        //（si_code==SI_USER）后 leader 停在真实 delivery-stop，但原实现下方 pt_cont(0)
+        // 把崩溃信号以 0 抑制 → 目标"复活"、崩溃 SIGCHLD 被收尾 drain 吞掉 → monitor
+        // 挂起 + 崩溃丢失（实证：dump 窗口 kill -SEGV 落在 waitpid 注入 → "crash during
+        // injection" 后 monitor 永久挂起）。用 GETSIGINFO 检测（崩溃 wait status 已被
+        // pt_call 内部 pt_wait 消费，waitpid/detect_leader_death 拿不到）：leader 停在
+        // crash-class delivery-stop → 保留停靠、返回信号走崩溃采集（与 crashed_in_window
+        // 对齐）；被捕获则中继（B184）。
+        siginfo_t inj_si;
+        if (ptrace(PTRACE_GETSIGINFO, _pid, 0, &inj_si) == 0 &&
+            (inj_si.si_signo == SIGILL || inj_si.si_signo == SIGABRT || inj_si.si_signo == SIGSEGV)) {
+            int ic = inj_si.si_signo;
+            if (signal_is_caught(_pid, ic)) {
+                info("leader %d stopped at caught %s after injection; relaying to "
+                     "handler (not crash collection)", _pid, strsignal(ic));
+                ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) ic);
+                crash_preserved = true;   // 已 CONT 恢复，跳过下方 pt_cont
+            } else {
+                info("leader %d crashed in %s after injection; preserving crash stop "
+                     "for crash collection", _pid, strsignal(ic));
+                sig = ic;
+                crash_preserved = true;
+            }
+        }
     }
     // B39: 本函数开头设了 PTRACE_O_TRACEFORK，若不清除则 monitor 继续运行时目标
     // 后续每个 fork 的子进程都被自动 attach+SIGSTOP 冻结（实证：state=t、
@@ -3591,6 +3618,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         if (ptrace(PTRACE_LISTEN, _pid, NULL, NULL) != 0) {
             error("group-stop leader %d: PTRACE_LISTEN failed (%s)", _pid, strerror(errno));
         }
+    } else if (crash_preserved) {
+        // B189: 注入后崩溃的 delivery-stop 已保留（或已 CONT 中继）——不 CONT，
+        // 避免 CONT(0) 抑制崩溃信号、目标复活、崩溃丢失。保留停靠供崩溃采集。
     } else if(!WIFSTOPPED(s) || stopped_at_ptrace_event) {
         pt_cont(_pid);
     }
