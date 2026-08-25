@@ -2189,21 +2189,39 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
         size_t size = 0;
         for (uint64_t addr = r.start_addr; addr < end_addr; addr += sizeof(buf)) {
             int req = MIN((end_addr - addr), sizeof(buf));
-            ssize_t len = pread(fd, buf, req, addr);
-            if (len < 0) {
-                warn("pread mem(%lx) failed(%d).", addr, errno);
-                break;
+            // b93 (Codex B93 review): 短读（0<len<req）时按整缓冲推进会把
+            // [addr+len, addr+req) 静默跳过，后续读到的数据在 core 中映射到更低的
+            // 虚拟地址（数据错位 + 洞）。改为循环读满 req（处理 EINTR）；读不动
+            // （EOF/硬错误，如 R50-1 观测的栈页 pread EIO）时零填充剩余字节保持
+            // PT_LOAD 布局连续，不静默错位。目标已停靠时短读少见，零填充比整个
+            // dump fail-closed 更不破坏真实采集。
+            ssize_t got = 0;
+            while (got < req) {
+                ssize_t len = pread(fd, buf + got, req - got, addr + got);
+                if (len < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    warn("pread mem(%lx) failed(%d); zero-filling %zd bytes",
+                         addr + got, errno, req - got);
+                    memset(buf + got, 0, req - got);
+                    break;
+                }
+                if (len == 0) {
+                    warn("pread mem(%lx) EOF after %zd of %d bytes; zero-filling",
+                         addr, got, req);
+                    memset(buf + got, 0, req - got);
+                    break;
+                }
+                got += len;
             }
-            if (len < req) {
-                // R50-1: 短读（0<=len<req）时本循环按整缓冲推进，未读部分被静默跳过
-                // → 该区域 core 数据有洞（gdb 零填充）。目标已停止时少见，但不应无声。
-                warn("pread mem(%lx) short read %zd of %d bytes; region data hole",
-                     addr, len, req);
+            if (got < req) {
+                got = req;   // 零填充已补满，写循环按整块输出保持布局连续
             }
-            mem_size += len;
+            mem_size += got;
 
-            for (ssize_t i=0; i<len; i+= BLOCK_SIZE) {
-                size_t j = MIN(len - i, BLOCK_SIZE);
+            for (ssize_t i=0; i<got; i+= BLOCK_SIZE) {
+                size_t j = MIN(got - i, BLOCK_SIZE);
                 // B68: WriteBlock 失败（压缩错误）返回 -1；直接 `size += rc` 会让
                 // size_t 下溢成巨大值，ph.p_filesz 声明巨额 → 解压被一致性检查拒。
                 int wrc = out.WriteBlock((const char*)(buf+i), j, BLOCK_TYPE_LOADS);
@@ -2216,7 +2234,7 @@ int Coredump::WriteLoads(Lz4Stream& out, pid_t pid, ProcMaps& maps)
             }
 
             // update file size
-            dprint("read %lu bytes", len);
+            dprint("read %lu bytes", got);
 
         } // for addr 
  
