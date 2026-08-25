@@ -1593,6 +1593,7 @@ Coredump::Coredump(pid_t pid)
       _arch(ARCH_X64),
 #endif
       _acore_version(ACORE_VERSION),
+      _crash_sig(0),   // B199: 非 0 时 WriteThreadMeta 覆盖所有线程 si_signo
       // 按 core.h 成员声明顺序（_ptrace_options 在 _ehdr/_note_phdr 之前）
       _ptrace_options(0),
       _ehdr(),
@@ -1783,6 +1784,13 @@ int Coredump::WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main) {
     if (rc != 0) { warn("getfpregs thread %d failed, zeroed block", pid); fp_ok = 0; }
     rc = ptrace(PTRACE_GETSIGINFO, pid, 0, &i._siginfo);
     if (rc != 0) { warn("getsiginfo thread %d failed, zeroed block", pid); }
+    // B199: monitor 崩溃采集时所有线程 pr_cursig 应为进程崩溃信号（内核原生 core
+    // 如此，gdb 按线程信号显示"Program terminated"）——worker 线程停在 attach 的
+    // SIGSTOP，不覆盖则 gdb 报 "SIGSTOP" 误导（实证：改 pr_cursig 后 gdb 正确显示
+    // SIGSEGV）。generate/forkcore（非崩溃）_crash_sig==0，保持各自 stop 信号。
+    if (_crash_sig != 0) {
+        i._siginfo.si_signo = _crash_sig;
+    }
     if (_arch == ARCH_X64) {
         rc = pt_getxstateregs(pid, (x64_xstatereg*)&i._xstate);
         if (rc != 0) { warn("getxstateregs thread %d failed, zeroed block", pid); fp_ok = 0; }
@@ -4071,6 +4079,9 @@ int Coredump::monitor(const char* corefile)
     // generate/forkcore/forkcore_m 入口的清理保持一致。
     _phdrs.clear();
     _core_pid = 0;
+    // B199: 崩溃采集时所有线程 pr_cursig 用进程崩溃信号（WriteThreadMeta 覆盖
+    // si_signo）——worker 线程停在 attach SIGSTOP，不覆盖则 gdb 报 "SIGSTOP"。
+    _crash_sig = exit_sig;
 
     // R50-6: 崩溃采集的失败路径同样要让崩溃进程死亡——成功路径末尾对每个线程
     // PTRACE_DETACH(exit_sig) 重投崩溃信号；失败路径若只 detach(NULL) 或直接

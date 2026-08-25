@@ -338,6 +338,10 @@ private:
     pid_t _core_pid;        // forked core's pid
     int _arch;              // ARCHTYPE
     int _acore_version;     // v3: 读到的 acore 版本（THREAD 块尾部 FP 有效位仅 v3+）
+    int _crash_sig;         // B199: monitor 崩溃采集的进程崩溃信号（非 0 时 WriteThreadMeta
+                            // 覆盖所有线程 si_signo——内核原生 core 全部线程 pr_cursig 都是
+                            // 崩溃信号，gdb 按线程信号显示；不覆盖则 worker pr_cursig=SIGSTOP
+                            //（attach 停靠），多线程崩溃 core 被 gdb 报 "SIGSTOP" 误导）
     // 内核没有 PTRACE_GETOPTIONS；arthur 需要自己跟踪给目标设过的 ptrace
     // options（pt_monitor 设 TRACEEXIT，forkcore_m 临时叠加 TRACEFORK），
     // 以便在清除 TRACEFORK 时把 TRACEEXIT 恢复回去（B39）。
