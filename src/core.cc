@@ -1023,12 +1023,14 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
                 // 注入函数/壳代码 ret 到模拟返回地址 0 产生的**页面 fault**（fetch
                 // 0 或执行 NX 栈页——实测 fork 壳代码的完成 fault si_addr 是栈地址、
                 // si_code=SEGV_ACCERR，因此 si_addr 不可靠）。kill 投递的 SIGSEGV
-                // 无 fault，si_code=SI_USER(0)。注入函数是 syscall 包装不内部 fault，
-                // 故注入期间唯一非 fault 的 SIGSEGV 就是 kill 投递的真实崩溃——
-                // 用 si_code==SI_USER 判定（实证：mmap 注入期间 kill -SEGV → 原实现
-                // 把崩溃当完成、mmap 返回 0x1、目标"复活"崩溃漏抓）。
+                // 无 fault，si_code=SI_USER(0) 或 SI_TKILL（tgkill）。注入函数是 syscall
+                // 包装不内部 fault，故注入期间唯一非 fault 的 SIGSEGV 就是 kill 投递的
+                // 真实崩溃——用 si_code==SI_USER/SI_TKILL 判定（实证：mmap 注入期间
+                // kill -SEGV → 原实现把崩溃当完成、mmap 返回 0x1、目标"复活"崩溃漏抓；
+                // B196: 漏 SI_TKILL 会漏掉兄弟线程 tgkill 的崩溃）。
                 siginfo_t si;
-                if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) != 0 || si.si_code == SI_USER) {
+                if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) != 0 ||
+                    si.si_code == SI_USER || si.si_code == SI_TKILL) {
                     error("SIGSEGV si_code=%d during injection (real crash, not completion)",
                           si.si_code);
                     return fail("crash during injection");

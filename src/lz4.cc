@@ -504,9 +504,23 @@ ProcFile* Lz4Stream::GetFile()
         return NULL;
     }
 
+    // B194: 合法序列化恒有 size == sizeof(ProcFile) + pf->f_size（PutFile 写
+    // pf->Size()）。外层 size 前缀被位翻转改大时，GetFile 会越过本文件逻辑
+    // 边界吞掉后续 FILE 块的 size 前缀（跨文件错位）；用真实头字段 pf->f_size
+    // 做确定性边界证明——改大必不匹配 → fail-closed，杜绝按伪造 f_size 逃逸
+    // 的垃圾 ProcFile。改小同样被拒（此前 B37 是钳制继续，现在更严格地拒绝）。
+    // 必须在下方 B37 覆盖 pf->f_size 之前检查。
+    if (size != sizeof(ProcFile) + pf->f_size) {
+        error("proc file size %u mismatch header f_size %u (acore corrupt)",
+              size, pf->f_size);
+        free(pf);
+        return NULL;
+    }
+
     // B37: 损坏 acore 可让内部 f_size 大于实际 malloc 缓冲（size），后续
     // ProcAuxv/ProcCmdline/ProcStat 按 f_size 读会越界。钳制到真实缓冲大小。
     // （size >= sizeof(ProcFile) 已保证上方，f_data 长度即 size - 头部。）
+    // 通过 B194 校验后此处恒为 no-op（size - 头部 == pf->f_size），仅作兜底。
     pf->f_size = size - sizeof(ProcFile);
 
     return pf;
