@@ -91,6 +91,7 @@ int main(int argc, char *argv[])
     int ch;
     int mode_set = 0;   // R50-6: 记录 mode 选项个数，冲突检测
     int pid_set = 0;    // R50-29: 是否显式给了 -p（区分"没给"与"给了非法值"）
+    int op_set = 0;     // b181: 记录 -c/-m 主操作个数（-c -m 同给须拒绝）
     while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
         switch (ch) {
 
@@ -113,11 +114,13 @@ int main(int argc, char *argv[])
 
         case 'm':   // merge
             cfg.op = ARTHUR_OP_MERGE;
+            op_set++;
             break;
 
         case 'c':   // core
             cfg.op = ARTHUR_OP_DECOMPRESS;
             cfg.metafile = strdup(optarg);
+            op_set++;
             break;
 
         case 'o':   // output
@@ -163,6 +166,12 @@ int main(int argc, char *argv[])
     if (mode_set > 1) {
         error("conflicting mode options (-0/-1/-2/-3 are mutually exclusive)");
         return -1;
+    }
+    // b181 (Codex B181 review): -c 与 -m 两个主操作同样"最后一个生效"静默覆盖
+    //（`-c x -m` 执行 merge、`-m -c x` 执行 decompress）。op_set>1 显式拒绝。
+    if (op_set > 1) {
+        error("conflicting operations (-c convert and -m merge are mutually exclusive)");
+        return 2;
     }
     // R50-29: -p 与 -c/-m 冲突（capture vs decompress/merge）——原实现分支优先级
     // 静默决定，-c/-m 被无视，用户输入错误却执行了另一件事。显式拒绝。

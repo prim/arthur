@@ -237,7 +237,14 @@ int Lz4Stream::WriteBlock(const char *s, size_t n, BlockType t)
 {
     int rc;
     size_t m = 0;
-    
+
+    // b193 (Codex B193 review): 返回值是 int——n>INT_MAX 时 `return (int)m` 截断成
+    // 负值/垃圾。当前调用方单块 ≤ BLOCK_SIZE 不可达，纵深防护与 Write 入口对齐。
+    if (n > INT_MAX) {
+        error("WriteBlock size %zu exceeds INT_MAX, aborting", n);
+        return -1;
+    }
+
     // get a new block
     // B70: Flush 失败（磁盘满）时当前块未密封；继续写会让 acore 错位。传播错误。
     if (Flush() < 0) {
