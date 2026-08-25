@@ -3470,7 +3470,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     bool group_stop_event = false;
     // B189: 注入期间 leader 崩溃（B158 fail-closed 检测到）后保留 delivery-stop——
     // 置位后下方 pt_cont 跳过（CONT(0) 会抑制崩溃信号、目标复活、崩溃丢失）。
+    // relay_sig：被捕获崩溃的中继信号——延迟到 SETOPTIONS（清 TRACEFORK，需 leader
+    // 停止）之后、pt_cont 段用 CONT(sig) 交付（立即 CONT 会让 SETOPTIONS 对运行中
+    // leader 失败、TRACEFORK 残留 → 后续 fork 子进程被冻结）。
     bool crash_preserved = false;
+    int relay_sig = 0;
     if(WIFSTOPPED(s)) {
         sig = WSTOPSIG(s);
         // B66: dump 窗口（pt_cont 后 TRACEFORK 仍设）内 leader 自己 fork 会触发
@@ -3588,8 +3592,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             if (signal_is_caught(_pid, ic)) {
                 info("leader %d stopped at caught %s after injection; relaying to "
                      "handler (not crash collection)", _pid, strsignal(ic));
-                ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) ic);
-                crash_preserved = true;   // 已 CONT 恢复，跳过下方 pt_cont
+                relay_sig = ic;   // 延迟到 SETOPTIONS 之后用 CONT(sig) 中继
+                crash_preserved = true;
             } else {
                 info("leader %d crashed in %s after injection; preserving crash stop "
                      "for crash collection", _pid, strsignal(ic));
@@ -3619,8 +3623,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             error("group-stop leader %d: PTRACE_LISTEN failed (%s)", _pid, strerror(errno));
         }
     } else if (crash_preserved) {
-        // B189: 注入后崩溃的 delivery-stop 已保留（或已 CONT 中继）——不 CONT，
-        // 避免 CONT(0) 抑制崩溃信号、目标复活、崩溃丢失。保留停靠供崩溃采集。
+        // B189: 注入后崩溃——保留 delivery-stop 供崩溃采集（不 CONT，避免 CONT(0)
+        // 抑制崩溃信号）；被捕获则 CONT(sig) 中继走 handler（SETOPTIONS 已在 leader
+        // 停止时清 TRACEFORK）。
+        if (relay_sig) {
+            ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) relay_sig);
+        }
     } else if(!WIFSTOPPED(s) || stopped_at_ptrace_event) {
         pt_cont(_pid);
     }
