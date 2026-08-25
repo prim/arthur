@@ -1052,7 +1052,14 @@ static inline int pt_attach(pid_t pid)
     // R50-22: pt_wait 超时（线程 D 态不可停，SIGSTOP 无法交付）时 attach 虽成功但
     // tracee 未停靠——若当成功，WriteThreadMeta 写零化块、结尾 DETACH 失败残留
     // PT_PTRACED+SIGSTOP，D 态解除后线程永久冻结。传播失败让调用方 fail-closed。
+    // B179: 仅传播失败仍把 tracee 留在 PT_PTRACED+SIGSTOP——arthur 退出后内核自动
+    // detach 不恢复 TASK_STOPPED，D 态线程解除后 SIGSTOP 交付、永久冻结。撤销已成功
+    // 的 attach：DETACH 清 PT_PTRACED（对运行中/D 态 tracee 同样有效），SIGCONT 取消
+    // pending SIGSTOP。best-effort——失败则维持原状（与不修等价），正常路径不受影响。
     if (pt_wait(pid) < 0) {
+        if (ptrace(PTRACE_DETACH, pid, NULL, (void*)SIGCONT) != 0) {
+            warn("pt_attach: detach %d after timeout failed (%s)", pid, strerror(errno));
+        }
         return -1;
     }
 
@@ -1540,18 +1547,32 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
     char buf[BUFFER_SIZE];
     // B29: 原实现忽略 ReadPid 返回值——读失败时 NULL 传入 PutFile（NULL 解引用
     // 崩溃）或未初始化 buf 被当 ProcFile 写出垃圾。这里逐项检查，失败即返回 -1。
-    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_CMDLINE)) {
-        error("read cmdline of %d failed", _pid); return -1;
-    }
-    if (out.PutFile((ProcFile*) buf) < 0) {
-        error("write proc file failed (disk full?)");
+    // B180: 与 maps 的 R50-31 对齐——cmdline/auxv/environ/io/limits 超 1MB 缓冲
+    // 截断时也 fail-closed（原实现静默把截断数据当完整写入 acore，解压端 64MB
+    // 上限不会兜底，截断透传到生成的 core）。真实进程这些文件极少超 1MB
+    //（environ 在巨型环境变量场景可达）。
+    auto read_pid_checked = [&](ProcType t, const char* what) -> int {
+        bool truncated = false;
+        ProcFile* pf = ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, t, &truncated);
+        if (!pf) {
+            error("read %s of %d failed", what, _pid);
+            return -1;
+        }
+        if (truncated) {
+            error("%s of %d exceeds buffer (%ld bytes), refusing incomplete dump",
+                  what, _pid, (long)BUFFER_SIZE);
+            return -1;
+        }
+        if (out.PutFile(pf) < 0) {
+            error("write %s failed (disk full?)", what);
+            return -1;
+        }
+        return 0;
+    };
+    if (read_pid_checked(PROC_TYPE_CMDLINE, "cmdline") != 0) {
         return -1;
     }
-    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_AUXV)) {
-        error("read auxv of %d failed", _pid); return -1;
-    }
-    if (out.PutFile((ProcFile*) buf) < 0) {
-        error("write proc file failed (disk full?)");
+    if (read_pid_checked(PROC_TYPE_AUXV, "auxv") != 0) {
         return -1;
     }
 
@@ -1579,25 +1600,13 @@ int Coredump::WriteProcessMeta(Lz4Stream& out, ProcMaps& maps)
     // 悬垂指针（_pf==NULL 时 readline/Parse 安全返回 0）。
     maps.setpf(NULL);
 
-    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_ENVIRON)) {
-        error("read environ of %d failed", _pid); return -1;
-    }
-    if (out.PutFile((ProcFile*) buf) < 0) {
-        error("write proc file failed (disk full?)");
+    if (read_pid_checked(PROC_TYPE_ENVIRON, "environ") != 0) {
         return -1;
     }
-    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_IO)) {
-        error("read io of %d failed", _pid); return -1;
-    }
-    if (out.PutFile((ProcFile*) buf) < 0) {
-        error("write proc file failed (disk full?)");
+    if (read_pid_checked(PROC_TYPE_IO, "io") != 0) {
         return -1;
     }
-    if (!ProcFile::ReadPid(buf, BUFFER_SIZE, _pid, PROC_TYPE_LIMITS)) {
-        error("read limits of %d failed", _pid); return -1;
-    }
-    if (out.PutFile((ProcFile*) buf) < 0) {
-        error("write proc file failed (disk full?)");
+    if (read_pid_checked(PROC_TYPE_LIMITS, "limits") != 0) {
         return -1;
     }
 
@@ -2476,6 +2485,12 @@ int Coredump::generate(const char *corefile)
     // LOADS/ELF → 坏 acore。检查并清理部分产物。
     if (WriteThreadMeta(out, _pid, true) != 0) {
         error("write leader thread meta failed");
+        // B178: 同函数其余失败路径全部 detach——缺 detach 时已 attach 线程（含 leader）
+        // 残留 PT_PTRACED+SIGSTOP，arthur 退出后内核自动 detach 不恢复 TASK_STOPPED，
+        // 目标永久冻结（磁盘满等 WriteThreadMeta 失败是 B64-B70 同触发类）。
+        for (pid_t& tid : _process._thrd_pid) {
+            pt_detach(tid);
+        }
         out.Close();
         unlink(corefile);
         return -1;
@@ -2486,6 +2501,11 @@ int Coredump::generate(const char *corefile)
 
         if (WriteThreadMeta(out, tid) != 0) {
             error("write thread meta of %d failed", tid);
+            // B178: 兄弟线程 WriteThreadMeta 失败同 leader——必须 detach 已 attach
+            // 的兄弟，否则目标冻结（对称遗漏，forkcore 已用 restore 修复）。
+            for (pid_t& t : _process._thrd_pid) {
+                pt_detach(t);
+            }
             out.Close();
             unlink(corefile);
             return -1;
