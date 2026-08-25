@@ -680,6 +680,64 @@ static inline bool regs_has_restart_return(user_regs64_struct &regs)
     long long rax = (long long)regs.get_rc();
     return rax <= -512 && rax >= -516;
 }
+
+// R50-51: forkcore_m 返回给 monitor 的组停靠哨兵（现有 -1=failed / -2=exited）。
+// 组停靠 leader 时 forkcore_m 直接返回它让 monitor 置 leader_in_group_stop——不依赖
+// SIGCHLD siginfo 中继（first-wins 会被 INTERRUPT 噪音污染，见 drain_noise 注释）。
+static const int GROUP_STOP_SENTINEL = -3;
+
+// R50-51: 基于 wait 状态的 leader 崩溃/死亡确定性检出（C134）。崩溃 SIGCHLD 会被
+// coalescing（first-wins）合并进 INTERRUPT 噪音，纯 siginfo 分类无法检出（且注入完成
+// 的 ret-to-0 SIGSEGV 也是 CLD_TRAPPED/SIGSEGV，会误报），必须看实际停靠状态。
+// 返回 >0 崩溃信号；-2 正常退出；0 运行中/无崩溃/非崩溃停靠（非崩溃停靠的 status
+// 已被 waitpid 消费，SIGCHLD 仍在队列留给 monitor 中继）。
+static int detect_leader_death(pid_t pid)
+{
+    int ws = 0;
+    pid_t r = waitpid(pid, &ws, WUNTRACED | WNOHANG);
+    if (r <= 0) {
+        return 0;
+    }
+    if (WIFSIGNALED(ws)) {
+        return WTERMSIG(ws);
+    }
+    if (WIFEXITED(ws)) {
+        return -2;
+    }
+    if (WIFSTOPPED(ws)) {
+        int st = WSTOPSIG(ws);
+        if (st == SIGILL || st == SIGABRT || st == SIGSEGV) {
+            return st;
+        }
+    }
+    return 0;
+}
+
+// R50-51: drain 遗留的 INTERRUPT/ptrace-stop 噪音 SIGCHLD（CLD_STOPPED 且
+// si_status==0）。stale 噪音会留在 pending 队列里，与后续真实信号 coalescing
+// first-wins 遮蔽（C133）——forkcore_m 失败路径（restore CONT leader 后）与收尾
+// 窗口都需要清掉，否则 monitor 出队 status=0 会 CONT(0) 中继，甚至解除组停靠
+//（B172 的"SIGCHLD 中继置位"机制被此破坏，R50-51 改为哨兵直传）。
+// 只吞 CLD_STOPPED/0；遇到非噪音（真实停靠/退出）即停止——调用方必须先调
+// detect_leader_death 兜底崩溃/退出（本函数不判崩溃），顺序保证不吞真实信号。
+static void drain_noise_sigchld(void)
+{
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    struct timespec zero_ts = {0, 0};
+    for (;;) {
+        siginfo_t si;
+        errno = 0;
+        if (sigtimedwait(&mask, &si, &zero_ts) < 0) {
+            break;   // EAGAIN：无 pending
+        }
+        if (si.si_code == CLD_STOPPED && si.si_status == 0) {
+            continue;   // INTERRUPT/ptrace-stop 噪音，吞掉
+        }
+        break;   // 非噪音：已出队消费；崩溃/退出由调用方 detect 兜底，不再多吞
+    }
+}
 // B72: out_inject_rsp/out_orig_word 输出注入时写 0 的 [rsp-8] 槽位与原字——
 // fork 注入后子进程（COW 快照）保留注入的 0，父进程恢复了但 dump 读的子进程没有，
 // 调用方可用这两个值把原字写回子进程，消除快照污染。
@@ -1735,6 +1793,13 @@ void Coredump::restore_target_after_fail()
     if (ptrace(PTRACE_CONT, _pid, NULL, NULL) != 0) {
         error("restore: cont %d failed (%s)", _pid, strerror(errno));
     }
+    // R50-51: 失败路径收尾——drain pt_int/ptrace-stop 遗留的 INTERRUPT 噪音
+    //（CLD_STOPPED/0）。stale 噪音留在 pending 队列会与后续真实崩溃信号 coalescing
+    // first-wins 遮蔽（C133：monitor 出队 status=0 中继 CONT(0) 抑制崩溃）。monitor
+    // 场景 SIGCHLD 被 block，噪音不会自动消失；standalone（SIGCHLD 未 block）下
+    // sigtimedwait 返回 EINVAL、本函数是安全空操作。真实崩溃/退出由调用方（forkcore_m
+    // 收尾 detect_leader_death）另行检出，本函数只清噪音。
+    drain_noise_sigchld();
 }
 
 int Coredump::VerifyFileHeader(Lz4Stream& in)
@@ -3236,6 +3301,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
             ptrace(PTRACE_CONT, _pid, NULL, NULL);
         }
+        // R50-51: 收尾 drain 本 lambda 的 pt_int INTERRUPT 噪音（同 restore 加固，
+        // C133——stale CLD_STOPPED/0 会遮蔽后续真实崩溃信号的 SIGCHLD）。
+        drain_noise_sigchld();
     };
 
     // TBD: dump memory regions
@@ -3453,18 +3521,23 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // monitor 主循环再也等不到该崩溃通知 → leader 冻结 + monitor 永久挂起。
     // 改 sigtimedwait 零超时：只 drain 已 pending 的噪音 SIGCHLD，不阻塞等待，
     // 之后的真实崩溃 SIGCHLD 留给主循环。
-    if (!group_stop_event) {
-        // R50-50: 组停靠时保留该 SIGCHLD（leader 组停靠的 CLD_STOPPED 通知），供
-        // monitor 主循环的 stop-class LISTEN 中继路径置 leader_in_group_stop；否则
-        // 后续对已停 leader 的 SIGUSR1 dump 不被 H2 预检跳过，forkcore_m 的 pt_int
-        // 在已停 tracee 上不产生新停靠、卡 10s 超时。非组停靠仍照旧 drain 噪音。
-        sigset_t mask;
-        sigemptyset(&mask);
-        sigaddset(&mask, SIGCHLD);
-        struct timespec zero_ts = {0, 0};
-        while (sigtimedwait(&mask, NULL, &zero_ts) > 0) {
-            // drain all already-pending noise SIGCHLD; 无则立即返回
+    // R50-51: 零超时 drain 仍会吞掉收尾窗口内已 pending 的崩溃 SIGCHLD（C134，
+    // 崩溃 SIGCHLD 还会被 coalescing 合并进 INTERRUPT 噪音，siginfo 分类判不出）。
+    // 改两步：先 detect_leader_death 按 wait 状态确定性检出收尾窗口内崩溃/退出并
+    // 返回给 monitor；再 drain_noise_sigchld 只清 INTERRUPT 噪音（CLD_STOPPED/0）。
+    // 组停靠场景由此返回 GROUP_STOP_SENTINEL 让 monitor 直接置位（不依赖被 first-wins
+    // 污染的 SIGCHLD siginfo 中继——否则 monitor 出队 status=0 会 CONT(0) 解除组停靠）。
+    int death = detect_leader_death(_pid);
+    if (death != 0) {
+        drain_noise_sigchld();
+        if (death == -2) {
+            return -2;
         }
+        return death;
+    }
+    drain_noise_sigchld();
+    if (group_stop_event) {
+        return GROUP_STOP_SENTINEL;
     }
 
     return sig;
@@ -3534,6 +3607,18 @@ int Coredump::monitor(const char* corefile)
                         error("failed to remove empty acore %s (%s)", corefile, strerror(errno));
                     }
                     return 0;
+                }
+                if (signal_forkcore == GROUP_STOP_SENTINEL) {
+                    // R50-51: forkcore_m 在 dump 窗口内检出 leader 组停靠并已 LISTEN
+                    // 保持停靠（B172）。不依赖 SIGCHLD siginfo 中继（first-wins 会被
+                    // INTERRUPT 噪音污染，出队 status=0 会走 CONT(0) 解除组停靠）。
+                    // 直接置位标志，后续 SIGUSR1 dump 被 H2 预检跳过；SIGCONT 恢复时
+                    // 下方中继路径清标志。
+                    info("leader in group-stop during dump; skipping further dumps "
+                         "until resumed (SIGCONT)");
+                    leader_in_group_stop = true;
+                    signal_forkcore = 0;
+                    continue;
                 }
                 // forkcore_m 失败（fail-closed）：restore_target_after_fail 已 resume
                 // leader，无需、也不应把 -1 当中继信号注入。跳过。
