@@ -282,9 +282,9 @@ public:
     int Seek(long offset);
 
     // open file and create stream
-    int Open(const char *file);   
-    // close file
-    void Close();
+    int Open(const char *file);
+    // close file; b167/b191 (Codex): 返回 Flush/fclose 错误（关闭期 ENOSPC 不再静默）
+    int Close();
 
     void PrintStat();
 

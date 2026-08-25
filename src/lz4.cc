@@ -97,25 +97,34 @@ int Lz4Stream::Open(const char *file)
     return 0;
 }
 
-void Lz4Stream::Close()
+int Lz4Stream::Close()
 {
     // R50-6: 幂等——双重 Close 曾因 fclose(NULL) 使 arthur 自身段错误
     //（forkcore 失败路径复制了 out.Close(); unlink(); 两组）。NULL 时直接返回。
+    // b167/b191 (Codex): 返回 Flush/fclose 错误——关闭期 ENOSPC 不再静默。
     if (!_file) {
-        return;
+        return 0;
     }
 
+    int rc = 0;
     if (_enc) {
         // B191: 收尾 Flush 失败（磁盘满/压缩失败）时未密封块静默丢失、acore 截断。
         // dump/test 路径在 WriteTailMark 前已显式 Flush（Close 的 Flush 通常是空
         // 操作），但作为最后防线失败必须报告而非吞掉。
         if (Flush() < 0) {
             error("Close: final flush failed (disk full?), output truncated");
+            rc = -1;
         }
     }
 
-    fclose(_file);
+    // b191 (Codex B191 review): fclose 才是 stdio 缓冲真正落盘的时机——ENOSPC 可
+    // 到此处才暴露，原实现静默吞掉。
+    if (fclose(_file) != 0) {
+        error("Close: fclose failed (%s), output may be truncated", strerror(errno));
+        rc = -1;
+    }
     _file = NULL;
+    return rc;
 }
 
 // file postion

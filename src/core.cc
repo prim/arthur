@@ -188,10 +188,11 @@ uint64_t get_module_address(pid_t pid, const char* so_path)
     if (!f) {
         return 0;
     }
-    while (!feof(f)) {
+    // b53/b120 (Codex B53/B120 review): 原 `while(!feof)` + 未检查 fgets——首读失败
+    // 时 line 是未初始化栈，读垃圾；空行/失败行会继续处理陈旧内容。改为以 fgets
+    // 成功为循环条件，读不到即正常结束（feof 或 I/O 错误都停止）。
+    while (fgets(line, sizeof(line), f)) {
         // read line
-        fgets(line, sizeof(line), f);
-
         // find path
         cur = 0;
         while (line[cur] && line[cur]!='/') {
@@ -1359,11 +1360,14 @@ int Note::fill_prpsinfo(const ProcessData& proc)
 
     // B63: pr_fname 用 task->comm（stat 括号内文本，可执行名），与内核原生 core
     // 一致。原实现用 argv[0] 全路径，gdb/ps 显示截断的路径而非进程名。
-    // comm 缺失（损坏 acore）时退回 argv[0]。
+    // b63 (Codex B63 review): 合法空 comm（PR_SET_NAME("")）与 stat 缺失/畸形都
+    // 表现为 comm[0]=='\0'，原实现一律回退 argv[0] 与内核不一致。已解析的 stat
+    // 必有 pid>0——仅 pid==0（stat 未解析）才回退 argv[0]；合法空 comm 保持空。
     std::string fname;
     if (proc._threads[0]._d_stat->comm[0] != '\0') {
         fname = proc._threads[0]._d_stat->comm;
-    } else if (proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
+    } else if (proc._threads[0]._d_stat->pid <= 0 &&
+               proc._d_cmdline && proc._d_cmdline->argv.size() > 0) {
         // B26: cmdline 为空时 argv[0] 越界。取 argv[0] 或空串。
         fname = proc._d_cmdline->argv[0];
     }
@@ -2716,9 +2720,14 @@ int Coredump::generate(const char *corefile)
     for (pid_t& tid : _process._thrd_pid) {
         pt_detach(tid);
     }
-    
+
     out.PrintStat();
-    out.Close();
+    // b167/b191: Close 返回关闭期错误（ENOSPC），不再静默返回 0
+    if (out.Close() != 0) {
+        error("generate: final close failed, core removed");
+        unlink(corefile);
+        return -1;
+    }
     return 0;
 }
 
@@ -3057,10 +3066,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         uint64_t gv[2] = {inject_page, 0x1000};
         // R50-1: 返回未检查——目标中途死亡时 regs 未初始化，下面 get_rc() 读垃圾
         // 进日志；注入页泄漏。检查并告警（acore 已有效，仅 best-effort 清理）。
+        // b98 (Codex B98 review): munmap 失败时 regs 保留上次调用的陈旧返回值，
+        // info 无条件打印会把 child pid 误报成 munmap 结果——移入成功分支。
         if (pt_call(_pid, &regs, r_munmap, 2, gv) != 0) {
             warn("munmap injection failed (target died?)");
+        } else {
+            info("munmap = %d", (int)regs.get_rc());
         }
-        info("munmap = %d", (int)regs.get_rc());
     }
 
     // restore program 
@@ -3152,9 +3164,17 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
                 // core 后自行死亡；大目标内核 core dump 可 >10s，pt_call 超时
                 // 触发同一失败路径。两种情况都会让子进程 zombie 残留（目标退出或
                 // 自行 waitpid 才回收）。如实区分告警，不再误导为"target died"。
-                warn("waitpid injection failed (target died, or mode-2 kernel "
-                     "core dump exceeded 10s); fork child %d may linger as a "
-                     "zombie until the target exits", (int)_core_pid);
+                // b165 (Codex B165 review): mode 0 不会出现"mode-2 kernel core dump
+                // 超时"这一原因——按 sys_core 分流，避免误导诊断。
+                if (sys_core) {
+                    warn("waitpid injection failed (target died, or mode-2 kernel "
+                         "core dump exceeded 10s); fork child %d may linger as a "
+                         "zombie until the target exits", (int)_core_pid);
+                } else {
+                    warn("waitpid injection failed (target died?); fork child %d "
+                         "may linger as a zombie until the target exits",
+                         (int)_core_pid);
+                }
             } else {
                 info("waitpid = %d", (int)regs.get_rc());
                 // B73 (Codex B2 review): 目标阻塞在可重启 syscall 时，B16 的 syscall-restart
@@ -3173,7 +3193,12 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 
     info("Process %u paused %0.3f ms.", _pid, ts_pause.timediff()*1000);
     out.PrintStat();
-    out.Close();
+    // b167/b191: Close 返回关闭期错误（ENOSPC），不再静默返回 0
+    if (out.Close() != 0) {
+        error("forkcore: final close failed, core removed");
+        unlink(corefile);
+        return -1;
+    }
     // R50-38: mode 2（sys_core）的元数据 acore 无 magic/LOADS/ELF/尾标
     //（WriteFileHeader/WriteLoads/WriteElfHeader/WriteTailMark 被跳过），且
     // merge(-m) 未实现——产出物（元数据 + 内核 core）无法合并成可用 core，
@@ -3505,10 +3530,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         uint64_t gv[2] = {inject_page, 0x1000};
         // R50-1: 返回未检查——目标中途死亡时 regs 未初始化，下面 get_rc() 读垃圾
         // 进日志；注入页泄漏。检查并告警（acore 已有效，仅 best-effort 清理）。
+        // b98 (Codex B98 review): munmap 失败时 regs 保留上次调用的陈旧返回值，
+        // info 无条件打印会把 child pid 误报成 munmap 结果——移入成功分支。
         if (pt_call(_pid, &regs, r_munmap, 2, gv) != 0) {
             warn("munmap injection failed (target died?)");
+        } else {
+            info("munmap = %d", (int)regs.get_rc());
         }
-        info("munmap = %d", (int)regs.get_rc());
     }
 
     // restore program regs
@@ -3815,7 +3843,13 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
 
     info("Process %u paused %0.3f ms.", _pid, ts_pause.timediff()*1000);
     out.PrintStat();
-    out.Close();
+    // b167/b191: Close 返回关闭期错误（ENOSPC）；失败删除部分 acore，返回 -1
+    // 让 monitor 走 "forkcore failed" 继续监控（目标已恢复运行）。
+    if (out.Close() != 0) {
+        error("forkcore_m: final close failed, partial acore removed");
+        unlink(corefile);
+        return -1;
+    }
 
     // clean pending signal generated above by tracee
     // b38 (Codex review): sigset_t 未 sigemptyset 就在未初始化位图上 sigaddset 是
@@ -4235,7 +4269,12 @@ crash_collect:
         ptrace(PTRACE_DETACH, tid, NULL, (uintptr_t) exit_sig);
     }
     out.PrintStat();
-    out.Close();
+    // b167/b191: Close 返回关闭期错误（ENOSPC）；失败删除部分 core
+    if (out.Close() != 0) {
+        error("monitor crash dump: final close failed, core removed");
+        unlink(corefile);
+        return -1;
+    }
     return 0;
 }
 
@@ -4431,7 +4470,12 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     }
 
     in.Close();
-    fclose(fout);
+    // b167/b191: fclose 是 stdio 缓冲落盘时机——关闭期 ENOSPC 原被忽略、返回 0
+    // 留截断 core。失败走 fail_core 删除部分产物。
+    if (fclose(fout) != 0) {
+        error("close output core failed (%s), core removed", strerror(errno));
+        return fail_core();
+    }
     cleanup_decompress();
     info("saved corefile '%s'.", out_core);
     return 0;
@@ -4541,7 +4585,11 @@ flush_and_close:
     if (WriteTailMark(out) != 0) {
         rc = -1;
     }
-    out.Close();
+    // b167/b191 (Codex): Close 返回 Flush/fclose 错误（关闭期 ENOSPC）——失败时
+    // rc=-1，下方 unlink 部分产物，不再"返回 0 留截断文件"。
+    if (out.Close() != 0) {
+        rc = -1;
+    }
     fclose(fin);
 
     // R50-20 (#3): 失败时遗留带尾标的部分 .z4——脚本按"文件存在+size>0"误判为有效
@@ -4604,7 +4652,12 @@ int Coredump::test_decompress(const char* in_file, const char* out_file)
         }
         file_size += len;
     }
-    fclose(fout);
+    // b167 (Codex B167 review): fclose 才是 stdio 缓冲落盘时机——关闭期 ENOSPC 原
+    // 被忽略、rc 保持 0 且不删除部分输出。检查 fclose，失败置 rc 走下方 unlink。
+    if (fclose(fout) != 0) {
+        error("close output failed (%s), output may be truncated", strerror(errno));
+        rc = -1;
+    }
     in.Close();
 
     // B167: 失败时遗留部分输出（损坏输入/磁盘满短写）——脚本按"文件存在+size>0"
