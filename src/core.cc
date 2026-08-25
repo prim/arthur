@@ -316,7 +316,12 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
             found_first_load = true;
         }
         if (phdrs[i].p_type == ARTHUR_PT_DYNAMIC) {
-            dyn_vaddr = base + phdrs[i].p_vaddr;
+            // C130: 与下方符号公式同源——PT_DYNAMIC 的运行时地址 = 加载基址 +
+            // p_vaddr，加载基址 = base - 首 PT_LOAD p_vaddr。ET_DYN（首段 vaddr=0）
+            // 下等价原 base + p_vaddr；ET_EXEC（非 PIE，p_vaddr 是绝对地址）下
+            // base + p_vaddr 会双倍偏移、读错 .dynamic → 符号解析失败（C130 原
+            // 评估的 fail-closed）。统一修正公式（首 PT_LOAD 未捕获时维持原行为）。
+            dyn_vaddr = base - first_load_vaddr + phdrs[i].p_vaddr;
             break;
         }
     }
