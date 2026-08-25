@@ -136,7 +136,6 @@ int ProcMaps::Parse()
     // B27: PATH_MAX 在 inc.h 被压到 128，真实映射路径（深容器/长库名）会超，
     // 既有 readline 溢出风险又有路径截断。行缓冲与名字缓冲提到 4096。
     const int MAPS_BUF = 4096;
-    char perm[16] = {0};
     char name[MAPS_BUF];
     char line[MAPS_BUF];
 
@@ -144,12 +143,16 @@ int ProcMaps::Parse()
     while (readline(cur, line, sizeof(line))) {
         //printf("%s\n", line);
         MemRegion r = {};
+        // b103 (Codex B103 review): perm 声明在循环外只清零一次——合法行之后出现
+        // 在 %4s 前解析失败的畸形行时，会继承上一行权限（陈旧 perms/私有标志）。
+        // 逐行清零 + 严格校验 sscanf 7 个转换，畸形行整体跳过，不再入表。
+        char perm[16] = {0};
         name[0] = 0;
         int consumed = 0;
         // R50-5: 偏移字段用 %8lx 会截断 ≥4GiB 的映射偏移（内核打印 %08llx 无上限）——
         // 9 位十六进制时 %8lx 读 8 位后空格不匹配，整行解析失败（offset/inode/name 全丢）。
-        // 去掉宽度用 %lx 读全。perm[16] 已初始化为 0，格式不匹配时 perms=0 而非垃圾。
-        sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %n",
+        // 去掉宽度用 %lx 读全。格式不匹配时 perms 保持 0 而非垃圾。
+        int nfields = sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %n",
                 &r.start_addr,
                 &r.end_addr,
                 perm,
@@ -158,6 +161,10 @@ int ProcMaps::Parse()
                 &r.dev_minor,
                 &r.inode,
                 &consumed);
+        if (nfields != 7) {
+            // 畸形/截断行：跳过，不产生继承陈旧权限或部分解析的 region
+            continue;
+        }
         // maps 第 6 列后的路径可能含空格或 (deleted) 后缀；%s 会截断，
         // 用 %n 定位 inode 字段结束位置，取剩余整行为映射名。
         if (consumed > 0 && consumed < (int)sizeof(line)) {

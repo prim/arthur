@@ -2120,7 +2120,11 @@ int Coredump::ReadMeta(Lz4Stream& in)
         // 把 stat 序列化大小也计入预算，超限即拒。
         meta_bytes += td._stat->Size();
         if (meta_bytes > THREAD_META_MAX) {
+            // b116 (Codex B116 review): 超预算时 td 尚未 push_back 进 _threads，
+            // cleanup_decompress 只释放已登记线程的 stat——当前 _stat 需显式释放，
+            // 否则每次失败泄漏 ≤64MB（同进程重复 decompress 会累积）。
             error("thread metadata %zu exceeds budget (with stat), acore corrupt", meta_bytes);
+            free(td._stat);
             return -1;
         }
         _process._threads.push_back(td);
