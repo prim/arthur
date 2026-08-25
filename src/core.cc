@@ -3586,8 +3586,14 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // crash-class delivery-stop → 保留停靠、返回信号走崩溃采集（与 crashed_in_window
         // 对齐）；被捕获则中继（B184）。
         siginfo_t inj_si;
+        // B190: B189 的 GETSIGINFO 检查缺 si_code 区分——注入**完成**的 SIGSEGV 是
+        // ret-to-0 页面 fault（si_code=SEGV_MAPERR/ACCERR），若目标无 SIGSEGV handler，
+        // B189 把它误判为崩溃 → 假崩溃采集 + kill_crashed 杀掉健康目标（实证：正常
+        // SIGUSR1 dump 触发假采集、目标死亡）。只有 kill/tkill 投递的崩溃
+        //（si_code==SI_USER/SI_TKILL）才是真崩溃；同步 fault 在注入上下文=完成。
         if (ptrace(PTRACE_GETSIGINFO, _pid, 0, &inj_si) == 0 &&
-            (inj_si.si_signo == SIGILL || inj_si.si_signo == SIGABRT || inj_si.si_signo == SIGSEGV)) {
+            (inj_si.si_signo == SIGILL || inj_si.si_signo == SIGABRT || inj_si.si_signo == SIGSEGV) &&
+            (inj_si.si_code == SI_USER || inj_si.si_code == SI_TKILL)) {
             int ic = inj_si.si_signo;
             if (signal_is_caught(_pid, ic)) {
                 info("leader %d stopped at caught %s after injection; relaying to "
