@@ -12,6 +12,7 @@
 #include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
+#include <climits>      // INT_MAX (b145: -p pid_t 上界)
 
 #include "core.h"
 #include "proc.h"
@@ -94,8 +95,20 @@ int main(int argc, char *argv[])
         switch (ch) {
 
         case 'p':   // pid
-            cfg.pid = atoi(optarg);
-            pid_set = 1;
+            // b145 (Codex B145 review): atoi 接受 `-p 123junk` 并操作 pid 123、
+            // 超长数字溢出 UB。strtol + 全串 + 正范围校验（真实合法 PID 为正 int）。
+            {
+                char *end = NULL;
+                errno = 0;
+                long v = strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || errno == ERANGE ||
+                    v <= 0 || v > INT_MAX) {
+                    error("invalid pid '%s' (must be a positive integer)", optarg);
+                    return 2;
+                }
+                cfg.pid = (pid_t)v;
+                pid_set = 1;
+            }
             break;
 
         case 'm':   // merge

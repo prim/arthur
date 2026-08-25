@@ -16,6 +16,7 @@
 #include <assert.h>
 #include <fcntl.h>      // open
 #include <errno.h>      // errno (PEEKDATA 判读)
+#include <climits>      // INT_MAX (b141: strtol pid_t 上界)
 #include <dlfcn.h>      // dlsym
 #include <dirent.h>     // readdir
 
@@ -1880,10 +1881,13 @@ int Coredump::collect_threads(pid_t leader)
         if (dp->d_name[0] == '.') continue;
         // R50-22: atoi 对超长数字串溢出是 UB（真实 /proc/task 由内核生成不可触发，
         // 防伪造/损坏 /proc）。strtol + 全串校验。
+        // b141 (Codex B141 review): 还须拒绝 ERANGE 与超出 pid_t 正范围的值——
+        // 否则超长数字串缩窄成 32 位 pid_t 时是实现定义截断（可指向无关进程）。
         char *end = NULL;
         errno = 0;
         long tid = strtol(dp->d_name, &end, 10);
-        if (end == dp->d_name || *end != '\0' || tid <= 0 || tid == leader) continue;
+        if (end == dp->d_name || *end != '\0' || tid <= 0 || tid == leader ||
+            errno == ERANGE || tid > (long)INT_MAX) continue;
         errno = 0;
         if (pt_attach((pid_t)tid) != 0) {
             // B77 (Codex B7 review): 线程可能在枚举与 attach 间退出（ESRCH，跳过）；
@@ -2282,7 +2286,9 @@ int Coredump::WriteElfHeader(Lz4Stream& out)
     // R50-13: e_phnum 是 uint16_t，>0xFFFF 个 phdr 时静默截断（对 65536 取模），
     // gdb 读到的段数错误、大部分 LOAD 段丢失，core 静默损坏无报错。高 vm.max_map_count
     // 生产环境（≥1M）可读 VMA 数可超 65535。未实现 PN_XNUM 扩展编号，fail-closed。
-    if (_phdrs.size() > 0xFFFF) {
+    // b128 (Codex B128 review): 0xFFFF 是 ELF PN_XNUM 保留哨兵，真实数量必须写进
+    // section 0 的 sh_info（Arthur 无该 section），恰 65535 个也须拒绝——用 >= 。
+    if (_phdrs.size() >= 0xFFFF) {
         error("phdr count %zu exceeds uint16 e_phnum limit (acore too fragmented)",
               _phdrs.size());
         return -1;
@@ -2326,7 +2332,8 @@ int Coredump::WriteElfHeader(FILE* fout)
     int rc = 0;
     ssize_t len;
     // R50-13: 同压缩侧——>0xFFFF 个 phdr 时 e_phnum 静默截断，gdb 读段数错误。
-    if (_phdrs.size() > 0xFFFF) {
+    // b128: PN_XNUM 保留值，>= 0xFFFF 即拒（同压缩侧）。
+    if (_phdrs.size() >= 0xFFFF) {
         error("phdr count %zu exceeds uint16 e_phnum limit (core too fragmented)",
               _phdrs.size());
         return -1;
@@ -2553,7 +2560,9 @@ int Coredump::GenerateNotes()
     }
 
     for (Note *nt : _notes) {
-        dprint(" [%x] %d 0x%x", nt->_type, nt->_size, nt->_size);
+        // b133 (Codex B133 review): Note::_size 已是 size_t，%d/%x 与实参类型不匹配
+        // （-DDEBUG 时变参 UB）。改 %zu/%zx。
+        dprint(" [%x] %zu 0x%zx", nt->_type, nt->_size, nt->_size);
         rc += nt->_size;
     }
 
@@ -2770,16 +2779,13 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
                                  "clean snapshot");
                         }
                     } else if (strncmp(line, "SigBlk:", 7) == 0) {
-                        // R50-30 (D4): 目标阻塞 SIGTRAP 时，子进程 `int $3` 的 SIGTRAP
-                        // 挂起不投递，子进程继续执行到 exit(0) 干净退出——不触发内核
-                        // core，mode 2 静默产出无用的 meta 文件。与 SigCgt 同风格告警。
-                        unsigned long long sigblk = 0;
-                        if (sscanf(line + 7, "%llx", &sigblk) == 1 &&
-                            (sigblk & (1ULL << (SIGTRAP - 1)))) {
-                            warn("mode 2: target blocks SIGTRAP; the forked child's "
-                                 "int $3 will be held pending and no kernel core will "
-                                 "be generated");
-                        }
+                        // b148 (Codex B148 review): 原 R50-30 (D4) 假定阻塞 SIGTRAP 时
+                        // int $3 的 SIGTRAP 挂起、子进程继续到 exit(0) 无 core——但
+                        // x86-64/aarch64 的 int $3 是同步硬件异常、强制投递、不受
+                        // sigmask 影响（实测阻塞 SIGTRAP 后 int3 仍以 SIGTRAP 终止）。
+                        // SigBlk 告警是确定性误报，删除。真正的 core 产出应以子进程
+                        // wait status / 实际产物判定。
+                        (void)0;
                     }
                 }
                 fclose(sf);
