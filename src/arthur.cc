@@ -157,6 +157,14 @@ int main(int argc, char *argv[])
         error("-p (capture) conflicts with -c/-m (convert/merge)");
         return 2;
     }
+    // B181: mode 选项（-0/-1/-2/-3）与 -c/-m 组合时被静默忽略——`-c acore -1 file`
+    // 实际执行 decompress（-1 被无视）、`-1 file -m` 落入 merge——与 -p 的 R50-29
+    // 检查同 class 的对称缺口（mode 选项在 test 工具里复用：`-1 file` 是 test_compress、
+    // `-2 in out` 是 test_decompress，op==GENERATE 时合法，不触发此检查）。
+    if (mode_set && cfg.op != ARTHUR_OP_GENERATE) {
+        error("mode option (-0/-1/-2/-3) conflicts with -c/-m (convert/merge)");
+        return 2;
+    }
     // R50-29: -p 0 / -p abc（atoi 得 0）被静默当"无 -p"，落到 test_compress/
     // test_decompress，操作类型被切换。非法 pid 显式拒绝。
     if (pid_set && cfg.pid <= 0) {
@@ -217,17 +225,45 @@ int main(int argc, char *argv[])
             return 2;
         }
         const char *file = argv[optind];
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s.z4", file);
-        return dump.test_compress(file, buf);
+        // B182/B183: 用户显式 -o 优先用，不再静默丢弃（原实现写死 <file>.z4）；
+        // 无 -o 时输出名动态拼接——原 128 字节栈缓冲对长路径截断，截断后不再等于
+        // <file>.z4、可能写到意外路径/同名冲突。
+        const char *out = cfg.output;
+        char *derived = NULL;
+        if (!out) {
+            size_t need = strlen(file) + 4;   // ".z4" + NUL
+            derived = (char*)malloc(need);
+            if (!derived) {
+                error("test_compress: out of memory");
+                return 2;
+            }
+            snprintf(derived, need, "%s.z4", file);
+            out = derived;
+        }
+        int rc = dump.test_compress(file, out);
+        free(derived);
+        return rc;
     } else if (cfg.mode == 2) {
-        // R50-1: 缺输出文件时 argv[optind+1] 为 NULL——fopen(NULL,"wb") 崩溃。
-        if (optind + 1 >= argc) {
-            error("test_decompress: missing output file");
+        // R50-1: 缺输入文件时 argv[optind] 为 NULL——fopen(NULL,"rb") 崩溃。
+        if (optind >= argc) {
+            error("test_decompress: missing input file");
             return 2;
         }
         const char *in_file = argv[optind];
-        const char *out_file = argv[optind+1];
+        // B182: test_decompress 同样支持 -o 作输出（原实现只认位置参数、-o 被静默
+        // 丢弃，且缺位置输出参数时误报 "missing output file"）。-o 与位置输出同给
+        // 视为歧义显式拒绝。
+        const char *out_file = cfg.output;
+        if (!out_file) {
+            if (optind + 1 >= argc) {
+                error("test_decompress: missing output file");
+                return 2;
+            }
+            out_file = argv[optind + 1];
+        } else if (optind + 1 < argc) {
+            error("test_decompress: ambiguous -o and positional output both given");
+            return 2;
+        }
         return dump.test_decompress(in_file, out_file);
     }
 
