@@ -119,6 +119,7 @@ static __used__ void inject_fork(void)
         "ret \n"
     "inject_child: \n"
         "brk #0 \n"             // generate a core by SIGTRACE
+    "inject_exit: \n"
         "mov x8, #93 \n"        // exit(0)
         "mov x0, #0 \n"
         "svc #0 \n"
@@ -140,6 +141,7 @@ static __used__ void inject_fork(void)
         "ret \n"
     "inject_child: \n"
         "int $3 \n"         // generate a core by SIGTRACE
+    "inject_exit: \n"
         "mov $60, %rax \n"  // exit(0)
         "mov $0, %rdi \n"
         "syscall \n"
@@ -781,6 +783,33 @@ static void drain_noise_sigchld(void)
 // 中 fork 已成功（子进程冻结在 EVENT_FORK stop）但 pt_call 之后失败时，调用方据此
 // SIGKILL 回收，否则子进程残留为 arthur 的 tracee（arthur 退出才释放并执行注入
 // 壳代码尾部，int $3 崩溃/exit）。
+// B195: DETACH(SIGKILL) 的 SIGKILL 与子进程壳代码 int $3 的竞态——SIGKILL 落地前
+// 子进程已执行 int $3，SIGTRAP 默认动作转储内核 core（monitor 每次 SIGUSR1 dump
+// 在目标 cwd 留 core.<comm>.<host>.<pid>；forkcore 因 leader 保持停止、SIGKILL
+// 恰好先落地而不留）。把子进程 rip 指到 exit(0) 序列（跳过 int $3）：SIGKILL 先到
+// 则 SIGKILL 杀、子进程先跑则干净 exit(0)，两条路都不转储 core。mode-2（sys_core）
+// 子进程非 tracee（GETREGS 失败直接返回），int $3 内核 core 正是 merge 所需，不受
+// 影响。调用方在 SIGKILL detach 前调用。
+static inline void pt_child_skip_int3(pid_t child, uint64_t inject_page,
+                                      long inject_exit_off)
+{
+    if (child <= 0 || inject_page == 0 || inject_exit_off <= 0) {
+        return;
+    }
+    user_regs64_struct cregs;
+    if (ptrace(PTRACE_GETREGS, child, 0, &cregs) != 0) {
+        // 子进程不可用（非 tracee / 已消失）——维持原 SIGKILL detach 行为。
+        return;
+    }
+#ifdef __aarch64__
+    cregs.pc = inject_page + (uint64_t)inject_exit_off;
+#else
+    cregs.rip = inject_page + (uint64_t)inject_exit_off;
+#endif
+    if (ptrace(PTRACE_SETREGS, child, 0, &cregs) != 0) {
+        // 设置失败维持原状，不掩盖错误。
+    }
+}
 static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, int argc,
                           uint64_t argv[], uint64_t *out_inject_rsp = NULL,
                           uint64_t *out_orig_word = NULL,
@@ -2826,6 +2855,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     user_regs64_struct regs;
 
     uint64_t inject_page = 0;
+    long inject_exit_off = 0;   // B195: 子进程 exit(0) 序列相对 inject_begin 偏移
     {
         //uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
         uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
@@ -2868,15 +2898,18 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
 
     // inject fork
     {
-        char *inject_begin=0, *inject_end=0; 
+        char *inject_begin=0, *inject_end=0, *inject_exit=0;
 #ifdef __aarch64__
         asm ("adr %0, inject_begin\n" : "=r" (inject_begin));
         asm ("adr %0, inject_end\n" : "=r" (inject_end));
+        asm ("adr %0, inject_exit\n" : "=r" (inject_exit));
 #else
         asm ("mov $inject_begin, %0 \n" : "=r" (inject_begin));
         asm ("mov $inject_end, %0 \n" : "=r" (inject_end));
+        asm ("mov $inject_exit, %0 \n" : "=r" (inject_exit));
 #endif
         int inject_size = (inject_end - inject_begin);
+        inject_exit_off = (long)(inject_exit - inject_begin);
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
         // B159: 必须从 inject_begin 拷贝，不能从 inject_fork（函数首）——inject_size
         // 只量 asm 块（inject_end - inject_begin），而函数首在 -O0 下多 4 字节前导
@@ -2965,6 +2998,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         // TRACEFORK 停止态 tracee 泄漏（若目标有 SIGTRAP handler，detach 后
         // 重投的 SIGTRAP 被处理，子进程作为目标副本继续存活）。统一先杀。
         auto kill_fork_child = [&]() -> void {
+            pt_child_skip_int3(_core_pid, inject_page, inject_exit_off);   // B195
             ptrace(PTRACE_DETACH, _core_pid, NULL, SIGKILL);
         };
         // write acore
@@ -3001,6 +3035,10 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     }
 
     // kill the forked process
+    // B195: SIGKILL 前把子进程 rip 指到 exit(0)（跳过 int $3），避免 SIGKILL 竞态
+    // 下 int $3 先执行、SIGTRAP 默认转储内核 core（monitor 每次 SIGUSR1 dump 在
+    // 目标 cwd 留 core.* 文件）。
+    pt_child_skip_int3(_core_pid, inject_page, inject_exit_off);
     ptrace(PTRACE_DETACH, _core_pid, NULL, SIGKILL);
     //assert(rc == 0);
 
@@ -3221,6 +3259,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // get a page for shellcode
     user_regs64_struct regs;
     uint64_t inject_page = 0;
+    long inject_exit_off = 0;   // B195: 子进程 exit(0) 序列相对 inject_begin 偏移
     {
         uint64_t gv[6] = {0, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0};
         // B57: pt_call 失败（目标中途死亡）时不填充 regs。forkcore 同位置有检查，
@@ -3259,15 +3298,18 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
 
     // inject fork
     {
-        char *inject_begin=0, *inject_end=0; 
+        char *inject_begin=0, *inject_end=0, *inject_exit=0;
 #ifdef __aarch64__
         asm ("adr %0, inject_begin\n" : "=r" (inject_begin));
         asm ("adr %0, inject_end\n" : "=r" (inject_end));
+        asm ("adr %0, inject_exit\n" : "=r" (inject_exit));
 #else
         asm ("mov $inject_begin, %0 \n" : "=r" (inject_begin));
         asm ("mov $inject_end, %0 \n" : "=r" (inject_end));
-#endif        
+        asm ("mov $inject_exit, %0 \n" : "=r" (inject_exit));
+#endif
         int inject_size = (inject_end - inject_begin);
+        inject_exit_off = (long)(inject_exit - inject_begin);
         dprint("inject_range(%p - %p), size(%d)", inject_begin, inject_end, inject_size);
         // B159: 必须从 inject_begin 拷贝，不能从 inject_fork（函数首）——inject_size
         // 只量 asm 块（inject_end - inject_begin），而函数首在 -O0 下多 4 字节前导
@@ -3370,6 +3412,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 子进程（auto-attach 冻结）未被回收。先杀子进程、再 INTERRUPT 停住 leader 清
     // TRACEFORK（保留 TRACEEXIT）再 CONT。
     auto recover_after_resume = [&]() -> void {
+        pt_child_skip_int3(_core_pid, inject_page, inject_exit_off);   // B195
         ptrace(PTRACE_DETACH, _core_pid, NULL, SIGKILL);   // 回收冻结的 fork 子进程
         if (pt_int(_pid) == 0) {                            // 停住 leader 才能 SETOPTIONS
             ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
@@ -3413,6 +3456,10 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     }
 
     // kill the forked process
+    // B195: SIGKILL 前把子进程 rip 指到 exit(0)（跳过 int $3），避免 SIGKILL 竞态
+    // 下 int $3 先执行、SIGTRAP 默认转储内核 core（monitor 每次 SIGUSR1 dump 在
+    // 目标 cwd 留 core.* 文件）。
+    pt_child_skip_int3(_core_pid, inject_page, inject_exit_off);
     ptrace(PTRACE_DETACH, _core_pid, NULL, SIGKILL);
     // assert(rc == 0);
 
