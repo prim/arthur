@@ -751,6 +751,29 @@ static int detect_leader_death(pid_t pid)
     return 0;
 }
 
+// B197: 注入失败时探测 leader 是否停在真实崩溃 delivery-stop（B158 已检出
+// "crash during injection"、GETSIGINFO 可见 si_code==SI_USER/SI_TKILL）。restore
+// 的 CONT(0) 会抑制该崩溃信号 → 目标"复活"、崩溃丢失（实证：失败 dump 窗口
+// kill-SEGV 后目标存活、无采集）。调用方据此返回崩溃信号让 monitor 采集。
+static int probe_crash_stop(pid_t pid)
+{
+    int ws = 0;
+    pid_t r = waitpid(pid, &ws, WUNTRACED | WNOHANG);
+    if (r > 0 && WIFSTOPPED(ws)) {
+        int st = WSTOPSIG(ws);
+        if (st == SIGILL || st == SIGABRT || st == SIGSEGV) {
+            return st;
+        }
+    }
+    siginfo_t si;
+    if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 &&
+        (si.si_signo == SIGILL || si.si_signo == SIGABRT || si.si_signo == SIGSEGV) &&
+        (si.si_code == SI_USER || si.si_code == SI_TKILL)) {
+        return si.si_signo;
+    }
+    return 0;
+}
+
 // R50-51: drain 遗留的 INTERRUPT/ptrace-stop 噪音 SIGCHLD（CLD_STOPPED 且
 // si_status==0）。stale 噪音会留在 pending 队列里，与后续真实信号 coalescing
 // first-wins 遮蔽（C133）——forkcore_m 失败路径（restore CONT leader 后）与收尾
@@ -3266,6 +3289,33 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // 此处漏掉（R50-1）——未检查会在下面把未初始化的 get_rc() 当 inject_page
         // 继续注入。fail-closed 还原目标。
         if (pt_call(_pid, &regs, r_mmap, 6, gv) != 0) {
+            // B197: 并发崩溃（B158 "crash during injection"）时 leader 停在崩溃
+            // delivery-stop——restore_target_after_fail 的 CONT(0) 会抑制崩溃信号、
+            // 目标"复活"崩溃丢失（实证：失败 dump 窗口 kill-SEGV 后目标存活、无
+            // 采集）。先探测崩溃并返回给 monitor 采集（保留停靠不 CONT；被捕获则
+            // CONT(sig) 中继走 handler，与 B184 对齐）。
+            int crash = probe_crash_stop(_pid);
+            if (crash != 0) {
+                if (signal_is_caught(_pid, crash)) {
+                    info("leader stopped at caught %s after failed injection; relaying to handler",
+                         strsignal(crash));
+                    ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);
+                    ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) crash);
+                } else {
+                    info("leader stopped at %s after failed injection; returning to collect",
+                         strsignal(crash));
+                    for (pid_t& tid : _process._thrd_pid) {
+                        if (tid != _pid) {
+                            ptrace(PTRACE_DETACH, tid, NULL, NULL);
+                        }
+                    }
+                    _process._thrd_pid.clear();
+                    ptrace(PTRACE_SETOPTIONS, _pid, 0, _ptrace_options);   // 清 TRACEFORK，不 CONT
+                }
+                out.Close();
+                unlink(corefile);
+                return crash;
+            }
             error("mmap injection failed (target died?)");
             pt_setregs(_pid, &saved_regs);
             restore_target_after_fail();
