@@ -3832,9 +3832,17 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
  * SIGSEGV, SIGABRT, SIGILL; able to produce corefile
  * on SIGUSR1
  */
-int Coredump::monitor(const char* corefile) 
-{   
+int Coredump::monitor(const char* corefile)
+{
     int rc;
+    // B201: 提前声明——attach 窗口崩溃检测可能 goto crash_collect，跨越这些变量
+    // 的初始化（C++ goto 规则）。
+    int exit_sig = 0;
+    int signal_forkcore = 0;    // signal generated due to free section in forkcore
+    unsigned dump_seq = 0;      // B58: SIGUSR1 dump 单调序号，避免同秒文件名覆盖
+    siginfo_t sig_info;
+    bool leader_in_group_stop = false;
+    sigset_t mask;
     Lz4Stream out(Lz4Stream::LZ4_Compress);
     rc = out.Open(corefile);
     if (rc < 0) {
@@ -3862,23 +3870,46 @@ int Coredump::monitor(const char* corefile)
     _ptrace_options = PTRACE_O_TRACEEXIT;
     info("Launched in monitor mode");
 
+    // B201: 目标在 pt_monitor 初始 attach 窗口崩溃（fault/kill 落在 SEIZE/pt_int
+    // 期间）时，SIGSEGV delivery-stop 的 SIGCHLD 被 pt_int/pt_wait 消费/合并吞掉
+    //（monitor SigPnd=0、wchan=do_sigtimedwait），目标停在 delivery-stop（state=t）、
+    // monitor 阻塞 sigwaitinfo 永久挂起、崩溃既不采集也不杀目标（实证 3/3）。用
+    // waitpid 状态（免疫 SIGCHLD 合并）检测 attach 窗口崩溃：无 handler → exit_sig
+    // 走崩溃采集；有 handler → CONT(sig) 中继；已退出 → 清理返回。
+    {
+        int death = detect_leader_death(_pid);
+        if (death != 0) {
+            if (death == -2) {
+                info("process %d exited during monitor attach", _pid);
+                out.Close();
+                unlink(corefile);
+                return 0;
+            }
+            if ((death == SIGILL || death == SIGABRT || death == SIGSEGV) &&
+                signal_is_caught(_pid, death)) {
+                info("leader %d stopped at caught %s during attach; relaying to handler",
+                     _pid, strsignal(death));
+                ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) death);
+            } else {
+                info("leader %d crashed during attach (%s); collecting",
+                     _pid, strsignal(death));
+                exit_sig = death;
+                goto crash_collect;
+            }
+        }
+    }
+
     // block all signals
     // b38 (Codex review): 未 sigemptyset 的 sigset_t 直接 sigaddset 是 UB，
     // 垃圾位会被 SIG_BLOCK 阻塞任意信号并进入 sigwaitinfo 等待集合。
-    sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD); // signal from tracee
     sigaddset(&mask, SIGUSR1); // signal for generating corefile while monitor
     sigprocmask(SIG_BLOCK, &mask, NULL);
 
-    int exit_sig = 0;
-    int signal_forkcore = 0; // signal generated due to free section in forkcore
-    unsigned dump_seq = 0;   // B58: SIGUSR1 dump 单调序号，避免同秒文件名覆盖
-    siginfo_t sig_info;
     // B157: leader 是否处于组停靠（SIGSTOP/TSTP/TTIN/TTOU）。SIGCHLD handler 在
     // LISTEN 组停靠时置位、中继/恢复时清零；H2 预检据此跳过 SIGUSR1 dump（waitpid
     // 查不到：组停靠 wait status 已被 LISTEN 消费）。
-    bool leader_in_group_stop = false;
     while(1) {
         if(signal_forkcore) {
             if (signal_forkcore < 0) {
@@ -4074,6 +4105,7 @@ int Coredump::monitor(const char* corefile)
         }
     }
 
+crash_collect:
     info("%s: process %d exit", strsignal(exit_sig), _pid);
     info("Writing out corefile...");
 
