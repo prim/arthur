@@ -298,7 +298,21 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
         return 0;
     }
     uint64_t dyn_vaddr = 0;
+    // B188: 符号地址 = 加载基址 + st_value，加载基址 = 映射起始 - 首 PT_LOAD 的
+    // p_vaddr。glibc/musl 首 PT_LOAD 恒 p_vaddr=0（base 即加载基址），原实现
+    // base + st_value 正确；但非零首段 vaddr 的异构 libc（容器替换/非 glibc）会
+    // 让符号地址偏移 p_vaddr、注入跑垃圾代码。记下首 PT_LOAD p_vaddr 修正。
+    // 注意：① 用 found 标志替代 `first_load_vaddr == 0` 哨兵——首 PT_LOAD 的
+    // p_vaddr 合法值为 0，哨兵条件恒真、会在第二个 PT_LOAD（如 0x26000）处覆盖
+    // 捕获（实证：glibc 首 LOAD vaddr=0 被误捕成 0x26000，符号地址偏移 → 注入
+    // 跑垃圾）。② dyn_vaddr 循环必须保留 break（取第一个 PT_DYNAMIC）。
+    uint64_t first_load_vaddr = 0;
+    bool found_first_load = false;
     for (size_t i = 0; i < phdrs.size(); i++) {
+        if (phdrs[i].p_type == PT_LOAD && !found_first_load) {
+            first_load_vaddr = phdrs[i].p_vaddr;
+            found_first_load = true;
+        }
         if (phdrs[i].p_type == ARTHUR_PT_DYNAMIC) {
             dyn_vaddr = base + phdrs[i].p_vaddr;
             break;
@@ -371,6 +385,13 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
         uint64_t buckets = gnu_hash + 16 + (uint64_t)bloom_size * 8;
         uint64_t chains = buckets + (uint64_t)nbuckets * 4;
         uint32_t max_chain = 0;
+        // B186: nbuckets(≤1M) × 每链步数(≤1M) 的**乘积**可达 10^12——构造的 libc
+        // 让每个 bucket 都指向同一长链（全 0 无终止位）时，内外层循环跑满 10^12 次
+        // pread（每次走 /proc/pid/mem 的 VMA 查找），arthur 挂起数天（对 crash-dump/
+        // monitor 工具的反取证 DoS）。R50-9 的单维度上限未覆盖乘积放大。加跨 bucket
+        // 全局步数上限，把总工作量收敛到亚秒级（合法 libc nbuckets~4k、链 1-2 项，
+        // 实际 ~9k 步，远低于上限）。
+        uint64_t total_steps = 0;
         for (uint32_t b = 0; b < nbuckets; b++) {
             uint32_t idx;
             if (pread(fd, &idx, 4, buckets + b * 4) != 4) {
@@ -389,6 +410,11 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
                 if (chain & 1) break;
                 idx++;
                 steps++;
+                // B186: 全局步数上限（跨 bucket），防乘积放大 DoS
+                if (++total_steps > ARTHUR_MAX_SYM) {
+                    close(fd);
+                    return 0;
+                }
             }
         }
         sym_count = symoffset + max_chain + 1;
@@ -427,7 +453,9 @@ static uint64_t get_remote_sym_address(pid_t pid, uint64_t base, const char *fun
         name[r] = '\0';
         if (strcmp(name, func_name) == 0) {
             close(fd);
-            return base + sym.st_value;
+            // B188: 加载基址修正（见 first_load_vaddr 捕获处）。合法 libc
+            // first_load_vaddr==0 时等价于原 base + st_value。
+            return base - first_load_vaddr + sym.st_value;
         }
     }
     close(fd);
@@ -467,6 +495,14 @@ static inline int pt_wait(pid_t pid)
         }
         pid_t rc = waitpid(pid, &status, WUNTRACED | WNOHANG);
         if (rc == pid) {
+            // B187: tracee 可能在 attach/interrupt 与 waitpid 之间退出——waitpid
+            // 返回 WIFEXITED/WIFSIGNALED 状态（正数），原实现当"成功停靠"返回，
+            // pt_attach/pt_int 只查 <0 误报成功 → 死线程被当停靠（collect_threads
+            // 写零化块、末尾 pt_detach 伪 ESRCH 错误、ECHILD 误标 EAGAIN/D 态）。
+            // 只有真正的 stop（signal-delivery/group/event stop）才算停靠成功。
+            if (!WIFSTOPPED(status)) {
+                return -1;
+            }
             break;
         }
         if (rc < 0 && errno == EINTR) {
