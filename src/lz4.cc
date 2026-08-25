@@ -1,6 +1,8 @@
 /* supports lz4 compress.
  */
 
+#include <limits.h>
+
 #include "inc.h"
 #include "lz4.h"
 
@@ -104,7 +106,12 @@ void Lz4Stream::Close()
     }
 
     if (_enc) {
-        Flush();
+        // B191: 收尾 Flush 失败（磁盘满/压缩失败）时未密封块静默丢失、acore 截断。
+        // dump/test 路径在 WriteTailMark 前已显式 Flush（Close 的 Flush 通常是空
+        // 操作），但作为最后防线失败必须报告而非吞掉。
+        if (Flush() < 0) {
+            error("Close: final flush failed (disk full?), output truncated");
+        }
     }
 
     fclose(_file);
@@ -175,7 +182,15 @@ int Lz4Stream::SetBlock(BlockType type)
  */
 int Lz4Stream::Write(const char *s, size_t n)
 {
-    // enough room 
+    // B193: 返回类型 int——n 超过 INT_MAX 时下方 return (int)m 截断成负值/垃圾。
+    // 当前调用方最大 56 字节（元数据结构），但 Write 是多块循环的公开入口，
+    // 防御性 fail-closed。
+    if (n > INT_MAX) {
+        error("Write: %zu bytes exceeds int return range", n);
+        return -1;
+    }
+
+    // enough room
     Block& block = CurrentBlock();
     if (n <= block.Available()) {
         //printf("block %d %d\n", block.Available(), block.Size());

@@ -39,9 +39,11 @@ namespace arthur {
  * Block constructs,
  * | Block Header | lz4 compressed data |
  * Block Header is a 1-4 bytes long header,
- *   - indicates end of the long data. (prev_cont flag)
+ *   - prev_cont flag: WriteBlock 的跨块逻辑数据续块置 1（首块 0）；Write/Flush
+ *     路径恒 0（WriteBlock 外的多块经 WriteBlock 切块）。仅信息位——读侧
+ *     ReadBlock 不消费，按块序 + block_type + size 重建。
  *   - indicates the data type (data or file).
- *   - indicates size of compressed data. 
+ *   - indicates size of compressed data.
  * each block contains a max of BLOCK_SIZE data, may has several structruts.
  * long data has its own boundary aligned to block, and may use several blocks to store.
  *
