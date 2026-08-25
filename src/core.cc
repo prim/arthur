@@ -1066,6 +1066,11 @@ static inline int pt_attach(pid_t pid)
         // 顺带 best-effort DETACH（tracee 若碰巧已停靠则清 PT_PTRACED；运行中/D 态
         // 返回 ESRCH，无副作用）。
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        // B185: 超时（D 态不可停）显式置 EAGAIN——调用方（collect_threads）据此与
+        // ESRCH 同待遇跳过该线程而非 abort（崩溃采集/正常 dump 都不该为一个不可停
+        // 的线程丢整个现场）。原实现靠 DETACH 失败残留的 ESRCH errno 碰巧跳过，
+        // 脆弱（DETACH 碰巧成功则 errno=0 → 误 abort）。
+        errno = EAGAIN;
         return -1;
     }
 
@@ -1768,8 +1773,15 @@ int Coredump::collect_threads(pid_t leader)
             // B77 (Codex B7 review): 线程可能在枚举与 attach 间退出（ESRCH，跳过）；
             // 但 EPERM/tracer 冲突等非 ESRCH 错误是真实故障，跳过会静默产出不完整
             // dump。fail-closed。
-            if (errno == ESRCH) {
-                error("attach thread %ld failed (exited), skipped", tid);
+            // B185: EAGAIN（pt_attach pt_wait 超时 = 线程 D 态不可停，B179/B185）与
+            // ESRCH 同等待遇——跳过而非 abort，避免崩溃采集/正常 dump 为单个不可停
+            // 线程丢掉整个现场（D 态兄弟在崩溃瞬间是现实场景，磁盘/NFS 阻塞）。
+            if (errno == ESRCH || errno == EAGAIN) {
+                if (errno == ESRCH) {
+                    error("attach thread %ld failed (exited), skipped", tid);
+                } else {
+                    error("attach thread %ld in D-state (uninterruptible), skipped", tid);
+                }
                 continue;
             }
             error("attach thread %ld failed (%s), aborting collection", tid, strerror(errno));
@@ -3479,9 +3491,21 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         info("leader %d in job-control group-stop during dump; skipping waitpid "
              "injection to preserve the stop", _pid);
     } else if (crashed_in_window) {
-        info("leader %d crashed in %s delivery-stop during dump; "
-             "skipping waitpid injection to preserve crash stop",
-             _pid, strsignal(sig));
+        // B184: crashed_in_window 缺 signal_is_caught（B168 对称遗漏）——dump 窗口内
+        // leader 停在**被捕获**的 crash-class delivery-stop（handler 目标做 safepoint/
+        // 崩溃上报）时，原实现跳过注入 + 返回崩溃信号 → 假崩溃采集 + kill_crashed
+        // 重投走 handler 进程不死 + 静默放弃监控。被捕获则中继（CONT(sig) 让 handler
+        // 跑），dump 正常完成返回 0；未捕获才是真崩溃，保留现场供崩溃采集。
+        if (signal_is_caught(_pid, sig)) {
+            info("leader %d stopped at caught %s during dump; relaying to handler "
+                 "(not crash collection)", _pid, strsignal(sig));
+            ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) sig);
+            sig = 0;
+        } else {
+            info("leader %d crashed in %s delivery-stop during dump; "
+                 "skipping waitpid injection to preserve crash stop",
+                 _pid, strsignal(sig));
+        }
     } else {
         pt_getregs(_pid, &saved_regs);
         // R50-50: leader 停靠时若处于可重启 syscall 的 -ERESTART* 返回点，CONT(0)
@@ -3558,6 +3582,16 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         drain_noise_sigchld();
         if (death == -2) {
             return -2;
+        }
+        // B184: detect_leader_death 检出的崩溃信号若被捕获（handler），不是致命
+        // 崩溃——与 B168 对齐中继（CONT(sig) 走 handler），不触发假崩溃采集。
+        // WIFSIGNALED（真死亡）不在此列（进程已死，无 handler 可走）。
+        if ((death == SIGILL || death == SIGABRT || death == SIGSEGV) &&
+            signal_is_caught(_pid, death)) {
+            info("leader %d stopped at caught %s in tail window; relaying to "
+                 "handler (not crash collection)", _pid, strsignal(death));
+            ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t) death);
+            return 0;
         }
         return death;
     }
@@ -3771,6 +3805,19 @@ int Coredump::monitor(const char* corefile)
                     ((ws >> 16) & 0xff) == 0) {   // 非 ptrace event 停靠
                     int st = WSTOPSIG(ws);
                     if (st == SIGILL || st == SIGABRT || st == SIGSEGV) {
+                        // B184: B168 的对称遗漏——此预检路径不查 signal_is_caught。
+                        // leader 停在**被捕获**的 crash-class delivery-stop（V8/Node
+                        // 装 crash handler 做 safepoint/崩溃上报）且 SIGUSR1 先出队时，
+                        // 原实现把它当致命崩溃 break → 假崩溃 core + kill_crashed 重投
+                        // 走 handler 进程不死 + 静默放弃监控（B168 只修了主循环 path B）。
+                        // 与 path B 对齐：被捕获则跳过 dump、交给主循环中继（SIGCHLD
+                        // 仍在队列，path B 会 CONT(sig) 让 handler 跑）。
+                        if (signal_is_caught(_pid, st)) {
+                            info("signal %s caught by target handler; relaying "
+                                 "(not crash collection)", strsignal(st));
+                            signal_forkcore = 0;
+                            continue;
+                        }
                         info("leader already in %s delivery-stop; skipping SIGUSR1 dump",
                              strsignal(st));
                         exit_sig = st;
