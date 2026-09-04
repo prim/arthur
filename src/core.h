@@ -8,6 +8,7 @@
 #include <sys/time.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <sstream>
 
 #include "inc.h"
@@ -37,9 +38,14 @@ struct AcoreHeader {
     /* version history:
      * 1: first u16 version.
      * 2: support arch and introduced aarch64 arch.
+     * 3: thread FP-valid and signal-mask metadata.
+     * 4: CRC32 on every compressed block.
+     * 5: runtime real UID/GID and crash signal at the end of PROCESS.
+     * 6: process-level stat stored separately from THREAD metadata.
      */
 
-#define ACORE_VERSION 3
+#define ACORE_MIN_VERSION 1
+#define ACORE_VERSION 6
     struct {
         uint16_t version:12;
         uint16_t arch:4;        // ARCHTYPE
@@ -68,11 +74,20 @@ struct ProcessData {
     ProcFile *_environ;
     ProcFile *_io;
     ProcFile *_limits;
+    // v6 stores process identity separately from THREAD metadata so a process
+    // remains representable after its original thread-group leader exits.
+    ProcFile *_stat;
 
     // proc file decoder
     ProcCmdline *_d_cmdline;
     ProcMaps *_d_maps;
     ProcAuxv *_d_auxv;
+    ProcStat *_d_stat;
+
+    // v5 PROCESS metadata. Older archives fall back to exec-time auxv IDs.
+    uint32_t _uid;
+    uint32_t _gid;
+    bool _credentials_valid;
     
     // threads group
     std::vector<ThreadData> _threads;   // threads data
@@ -86,12 +101,17 @@ public:
         _environ = NULL;
         _io = NULL;
         _limits = NULL;
+        _stat = NULL;
         // b50 (Codex review): 三个 decoder 指针原未初始化。cleanup_decompress()
         // 在 ParseAll() 之前（ReadMeta 失败）会读并 delete 它们——未初始化指针
         // invalid delete，UB。构造器统一置 NULL。
         _d_cmdline = NULL;
         _d_maps = NULL;
         _d_auxv = NULL;
+        _d_stat = NULL;
+        _uid = 0;
+        _gid = 0;
+        _credentials_valid = false;
     }
     int ParseAll();
 };
@@ -121,11 +141,19 @@ struct ThreadData {
 
     siginfo_t _siginfo;   // SigInfo
 
+    // ELF PRSTATUS signal state is not the same thing as the ptrace stop that
+    // happened to make register capture possible. Keep this decode-only value
+    // out of the acore wire format so v1-v5 remain layout-compatible.
+    int _prstatus_signal;
+
     // v3: THREAD 块尾部——FP/扩展寄存器读取是否成功（填 pr_fpvalid）+
     // 全 64 位 SigPnd/SigBlk 掩码（stat 字段 31/32 被内核掩成 31 位，丢 RT 信号）。
     char _fp_valid;
     uint64_t _sigpend;
     uint64_t _sighold;
+    // In-memory decode state only. v3+ archives always carry both masks, and
+    // zero is a valid value; v1-v2 fall back to the legacy stat fields.
+    char _signal_masks_valid;
 
     ProcFile *_stat;
     ProcStat *_d_stat;
@@ -167,7 +195,7 @@ public:
     }
     
     // process info
-    int fill_prpsinfo(const ProcessData& proc);
+    int fill_prpsinfo(const ProcessData& proc, pid_t leader_pid, bool crashed);
     int fill_auxv(const ProcessData& proc);
     int fill_file(const ProcessData& proc);
     // thread info
@@ -200,10 +228,8 @@ class Acore {
  *   Metadata
  *     ProcessData
  *     Proc Files,
- *       cmdline,
- *       stat,
- *       auxv,
- *       maps,
+ *       cmdline, auxv, maps, environ, io, limits,
+ *       process stat (v6+),
  *   for (thread in process) {
  *      regs,
  *      fpregs,
@@ -311,7 +337,7 @@ private:
     int ReadMeta(Lz4Stream& in);
     // 返回实际写出的未压缩字节数（可为数 GB，须用 ssize_t，不能用 int——
     // >2GB 会截断成负数被调用方误判为错误）；-1 表示读失败。
-    ssize_t ReadLoads(Lz4Stream& in, FILE* fout);
+    ssize_t ReadLoads(Lz4Stream& in, FILE* fout, size_t expected_bytes);
     int ReadElfHeader(Lz4Stream& in, size_t max_phdrs);
  
     // write core
@@ -322,11 +348,13 @@ private:
     int WriteCore(const char* out_core);
     int ReadCore(const char* in_core);
 
-    int WriteProcessMeta(Lz4Stream& out, ProcMaps& maps);
+    int WriteProcessMeta(Lz4Stream& out, ProcMaps& maps, pid_t source_pid = 0);
     int WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main = false);
     // 枚举 /proc/<leader>/task/ 全部线程并 attach 非主线程；attach 失败的
     // （线程已退出）从列表剔除，保证线程计数与实际写出的 THREAD 块一致。
     int collect_threads(pid_t leader);
+    // monitor 持久 SEIZE 全部现有线程，并用 TRACECLONE 维护后续线程。
+    int monitor_threads(pid_t leader);
     // 采集失败（fail-closed）时还原目标：detach 兄弟线程、resume leader、
     // 清空线程列表。monitor 场景下失败后目标必须能继续运行。
     void restore_target_after_fail();
@@ -337,15 +365,19 @@ private:
     pid_t _pid;             // target pid
     pid_t _core_pid;        // forked core's pid
     int _arch;              // ARCHTYPE
-    int _acore_version;     // v3: 读到的 acore 版本（THREAD 块尾部 FP 有效位仅 v3+）
-    int _crash_sig;         // B199: monitor 崩溃采集的进程崩溃信号（非 0 时 WriteThreadMeta
-                            // 覆盖所有线程 si_signo——内核原生 core 全部线程 pr_cursig 都是
-                            // 崩溃信号，gdb 按线程信号显示；不覆盖则 worker pr_cursig=SIGSTOP
-                            //（attach 停靠），多线程崩溃 core 被 gdb 报 "SIGSTOP" 误导）
+    int _acore_version;     // v3 thread state, v4 CRC, v5 credentials, v6 process stat.
+    int _crash_sig;         // monitor 崩溃采集的进程级终止信号。v5 PROCESS 保存它，
+                            // 解码时据此填写所有线程的 PRSTATUS；THREAD 仍保留原始
+                            // ptrace siginfo，避免把 worker 的 attach stop 伪造成 crash。
     // 内核没有 PTRACE_GETOPTIONS；arthur 需要自己跟踪给目标设过的 ptrace
-    // options（pt_monitor 设 TRACEEXIT，forkcore_m 临时叠加 TRACEFORK），
-    // 以便在清除 TRACEFORK 时把 TRACEEXIT 恢复回去（B39）。
+    // monitor_threads 设定的持久 options（TRACEEXIT | TRACECLONE）；
+    // forkcore_m 临时叠加 TRACEFORK，收尾时恢复此值（B39）。
     long _ptrace_options;
+    std::set<pid_t> _monitor_tids;
+    pid_t _monitor_crash_tid;
+    bool _monitor_recovery_failed;
+    bool _monitor_leader_exited;
+    std::map<pid_t, int> _monitor_relay_signals;
 
     // TBD: move to acore or corefile class. 
     ProcessData _process;   // process data
@@ -355,7 +387,7 @@ private:
     std::vector<Load> _loads;
     std::vector<Elf64_Phdr> _phdrs;
 
-    long _offset_load;
+    off_t _offset_load;
 };
 
 // time stamp for debug

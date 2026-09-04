@@ -57,7 +57,7 @@ void help()
     "      core lands in the TARGET's cwd (core_pattern), not here.\n"
     "      NOTE: merge (-m) is not implemented; the metadata file cannot be\n"
     "      merged into a final GNU corefile, so thread/reg data is unrecoverable.\n"
-    " -3 : attach to process, write gcore with lz4 compressed on SIGILL, SIGABRT and SIGSEGV\n"
+    " -3 : monitor all Linux core-dumping fatal signals and write an lz4-compressed acore\n"
     "      able to write out acorefile when monitoring"
     "\n"
     "Convert acore to corefile,\n"
@@ -90,12 +90,17 @@ int main(int argc, char *argv[])
 
     int ch;
     int mode_set = 0;   // R50-6: 记录 mode 选项个数，冲突检测
-    int pid_set = 0;    // R50-29: 是否显式给了 -p（区分"没给"与"给了非法值"）
+    int pid_set = 0;    // R50-29: 显式 -p 个数（也用于拒绝重复 singleton）
+    int output_set = 0;
     int op_set = 0;     // b181: 记录 -c/-m 主操作个数（-c -m 同给须拒绝）
     while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
         switch (ch) {
 
         case 'p':   // pid
+            if (++pid_set > 1) {
+                error("-p/--pid may be specified only once");
+                return 2;
+            }
             // b145 (Codex B145 review): atoi 接受 `-p 123junk` 并操作 pid 123、
             // 超长数字溢出 UB。strtol + 全串 + 正范围校验（真实合法 PID 为正 int）。
             {
@@ -108,7 +113,6 @@ int main(int argc, char *argv[])
                     return 2;
                 }
                 cfg.pid = (pid_t)v;
-                pid_set = 1;
             }
             break;
 
@@ -124,6 +128,10 @@ int main(int argc, char *argv[])
             break;
 
         case 'o':   // output
+            if (++output_set > 1) {
+                error("-o/--output may be specified only once");
+                return 2;
+            }
             cfg.output = strdup(optarg);
             break;
 
@@ -192,6 +200,36 @@ int main(int argc, char *argv[])
     if (pid_set && cfg.pid <= 0) {
         error("invalid pid %d (must be > 0)", cfg.pid);
         return 2;
+    }
+
+    // Each operation has an exact positional-operand contract. GNU getopt
+    // permits options and operands to be interspersed, so validate only after
+    // parsing. Silently ignoring a trailing filename can capture or overwrite
+    // a different artifact than an automation script intended.
+    int operand_count = argc - optind;
+    if (cfg.pid && operand_count != 0) {
+        error("capture accepts no positional operands (got %d)", operand_count);
+        return 2;
+    }
+    if (cfg.op == ARTHUR_OP_DECOMPRESS && operand_count != 0) {
+        error("-c accepts no positional operands (got %d)", operand_count);
+        return 2;
+    }
+    if (cfg.op == ARTHUR_OP_MERGE && operand_count != 2) {
+        error("-m requires exactly two positional operands: <acore> <core>");
+        return 2;
+    }
+    if (!cfg.pid && cfg.op == ARTHUR_OP_GENERATE && cfg.mode == 1 &&
+        operand_count != 1) {
+        error("test_compress requires exactly one input file");
+        return 2;
+    }
+    if (!cfg.pid && cfg.op == ARTHUR_OP_GENERATE && cfg.mode == 2) {
+        int expected = cfg.output ? 1 : 2;
+        if (operand_count != expected) {
+            error("test_decompress requires exactly one input and one output");
+            return 2;
+        }
     }
 
     Coredump dump(cfg.pid);

@@ -51,6 +51,11 @@ struct ProcFile {
 public:
     static ProcFile* ReadPid(char* buf, int buf_len, pid_t pid, ProcType type,
                              bool *out_truncated = NULL) {
+        if (!buf || buf_len < (int)sizeof(ProcFile) + 1 || pid <= 0 ||
+            type <= PROC_TYPE_UNKNOWN || type >= PROC_TYPE_MAX) {
+            errno = EINVAL;
+            return NULL;
+        }
         ProcFile *f = Read(out_truncated, buf, buf_len, "/proc/%u/%s", pid, szProcType(type));
         if (!f) {
             return f;
@@ -95,11 +100,12 @@ struct MemRegion {
 class ProcDecoder {
 
 public:
-    ProcDecoder(){};
+    ProcDecoder() : _pf(NULL) {};
     ProcDecoder(ProcFile* pf) : _pf(pf) {};
     // 多态基类（Parse 是虚函数）：必须虚析构，否则 delete 派生类是 UB
     virtual ~ProcDecoder() {};
     int readline(int& cur, char*out, size_t n);
+    int readline(int& cur, std::string& out);
     virtual int Parse() = 0;
 
     int setpf(ProcFile* maps) {
@@ -247,10 +253,22 @@ struct ProcAuxv : public ProcDecoder {
     uint32_t gid;
     uint32_t euid;
     uint32_t egid;
+    uint64_t page_size;
 
     // B56: uid/gid/euid/egid 零初始化——auxv 缺失/截断时 Parse 不设置，fill_prpsinfo 读垃圾。
     ProcAuxv(ProcFile* pf)
-        : ProcDecoder(pf), uid(0), gid(0), euid(0), egid(0) {}
+        : ProcDecoder(pf), uid(0), gid(0), euid(0), egid(0), page_size(0) {}
+    int Parse();
+};
+
+// Runtime real credentials from /proc/<pid>/status. AT_UID/AT_GID in auxv
+// describe the credentials at exec time and can become stale after setuid(2)
+// or setgid(2).
+struct ProcStatus : public ProcDecoder {
+    uint32_t uid;
+    uint32_t gid;
+
+    ProcStatus(ProcFile* pf) : ProcDecoder(pf), uid(0), gid(0) {}
     int Parse();
 };
 

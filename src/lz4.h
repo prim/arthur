@@ -120,6 +120,13 @@ public:
    
     // add data to buffer 
     int Write(const char *in, size_t n) {
+        if (!in && n != 0) {
+            errno = EINVAL;
+            return -EINVAL;
+        }
+        if (n == 0) {
+            return 0;
+        }
         if (n > Available())  {
             return -ENOSPC;
         }
@@ -131,6 +138,13 @@ public:
    
     // read out data from buffer 
     int Read(char *out, size_t n) {
+        if (!out && n != 0) {
+            errno = EINVAL;
+            return -EINVAL;
+        }
+        if (n == 0) {
+            return 0;
+        }
         if (n > Size()) {
             return  -ENOSPC;
         }
@@ -142,6 +156,13 @@ public:
 
     // read data without update cursor
     int Peek(char *out, size_t n) {
+        if (!out && n != 0) {
+            errno = EINVAL;
+            return -EINVAL;
+        }
+        if (n == 0) {
+            return 0;
+        }
         if (n > Size()) {
             return -ENOSPC;
         }
@@ -262,6 +283,9 @@ public:
     Block* ReadBlock(BlockHeader& out_hdr);
     int ReadRaw(char* out, size_t n);
     int Peek(char*out, size_t n);
+    // A valid Arthur stream ends exactly at TailMark. Reject concatenated or
+    // accidentally appended bytes instead of silently accepting a prefix.
+    int VerifyPhysicalEof();
 
     // put or get file to stream
     ProcFile* GetFile();
@@ -283,6 +307,13 @@ public:
 
     // open file and create stream
     int Open(const char *file);
+    // Take ownership of a direction-compatible descriptor only after success.
+    int OpenFd(int fd);
+    // The checksum layout is a stream-wide setting and can only change before
+    // the first compressed block is buffered or consumed.
+    int EnableBlockChecksums(bool enabled = true);
+    // Flush application and kernel buffers without closing the stream.
+    int Sync();
     // close file; b167/b191 (Codex): 返回 Flush/fclose 错误（关闭期 ENOSPC 不再静默）
     int Close();
 
@@ -306,6 +337,9 @@ private:
 
     // Decompress a block from file
     int Decompress(Block& block);
+    int InitCodec();
+    void ReleaseCodec();
+    void ResetState();
 
 private:
     Block _blocks[MAX_RING_BUF];    // lz4 uses double blocks.
@@ -325,6 +359,8 @@ private:
     bool _eof_clean;
     // R50-20: 是否读到过尾标（test_decompress 区分干净结束与整块截断）
     bool _tail_seen;
+    // acore v4 and checksummed test streams append CRC32 to each compressed block.
+    bool _block_checksums;
 };
 
 };

@@ -2,11 +2,15 @@
  */
 
 #include <limits.h>
+#include <fcntl.h>
+#include <array>
 
 #include "inc.h"
 #include "lz4.h"
 
 namespace arthur {
+
+static const size_t MAX_PROC_FILE_SIZE = 64 * 1024 * 1024;
 
 const char* szBlockType(BlockType t)
 {
@@ -29,6 +33,7 @@ Lz4Stream::Lz4Stream(lz4_mode mode) :
     _size_file = 0;
     _eof_clean = true;
     _tail_seen = false;
+    _block_checksums = false;
     // R50-5: _block_type 原未初始化——test_compress 走 Write/Flush 不调 SetBlock，
     // Flush 把垃圾类型写进块头（未定义值）。初始化安全默认值。
     _block_type = BLOCK_TYPE_PROCESS;
@@ -39,7 +44,11 @@ Lz4Stream::~Lz4Stream()
     if (_file) {
         Close();
     }
+    ReleaseCodec();
+}
 
+void Lz4Stream::ReleaseCodec()
+{
     if (_enc) {
         LZ4_freeStream(_enc);
         _enc = NULL;
@@ -51,15 +60,23 @@ Lz4Stream::~Lz4Stream()
     }
 }
 
-int Lz4Stream::Open(const char *file) 
-{   
-    if (_mode == LZ4_Compress) {
-        _file = fopen(file, "wb");
-        if (!_file) {
-            error("Fail to open file: %s", file);
-            return -1;
-        }
+void Lz4Stream::ResetState()
+{
+    _block_index = 0;
+    _block_type = BLOCK_TYPE_PROCESS;
+    _size_real = 0;
+    _size_file = 0;
+    _eof_clean = true;
+    _tail_seen = false;
+    _block_checksums = false;
+    for (size_t i = 0; i < MAX_RING_BUF; i++) {
+        _blocks[i].Clear();
+    }
+}
 
+int Lz4Stream::InitCodec()
+{
+    if (_mode == LZ4_Compress) {
         _enc = LZ4_createStream();
         if(!_enc) {
             error("Fail to create encode stream");
@@ -71,14 +88,7 @@ int Lz4Stream::Open(const char *file)
             error("Fail to init encode stream");
             return -1;
         }
-        
     } else if (_mode == LZ4_Decompress) {
-        _file = fopen(file, "rb");
-        if (!_file) {
-            error("Fail to open file: %s", file);
-            return -1;
-        }
-
         _dec = LZ4_createStreamDecode();
         if(!_dec) {
             error("Fail to create decode stream");
@@ -97,12 +107,107 @@ int Lz4Stream::Open(const char *file)
     return 0;
 }
 
+int Lz4Stream::Open(const char *file)
+{
+    if (!file) {
+        errno = EINVAL;
+        error("cannot open an LZ4 stream with a null path");
+        return -1;
+    }
+    if (_file) {
+        errno = EBUSY;
+        error("cannot reopen an active LZ4 stream");
+        return -1;
+    }
+    ReleaseCodec();
+    ResetState();
+    _file = fopen(file, _mode == LZ4_Compress ? "wb" : "rb");
+    if (!_file) {
+        error("Fail to open file: %s", file);
+        return -1;
+    }
+    if (InitCodec() != 0) {
+        fclose(_file);
+        _file = NULL;
+        ReleaseCodec();
+        return -1;
+    }
+    return 0;
+}
+
+int Lz4Stream::OpenFd(int fd)
+{
+    if (fd < 0) {
+        errno = EBADF;
+        error("cannot open an LZ4 stream from an invalid fd");
+        return -1;
+    }
+    if (_file) {
+        errno = EBUSY;
+        error("cannot reopen an active LZ4 stream");
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        error("cannot inspect LZ4 stream fd: %s", strerror(errno));
+        return -1;
+    }
+#ifdef O_PATH
+    if (flags & O_PATH) {
+        errno = EBADF;
+        error("cannot use an O_PATH fd for LZ4 stream I/O");
+        return -1;
+    }
+#endif
+    int access_mode = flags & O_ACCMODE;
+    bool access_ok = _mode == LZ4_Compress
+        ? (access_mode == O_WRONLY || access_mode == O_RDWR)
+        : (access_mode == O_RDONLY || access_mode == O_RDWR);
+    if (!access_ok) {
+        errno = EBADF;
+        error("LZ4 stream fd access mode is incompatible with codec direction");
+        return -1;
+    }
+
+    ReleaseCodec();
+    ResetState();
+    if (InitCodec() != 0) {
+        ReleaseCodec();
+        return -1;
+    }
+    _file = fdopen(fd, _mode == LZ4_Compress ? "wb" : "rb");
+    if (!_file) {
+        error("Fail to open stream from fd: %s", strerror(errno));
+        ReleaseCodec();
+        return -1;
+    }
+    return 0;
+}
+
+int Lz4Stream::Sync()
+{
+    if (!_file || !_enc) {
+        errno = EBADF;
+        return -1;
+    }
+    if (Flush() < 0) {
+        return -1;
+    }
+    if (fflush(_file) != 0 || fsync(fileno(_file)) != 0) {
+        error("sync output failed (%s)", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 int Lz4Stream::Close()
 {
     // R50-6: 幂等——双重 Close 曾因 fclose(NULL) 使 arthur 自身段错误
     //（forkcore 失败路径复制了 out.Close(); unlink(); 两组）。NULL 时直接返回。
     // b167/b191 (Codex): 返回 Flush/fclose 错误——关闭期 ENOSPC 不再静默。
     if (!_file) {
+        ReleaseCodec();
         return 0;
     }
 
@@ -124,25 +229,54 @@ int Lz4Stream::Close()
         rc = -1;
     }
     _file = NULL;
+    ReleaseCodec();
     return rc;
 }
 
 // file postion
 int Lz4Stream::Seek(long n)
 {
+    if (!_file) {
+        errno = EBADF;
+        return -1;
+    }
     return fseek(_file, n, SEEK_SET);
 }
 
 long Lz4Stream::Tell()
 {
+    if (!_file) {
+        errno = EBADF;
+        return -1;
+    }
     return ftell(_file);
 }
 
 int Lz4Stream::Peek(char *out, size_t n)
 {
+    if (!_file || !_dec) {
+        errno = EBADF;
+        _eof_clean = false;
+        return -1;
+    }
+    if ((!out && n != 0) || n > INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (n == 0) {
+        return 0;
+    }
     long save = Tell();
+    if (save < 0) {
+        error("peek requires a seekable input stream");
+        return -1;
+    }
     int rc = ReadRaw(out, n);
-    Seek(save);
+    if (Seek(save) != 0) {
+        _eof_clean = false;
+        error("failed to restore input position after peek");
+        return -1;
+    }
     return rc;
 }
 
@@ -151,17 +285,81 @@ int Lz4Stream::WriteRaw(const char *s, size_t n)
 {
     // B70: 原 `assert(rc == n)` 在磁盘满短写时 debug 构建 abort（NDEBUG 静默丢）。
     // 改为返回实际写入数，调用方检查。
-    return (int)fwrite(s, 1, n, _file);
+    if (!_file || !_enc) {
+        errno = EBADF;
+        return -1;
+    }
+    if ((!s && n != 0) || n > INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    // Raw protocol fields delimit compressed block sequences. Preserve bytes
+    // already buffered by Write() before inserting the raw field; otherwise a
+    // later Close() would emit the compressed block after the raw marker.
+    if (!CurrentBlock().isEmpty() && Flush() < 0) {
+        return -1;
+    }
+    size_t written = fwrite(s, 1, n, _file);
+    _size_file += written;
+    return (int)written;
 }
 
 int Lz4Stream::ReadRaw(char *out, size_t n)
 {
-    return fread(out, 1, n, _file);
+    if (!_file || !_dec) {
+        errno = EBADF;
+        return -1;
+    }
+    if ((!out && n != 0) || n > INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    return (int)fread(out, 1, n, _file);
+}
+
+int Lz4Stream::VerifyPhysicalEof()
+{
+    if (!_file || _mode != LZ4_Decompress || !_tail_seen) {
+        _eof_clean = false;
+        error("cannot verify stream end before tail mark");
+        return -1;
+    }
+    if (!_eof_clean) {
+        errno = EPROTO;
+        error("stream end has already failed physical EOF validation");
+        return -1;
+    }
+
+    unsigned char trailing = 0;
+    size_t rc = fread(&trailing, 1, 1, _file);
+    if (rc != 0) {
+        _eof_clean = false;
+        error("trailing data after tail mark (first byte 0x%02x), stream corrupt",
+              trailing);
+        return -1;
+    }
+    if (ferror(_file) || !feof(_file)) {
+        _eof_clean = false;
+        error("failed to verify physical EOF after tail mark");
+        return -1;
+    }
+    return 0;
 }
 
 // write stream
 int Lz4Stream::Flush()
 {
+    if (!_file || !_enc) {
+        errno = EBADF;
+        return -1;
+    }
+
     // empty 
     Block& block = CurrentBlock();
     if (block.isEmpty()) {
@@ -183,7 +381,42 @@ int Lz4Stream::Flush()
 
 int Lz4Stream::SetBlock(BlockType type)
 {
+    if (type < 0 || type >= BLOCK_TYPE_MAX) {
+        errno = EINVAL;
+        error("invalid LZ4 block type %d", type);
+        return -1;
+    }
+    if (!_file || !_enc) {
+        errno = EBADF;
+        error("cannot set a block type on an inactive compressor");
+        return -1;
+    }
+    if (type != _block_type && !CurrentBlock().isEmpty()) {
+        // Buffered bytes belong to the old type. Seal them before changing the
+        // type so metadata cannot be silently relabelled.
+        if (Flush() < 0) {
+            return -1;
+        }
+    }
     _block_type = type; 
+    return 0;
+}
+
+int Lz4Stream::EnableBlockChecksums(bool enabled)
+{
+    if (!_file || (!_enc && !_dec)) {
+        errno = EBADF;
+        return -1;
+    }
+    if (_block_checksums == enabled) {
+        return 0;
+    }
+    if (_block_index != 0 || (_enc && !CurrentBlock().isEmpty())) {
+        errno = EBUSY;
+        error("cannot change checksum layout after compressed data has started");
+        return -1;
+    }
+    _block_checksums = enabled;
     return 0;
 }
 
@@ -191,6 +424,15 @@ int Lz4Stream::SetBlock(BlockType type)
  */
 int Lz4Stream::Write(const char *s, size_t n)
 {
+    if (!_file || !_enc) {
+        errno = EBADF;
+        return -1;
+    }
+    if (!s && n != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
     // B193: 返回类型 int——n 超过 INT_MAX 时下方 return (int)m 截断成负值/垃圾。
     // 当前调用方最大 56 字节（元数据结构），但 Write 是多块循环的公开入口，
     // 防御性 fail-closed。
@@ -247,6 +489,20 @@ int Lz4Stream::WriteBlock(const char *s, size_t n, BlockType t)
     int rc;
     size_t m = 0;
 
+    if (!s && n != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (t < 0 || t >= BLOCK_TYPE_MAX) {
+        errno = EINVAL;
+        error("invalid LZ4 block type %d", t);
+        return -1;
+    }
+    if (!_file || !_enc) {
+        errno = EBADF;
+        return -1;
+    }
+
     // b193 (Codex B193 review): 返回值是 int——n>INT_MAX 时 `return (int)m` 截断成
     // 负值/垃圾。当前调用方单块 ≤ BLOCK_SIZE 不可达，纵深防护与 Write 入口对齐。
     if (n > INT_MAX) {
@@ -287,6 +543,32 @@ int Lz4Stream::WriteBlock(const char *s, size_t n, BlockType t)
     return m;
 }
 
+static uint32_t crc32_update(uint32_t crc, const void *data, size_t size)
+{
+    static const std::array<uint32_t, 256> table = []() {
+        std::array<uint32_t, 256> values = {};
+        for (uint32_t i = 0; i < values.size(); i++) {
+            uint32_t value = i;
+            for (int bit = 0; bit < 8; bit++) {
+                value = (value >> 1) ^ ((value & 1) ? 0xedb88320U : 0);
+            }
+            values[i] = value;
+        }
+        return values;
+    }();
+    const unsigned char *bytes = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < size; i++) {
+        crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+static uint32_t block_checksum(const BlockHeader& hdr, const char *data, size_t size)
+{
+    uint32_t crc = crc32_update(0xffffffffU, &hdr, sizeof(hdr));
+    return crc32_update(crc, data, size) ^ 0xffffffffU;
+}
+
 // compress buffer and flush to fd.
 int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
 {
@@ -304,9 +586,6 @@ int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
         return -1;
     }
 
-    _size_real += block.Length();
-    _size_file += len;
-
     // write block header
     hdr.size = len;
     // B64: `rc < 0` 恒假——fwrite 返回 size_t（实际写入数），磁盘满时短写返回
@@ -321,6 +600,17 @@ int Lz4Stream::Compress(Block& block, BlockHeader& hdr)
         error("write block data failed (disk full?)");
         return -1;
     }
+    if (_block_checksums) {
+        uint32_t checksum = block_checksum(hdr, block.rBuf(), block.Length());
+        if (fwrite(&checksum, 1, sizeof(checksum), _file) != sizeof(checksum)) {
+            error("write block checksum failed (disk full?)");
+            return -1;
+        }
+    }
+
+    _size_real += block.Length();
+    _size_file += sizeof(hdr) + len +
+        (_block_checksums ? sizeof(uint32_t) : 0);
 
     dprint("writed %lu, compress = %d", block.Length(), len);
  
@@ -339,6 +629,12 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
 {
     char buf[LZ4_COMPRESSBOUND(BLOCK_SIZE)];
     int rc;
+
+    if (!_file || !_dec) {
+        errno = EBADF;
+        _eof_clean = false;
+        return NULL;
+    }
 
     // next block
     _block_index++;
@@ -387,6 +683,14 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
         return NULL;
     }
 
+    uint32_t stored_checksum = 0;
+    if (_block_checksums &&
+        fread(&stored_checksum, 1, sizeof(stored_checksum), _file) != sizeof(stored_checksum)) {
+        _eof_clean = false;
+        error("read block checksum failed, acore truncated");
+        return NULL;
+    }
+
     // decompress
     // R50-15 (T3): `rc < 0` 只拒负值——构造的块可解出 0 字节（rc==0），空块被当
     // 成功返回（写侧 Compress 对空块提前返回、从不写 0 字节块，故 rc==0 恒异常）。
@@ -398,6 +702,16 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
         return NULL;
     }
     block._length = rc;
+    if (_block_checksums) {
+        uint32_t actual_checksum = block_checksum(hdr, block.rBuf(), block.Length());
+        if (actual_checksum != stored_checksum) {
+            _eof_clean = false;
+            error("block checksum mismatch (%08x != %08x), acore corrupt",
+                  actual_checksum, stored_checksum);
+            block.Clear();
+            return NULL;
+        }
+    }
     dprint("ReadBlock size(%d), type(%d), data(%d)\n", hdr.size, hdr.block_type, rc);
 
     return &block;;
@@ -409,6 +723,37 @@ int Lz4Stream::PutFile(ProcFile* pf)
 {
     int rc;
 
+    if (!pf) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!_file || !_enc) {
+        errno = EBADF;
+        return -1;
+    }
+
+    // The wire prefix and return value are narrower than ProcFile::Size().
+    // Reject the complete object before Flush/WriteRaw so failure leaves the
+    // current logical block untouched and cannot create a partial FILE record.
+    if ((size_t)pf->f_size > SIZE_MAX - sizeof(ProcFile)) {
+        errno = EOVERFLOW;
+        error("proc file size overflows size_t");
+        return -1;
+    }
+    size_t serialized_size = sizeof(ProcFile) + (size_t)pf->f_size;
+    if (serialized_size > UINT32_MAX || serialized_size > INT_MAX) {
+        errno = EOVERFLOW;
+        error("proc file size %zu exceeds wire or return range", serialized_size);
+        return -1;
+    }
+    // Keep the writer symmetric with GetFile's corruption/allocation cap.
+    // A stream emitted by this implementation must be readable by it.
+    if (serialized_size > MAX_PROC_FILE_SIZE) {
+        errno = EFBIG;
+        error("proc file size %zu exceeds sanity cap", serialized_size);
+        return -1;
+    }
+
     // seal the current block
     // B70: Flush 失败（磁盘满）时传播错误。
     if (Flush() < 0) {
@@ -417,7 +762,7 @@ int Lz4Stream::PutFile(ProcFile* pf)
     }
 
     // flat size
-    uint32_t size = pf->Size();
+    uint32_t size = (uint32_t)serialized_size;
 
     // TBD: remove the Raw size
     // write file size
@@ -444,6 +789,12 @@ ProcFile* Lz4Stream::GetFile()
     int rc;
     uint32_t size;
 
+    if (!_file || !_dec) {
+        errno = EBADF;
+        _eof_clean = false;
+        return NULL;
+    }
+
     // TBD: remove the Raw Size
     // readout the file size
     rc = ReadRaw((char*)&size, sizeof(size));
@@ -454,7 +805,7 @@ ProcFile* Lz4Stream::GetFile()
 
     // B23: size 来自 acore 可构造为任意 32 位值；malloc(huge) 会 OOM/巨量分配。
     // 合法 /proc 文件不会超过 64MB（真实进程 maps 最多几 MB）。超限拒绝。
-    if (size > 64*1024*1024) {
+    if (size > MAX_PROC_FILE_SIZE) {
         error("proc file size %u exceeds sanity cap, acore corrupt", size);
         return NULL;
     }
@@ -488,6 +839,16 @@ ProcFile* Lz4Stream::GetFile()
         // 损坏 acore 的块类型不匹配：拒绝而非 assert abort
         if (hdr.block_type != BLOCK_TYPE_FILE) {
             error("expected FILE block, got type %u, acore corrupt", hdr.block_type);
+            free(pf);
+            return NULL;
+        }
+
+        // PutFile uses WriteBlock: the first block starts a logical file and
+        // every later block is explicitly marked as its continuation. Enforce
+        // that boundary so a FILE block cannot be spliced into another object.
+        bool expected_cont = (i != 0);
+        if ((hdr.prev_cont != 0) != expected_cont) {
+            error("FILE block continuation flag mismatch at offset %u (acore corrupt)", i);
             free(pf);
             return NULL;
         }
@@ -544,8 +905,10 @@ ProcFile* Lz4Stream::GetFile()
 
 void Lz4Stream::PrintStat()
 {
-    info("Compressed %lu bytes into %lu bytes ==> %0.2f", 
-            _size_real, _size_file, (double)_size_file/_size_real*100); 
+    double ratio = _size_real == 0 ? 0.0 :
+        (double)_size_file / _size_real * 100;
+    info("Compressed %lu bytes into %lu bytes ==> %0.2f%%",
+         _size_real, _size_file, ratio);
 }
 
 };

@@ -5,6 +5,8 @@
 #include <iostream> 
 #include <sstream> 
 #include <cstdarg>
+#include <cerrno>
+#include <climits>
 #include <fcntl.h>
 
 #include "inc.h"
@@ -28,6 +30,14 @@ const char* szProcType(ProcType type)
 
 ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path, bool *out_truncated)
 {
+    if (out_truncated) {
+        *out_truncated = false;
+    }
+    if (!buf || buf_len < (int)sizeof(ProcFile) + 1 || !path) {
+        errno = EINVAL;
+        error("invalid buffer or path for proc file read");
+        return NULL;
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         error("open %s failed", path);
@@ -42,26 +52,44 @@ ProcFile* ProcFile::ReadPath(char* buf, int buf_len, const char *path, bool *out
     int len = 0;
 
     for (;;) {
-        // 剩余空间不足时立即停止，避免越过 f_data 末尾写（B17）。
-        // 原实现读满后仍继续写，left 变负仍 read，堆/栈缓冲区溢出。
+        // 载荷区恰好读满时必须再探测 1 字节才能区分“完整读到 EOF”和
+        // “确实还有数据”。探测字节不写入调用方缓冲区，保持 B17 的边界。
         if (left <= 0) {
-            warn("buffer too small for %s, truncating at %d bytes", path, len);
-            if (out_truncated) { *out_truncated = true; }
+            char extra;
+            do {
+                rc = read(fd, &extra, 1);
+            } while (rc < 0 && errno == EINTR);
+            if (rc < 0) {
+                int saved_errno = errno;
+                error("read %s failed (%s)", path, strerror(saved_errno));
+                close(fd);
+                errno = saved_errno;
+                return NULL;
+            }
+            if (rc > 0) {
+                warn("buffer too small for %s, truncating at %d bytes", path, len);
+                if (out_truncated) { *out_truncated = true; }
+            }
             break;
         }
 
         rc = read(fd, pf->f_data+len, MIN(4096, left));
-        if (rc <= 0) {
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        if (rc < 0) {
+            int saved_errno = errno;
+            error("read %s failed (%s)", path, strerror(saved_errno));
+            close(fd);
+            errno = saved_errno;
+            return NULL;
+        }
+        if (rc == 0) {
             break;
         }
 
         len += rc;
         left -= rc;
-    }
-
-    if (left == 0) {
-        warn("buffer may be too small for %s", path);
-        if (out_truncated) { *out_truncated = true; }
     }
 
     close(fd);
@@ -76,10 +104,20 @@ ProcFile* ProcFile::Read(bool *out_truncated, char* buf, int buf_len, const char
 {
     char path[PATH_MAX];
 
+    if (!fmt) {
+        errno = EINVAL;
+        return NULL;
+    }
+
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(path, sizeof(path), fmt, ap);
+    int path_len = vsnprintf(path, sizeof(path), fmt, ap);
     va_end(ap);
+    if (path_len < 0 || path_len >= (int)sizeof(path)) {
+        errno = ENAMETOOLONG;
+        error("proc file path exceeds PATH_MAX");
+        return NULL;
+    }
 
     return ReadPath(buf, buf_len, path, out_truncated);
 }
@@ -131,28 +169,52 @@ int ProcDecoder::readline(int& cur, char *out, size_t n)
     return len;
 }
 
+int ProcDecoder::readline(int& cur, std::string& out)
+{
+    out.clear();
+    if (!_pf || cur < 0 || cur >= (int)_pf->f_size) {
+        return 0;
+    }
+
+    const char *begin = _pf->f_data + cur;
+    const char *end = _pf->f_data + _pf->f_size;
+    const char *line_end = begin;
+    while (line_end < end && *line_end != '\n') {
+        line_end++;
+    }
+    out.assign(begin, (size_t)(line_end - begin));
+    while (line_end < end && *line_end == '\n') {
+        line_end++;
+    }
+    cur = (int)(line_end - _pf->f_data);
+    return (int)out.size();
+}
+
 int ProcMaps::Parse()
 {
-    // B27: PATH_MAX 在 inc.h 被压到 128，真实映射路径（深容器/长库名）会超，
-    // 既有 readline 溢出风险又有路径截断。行缓冲与名字缓冲提到 4096。
-    const int MAPS_BUF = 4096;
-    char name[MAPS_BUF];
-    char line[MAPS_BUF];
-
+    clear();
     int cur = 0;
-    while (readline(cur, line, sizeof(line))) {
+    std::string line;
+    uint64_t previous_end = 0;
+    while (readline(cur, line)) {
+        // /proc/<pid>/maps is text. An embedded NUL makes sscanf stop at a
+        // valid-looking prefix while the path extraction below keeps the
+        // hidden suffix, producing a malformed NT_FILE note.
+        if (line.find('\0') != std::string::npos) {
+            error("maps line contains an embedded NUL, acore corrupt");
+            return -1;
+        }
         //printf("%s\n", line);
         MemRegion r = {};
         // b103 (Codex B103 review): perm 声明在循环外只清零一次——合法行之后出现
         // 在 %4s 前解析失败的畸形行时，会继承上一行权限（陈旧 perms/私有标志）。
         // 逐行清零 + 严格校验 sscanf 7 个转换，畸形行整体跳过，不再入表。
         char perm[16] = {0};
-        name[0] = 0;
         int consumed = 0;
         // R50-5: 偏移字段用 %8lx 会截断 ≥4GiB 的映射偏移（内核打印 %08llx 无上限）——
         // 9 位十六进制时 %8lx 读 8 位后空格不匹配，整行解析失败（offset/inode/name 全丢）。
         // 去掉宽度用 %lx 读全。格式不匹配时 perms 保持 0 而非垃圾。
-        int nfields = sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %n",
+        int nfields = sscanf(line.c_str(), "%lx-%lx %4s %lx %x:%x %lu %n",
                 &r.start_addr,
                 &r.end_addr,
                 perm,
@@ -162,17 +224,28 @@ int ProcMaps::Parse()
                 &r.inode,
                 &consumed);
         if (nfields != 7) {
-            // 畸形/截断行：跳过，不产生继承陈旧权限或部分解析的 region
-            continue;
+            error("malformed maps line, acore corrupt");
+            return -1;
         }
+        if (strlen(perm) != 4 ||
+            (perm[0] != 'r' && perm[0] != '-') ||
+            (perm[1] != 'w' && perm[1] != '-') ||
+            (perm[2] != 'x' && perm[2] != '-') ||
+            (perm[3] != 'p' && perm[3] != 's') ||
+            r.start_addr >= r.end_addr || r.start_addr < previous_end) {
+            error("invalid or overlapping maps region %lx-%lx, acore corrupt",
+                  (unsigned long)r.start_addr, (unsigned long)r.end_addr);
+            return -1;
+        }
+        previous_end = r.end_addr;
         // maps 第 6 列后的路径可能含空格或 (deleted) 后缀；%s 会截断，
         // 用 %n 定位 inode 字段结束位置，取剩余整行为映射名。
-        if (consumed > 0 && consumed < (int)sizeof(line)) {
-            const char *path = line + consumed;
-            while (*path == ' ' || *path == '\t') {
+        if (consumed > 0 && (size_t)consumed < line.size()) {
+            size_t path = (size_t)consumed;
+            while (path < line.size() && (line[path] == ' ' || line[path] == '\t')) {
                 path++;
             }
-            snprintf(name, sizeof(name), "%s", path);
+            r.name.assign(line, path, std::string::npos);
         }
 
         // decode perm bits
@@ -190,8 +263,6 @@ int ProcMaps::Parse()
         } else if (perm[3] == 's') {
             r.is_shared = 1;
         }
-        r.name = name;
-
         // B163: region 数无上限——构造 acore 的 maps 文件（GetFile 上限 64MB）可用
         // 2 字节短行（"x\n"）塞入海量 region，每 region 48 字节 + SSO string ≈ 42x
         // 内存放大（实测 2M 行 → 165MB），64MB 上限 → ~2.7GB → OOM abort；且
@@ -215,6 +286,7 @@ int ProcCmdline::Parse()
     if (!_pf) {
         return 0;
     }
+    argv.clear();
     const char* end = _pf->f_data + _pf->f_size;
     const char* p = _pf->f_data;
     // R50-5: 无上限——构造的 NUL 密集 cmdline（GetFile 上限 64MB）可产生约 64M 个
@@ -227,9 +299,16 @@ int ProcCmdline::Parse()
         }
         argv.push_back(std::string(p, (size_t)(q - p)));
         if (q >= end) {
-            break;   // 无 NUL 终止（损坏数据）：结束
+            p = end;
+            break;   // bounded final argument without NUL
         }
         p = q + 1;
+    }
+
+    if (p < end) {
+        error("cmdline exceeds %lu arguments, acore corrupt",
+              (unsigned long)MAX_ARGV);
+        return -1;
     }
 
     return argv.size();
@@ -241,10 +320,14 @@ int ProcStat::Parse()
     // /proc/<pid>/stat 格式 `pid (comm) state ppid ...`——comm 可能含空格/括号，
     // strtok 按空格切分会把字段整体错位。正确做法：取第一个 '(' 与最后一个 ')'，
     // '(' 前是 pid，')' 后才是真正按空格切的字段。字段不足时用 fld() 兜底 "0"。
-    if (!_pf) {
-        return 0;
+    if (!_pf || _pf->f_size == 0 || _pf->f_size >= 1024) {
+        error("stat missing or exceeds parser boundary, acore corrupt");
+        return -1;
     }
-
+    if (memchr(_pf->f_data, '\0', _pf->f_size) != NULL) {
+        error("stat contains an embedded NUL, acore corrupt");
+        return -1;
+    }
     char buf[1024];
     size_t n = _pf->f_size;
     if (n >= sizeof(buf)) {
@@ -259,6 +342,14 @@ int ProcStat::Parse()
     char *open = strchr(buf, '(');
     char *close = open ? strrchr(open, ')') : NULL;
     if (open && close) {
+        // task->comm may legally contain a newline. Only a newline after the
+        // closing ')' terminates the stat record; treating the first newline
+        // in the buffer as the terminator rejects a live, valid Linux task.
+        char *newline = strchr(close + 1, '\n');
+        if (newline && newline != buf + n - 1) {
+            error("stat contains data after its first record, acore corrupt");
+            return -1;
+        }
         // B63: comm = 括号内文本（内核 task->comm，可执行名）。可能含空格/括号，
         // 用长度拷贝（不能截到空格）。
         size_t clen = (size_t)(close - open - 1);
@@ -270,34 +361,40 @@ int ProcStat::Parse()
 
         // pid 在 '(' 之前
         *open = '\0';
-        char *tok = strtok(buf, " ");
+        char *saveptr = NULL;
+        char *tok = strtok_r(buf, " ", &saveptr);
         if (tok) {
             array[fields++] = tok;        // array[0] = pid
+        }
+        if (!tok || strtok_r(NULL, " ", &saveptr) != NULL) {
+            error("stat contains extra data before comm, acore corrupt");
+            return -1;
         }
         // array[1] 保留为 comm（不解析，保持索引与注释一致）
         // ')' 之后的字段：state ppid ...
         char *rest = close + 1;
         while (*rest == ' ') rest++;
-        tok = strtok(rest, " ");
+        tok = strtok_r(rest, " ", &saveptr);
         int idx = 2;                      // array[2] = state, array[3] = ppid ...
         while (tok) {
             if (idx >= (int)ARRAYSIZE(array) - 1) {
                 break;
             }
             array[idx++] = tok;
-            tok = strtok(NULL, " ");
+            tok = strtok_r(NULL, " ", &saveptr);
         }
         fields = idx;
     } else {
-        // 无括号：退化为空格切分（字段可能错位，但保证不崩溃）
-        char *tok = strtok(buf, " ");
-        while (tok) {
-            if (fields >= (int)ARRAYSIZE(array) - 1) {
-                break;
-            }
-            array[fields++] = tok;
-            tok = strtok(NULL, " ");
-        }
+        error("stat lacks a complete comm field, acore corrupt");
+        return -1;
+    }
+
+    // Every supported Linux /proc/<pid>/stat contains well beyond field 32;
+    // Arthur consumes through SigBlk (field 32). Missing fields previously
+    // became string "0" and yielded a plausible-looking but false PRSTATUS.
+    if (fields <= 31) {
+        error("stat has only %d fields, acore corrupt", fields);
+        return -1;
     }
 
     // 字段缺失时返回 "0" 而非 NULL，避免 strtol/解引用崩溃
@@ -305,6 +402,10 @@ int ProcStat::Parse()
         return (idx >= 0 && idx < fields && array[idx]) ? array[idx] : "0";
     };
 
+    if (fld(2)[0] == '\0' || fld(2)[1] != '\0') {
+        error("stat task state is not exactly one character, acore corrupt");
+        return -1;
+    }
     sname = fld(2)[0];
     // b25 (Codex review): ELF prpsinfo 的 pr_state 由内核 fill_psinfo 填
     // task_state_index(p)，即 fs/proc/array.c task_state_array 的**序数**
@@ -322,24 +423,84 @@ int ProcStat::Parse()
         case 'Z': state=6; break;   // index 6 (zombie)
         case 'P': state=7; break;   // index 7 (parked)
         case 'I': state=8; break;   // index 8 (idle)
-        default: state=0; break;
+        // Linux 2.6.33-3.13 exposed these transient states. Arthur still
+        // reads v1-v3 archives from that era; retain approximate modern
+        // equivalents instead of rejecting an otherwise valid old stat.
+        case 'x': state=5; break;   // dead
+        case 'K': state=2; break;   // wakekill
+        case 'W': state=0; break;   // waking (also pre-2.6 paging)
+        default:
+            error("stat has invalid task state '%c', acore corrupt", sname);
+            return -1;
     }
 
-    pid = strtol(fld(0), NULL, 10);
-    ppid = strtol(fld(3), NULL, 10);
-    pgid = strtol(fld(4), NULL, 10);
-    sid = strtol(fld(5), NULL, 10);
+    auto parse_signed = [&](int idx, long& out) -> bool {
+        const char *text = fld(idx);
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(text, &end, 10);
+        if (end == text || *end != '\0' || errno == ERANGE) {
+            error("stat field %d is not a valid signed integer, acore corrupt", idx + 1);
+            return false;
+        }
+        out = value;
+        return true;
+    };
+    auto parse_unsigned = [&](int idx, unsigned long& out) -> bool {
+        const char *text = fld(idx);
+        if (*text == '-') {
+            error("stat field %d is unexpectedly negative, acore corrupt", idx + 1);
+            return false;
+        }
+        char *end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(text, &end, 10);
+        if (end == text || *end != '\0' || errno == ERANGE) {
+            error("stat field %d is not a valid unsigned integer, acore corrupt", idx + 1);
+            return false;
+        }
+        out = value;
+        return true;
+    };
+
+    long parsed_pid, parsed_ppid, parsed_pgid, parsed_sid;
+    long parsed_nice, parsed_num_threads, parsed_rss;
+    unsigned long parsed_flags, parsed_utime, parsed_stime, parsed_cutime;
+    unsigned long parsed_cstime, parsed_vsize, parsed_pending, parsed_blocked;
+    if (!parse_signed(0, parsed_pid) || !parse_signed(3, parsed_ppid) ||
+        !parse_signed(4, parsed_pgid) || !parse_signed(5, parsed_sid) ||
+        !parse_unsigned(8, parsed_flags) || !parse_unsigned(13, parsed_utime) ||
+        !parse_unsigned(14, parsed_stime) || !parse_unsigned(15, parsed_cutime) ||
+        !parse_unsigned(16, parsed_cstime) || !parse_signed(18, parsed_nice) ||
+        !parse_signed(19, parsed_num_threads) || !parse_unsigned(22, parsed_vsize) ||
+        !parse_signed(23, parsed_rss) || !parse_unsigned(30, parsed_pending) ||
+        !parse_unsigned(31, parsed_blocked)) {
+        return -1;
+    }
+    if (parsed_pid <= 0 || parsed_pid > INT_MAX || parsed_ppid < 0 ||
+        parsed_ppid > INT_MAX || parsed_pgid < 0 || parsed_pgid > INT_MAX ||
+        parsed_sid < 0 || parsed_sid > INT_MAX || parsed_nice < -20 ||
+        parsed_nice > 19 || parsed_num_threads <= 0 ||
+        parsed_num_threads > INT_MAX || parsed_rss < 0) {
+        error("stat numeric field outside supported range, acore corrupt");
+        return -1;
+    }
+
+    pid = (pid_t)parsed_pid;
+    ppid = (pid_t)parsed_ppid;
+    pgid = (pid_t)parsed_pgid;
+    sid = (pid_t)parsed_sid;
 
     /* kernel uses jiffies, here changed to MS
      */
-    utime = strtoul(fld(13), NULL, 10);
-    stime = strtoul(fld(14), NULL, 10);
-    cutime = strtoul(fld(15), NULL, 10);
-    cstime = strtoul(fld(16), NULL, 10);
+    utime = parsed_utime;
+    stime = parsed_stime;
+    cutime = parsed_cutime;
+    cstime = parsed_cstime;
 
     /* kernel task_vsize, PAGESIZE * mm->total_vm
      */
-    vsize = strtoul(fld(22), NULL, 10) / 1024;
+    vsize = parsed_vsize / 1024;
 
     /* kernel mm_struct, rss is anon_rss + file_rss pages
      */
@@ -347,17 +508,21 @@ int ProcStat::Parse()
     // 上偏小 16 倍。用真实页大小（采集侧==宿主，ptrace 同架构）。
     {
         static long page_size = sysconf(_SC_PAGESIZE);
-        rss = strtoul(fld(23), NULL, 10) * (unsigned long)page_size / 1024;
+        if (page_size <= 0 || (unsigned long)parsed_rss > ULONG_MAX / (unsigned long)page_size) {
+            error("stat rss conversion overflows, acore corrupt");
+            return -1;
+        }
+        rss = (unsigned long)parsed_rss * (unsigned long)page_size / 1024;
     }
 
     // num_threads
-    num_threads = strtoul(fld(19), NULL, 10);
+    num_threads = (int)parsed_num_threads;
 
     // B25: 补充 note 字段
-    flags = strtoul(fld(8), NULL, 10);    // stat 字段 9
-    nice = (int)strtol(fld(18), NULL, 10); // stat 字段 19
-    pending = strtoul(fld(30), NULL, 10); // stat 字段 31
-    blocked = strtoul(fld(31), NULL, 10); // stat 字段 32
+    flags = parsed_flags;       // stat field 9
+    nice = (int)parsed_nice;    // stat field 19
+    pending = parsed_pending;   // stat field 31
+    blocked = parsed_blocked;   // stat field 32
 
     return 0;
 }
@@ -366,9 +531,14 @@ int ProcAuxv::Parse()
 {
     // B28: ProcFile 是 #pragma pack(1)，f_data 在偏移 9（未对齐）；直接
     // (uint64_t*) 解引用在 aarch64 上可能 fault。用 memcpy 逐对读。
-    if (!_pf) {
-        return 0;
+    if (!_pf || _pf->f_size < 2 * sizeof(uint64_t) ||
+        (_pf->f_size % (2 * sizeof(uint64_t))) != 0) {
+        error("auxv size %u is not a complete entry sequence, acore corrupt",
+              _pf ? _pf->f_size : 0);
+        return -1;
     }
+    uid = gid = euid = egid = 0;
+    page_size = 0;
     const char* base = _pf->f_data;
     size_t count = _pf->f_size / 8;
     for (size_t i = 0; i + 1 < count; i += 2) {
@@ -377,30 +547,129 @@ int ProcAuxv::Parse()
         memcpy(&val, base + (i + 1) * 8, 8);
         switch (type) {
             case AT_NULL:
-                // end mark
+                if (i + 2 != count) {
+                    error("auxv contains data after AT_NULL, acore corrupt");
+                    return -1;
+                }
                 return 0;
-                break;
 
             case AT_UID:
+                if (val > UINT32_MAX) {
+                    error("auxv AT_UID exceeds uid_t range, acore corrupt");
+                    return -1;
+                }
                 uid = (uint32_t)val;
                 break;
 
             case AT_GID:
+                if (val > UINT32_MAX) {
+                    error("auxv AT_GID exceeds gid_t range, acore corrupt");
+                    return -1;
+                }
                 gid = (uint32_t)val;
                 break;
 
             case AT_EUID:
+                if (val > UINT32_MAX) {
+                    error("auxv AT_EUID exceeds uid_t range, acore corrupt");
+                    return -1;
+                }
                 euid = (uint32_t)val;
                 break;
 
             case AT_EGID:
+                if (val > UINT32_MAX) {
+                    error("auxv AT_EGID exceeds gid_t range, acore corrupt");
+                    return -1;
+                }
                 egid = (uint32_t)val;
+                break;
+
+            case AT_PAGESZ:
+                if (val == 0 || val > UINT32_MAX || (val & (val - 1)) != 0) {
+                    error("auxv AT_PAGESZ is invalid, acore corrupt");
+                    return -1;
+                }
+                page_size = val;
                 break;
         }
     }
 
+    error("auxv missing AT_NULL terminator, acore corrupt");
+    return -1;
+}
+
+int ProcStatus::Parse()
+{
+    if (!_pf || _pf->f_size == 0 ||
+        memchr(_pf->f_data, '\0', _pf->f_size) != NULL) {
+        error("status missing or contains an embedded NUL");
+        return -1;
+    }
+
+    bool saw_uid = false;
+    bool saw_gid = false;
+    int cur = 0;
+    std::string line;
+    while (readline(cur, line)) {
+        const char *field = NULL;
+        uint32_t *real_id = NULL;
+        bool *seen = NULL;
+        if (line.compare(0, 4, "Uid:") == 0) {
+            field = "Uid";
+            real_id = &uid;
+            seen = &saw_uid;
+        } else if (line.compare(0, 4, "Gid:") == 0) {
+            field = "Gid";
+            real_id = &gid;
+            seen = &saw_gid;
+        } else {
+            continue;
+        }
+
+        if (*seen) {
+            error("status contains duplicate %s field", field);
+            return -1;
+        }
+        *seen = true;
+
+        const char *p = line.c_str() + 4;
+        uint32_t values[4] = {};
+        for (size_t i = 0; i < ARRAYSIZE(values); i++) {
+            bool separated = false;
+            while (*p == ' ' || *p == '\t') {
+                separated = true;
+                p++;
+            }
+            if (!separated || *p < '0' || *p > '9') {
+                error("status %s field lacks four valid IDs", field);
+                return -1;
+            }
+            char *end = NULL;
+            errno = 0;
+            unsigned long long value = strtoull(p, &end, 10);
+            if (end == p || errno == ERANGE || value > UINT32_MAX) {
+                error("status %s field contains an out-of-range ID", field);
+                return -1;
+            }
+            values[i] = (uint32_t)value;
+            p = end;
+        }
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p != '\0') {
+            error("status %s field contains trailing data", field);
+            return -1;
+        }
+        *real_id = values[0];
+    }
+
+    if (!saw_uid || !saw_gid) {
+        error("status is missing Uid or Gid credentials");
+        return -1;
+    }
     return 0;
 }
 
 }; // arthur
-
