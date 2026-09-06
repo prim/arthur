@@ -192,8 +192,33 @@ int main(int argc, char **argv)
     assert(reader.Open(trailing_stream.c_str()) == 0);
     assert(reader.ReadBlock(hdr) != NULL);
     assert(reader.ReadBlock(hdr) == NULL && reader.TailSeen());
+    long tail_end = reader.Tell();
+    assert(reader.ReadBlock(hdr) == NULL && reader.LastReadClean());
+    assert(reader.Tell() == tail_end);
     assert(reader.VerifyPhysicalEof() == -1);
     assert(reader.VerifyPhysicalEof() == -1);
+    long failed_end = reader.Tell();
+    assert(reader.ReadBlock(hdr) == NULL && !reader.LastReadClean());
+    assert(reader.Tell() == failed_end);
+    assert(reader.VerifyPhysicalEof() == -1);
+    assert(reader.Close() == 0);
+
+    std::string invalid_block_stream = std::string(argv[2]) + ".invalid-block.z4";
+    assert(writer.Open(invalid_block_stream.c_str()) == 0);
+    BlockHeader invalid_block;
+    invalid_block.block_type = BLOCK_TYPE_STREAM;
+    invalid_block.size = 1;
+    assert(writer.WriteRaw(reinterpret_cast<const char *>(&invalid_block),
+                           sizeof(invalid_block)) == (int)sizeof(invalid_block));
+    assert(writer.WriteRaw("\0", 1) == 1); // Decodes to an invalid empty block.
+    assert(writer.WriteRaw(reinterpret_cast<const char *>(&boundary_tail),
+                           sizeof(boundary_tail)) == (int)sizeof(boundary_tail));
+    assert(writer.Close() == 0);
+    assert(reader.Open(invalid_block_stream.c_str()) == 0);
+    assert(reader.ReadBlock(hdr) == NULL && !reader.LastReadClean());
+    long invalid_end = reader.Tell();
+    assert(reader.ReadBlock(hdr) == NULL && !reader.LastReadClean());
+    assert(!reader.TailSeen() && reader.Tell() == invalid_end);
     assert(reader.Close() == 0);
 
     assert(reader.Open(proc_size_stream.c_str()) == 0);

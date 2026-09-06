@@ -65,14 +65,17 @@ int main()
     // Linux task names may contain a newline. In /proc/<tid>/stat it remains
     // inside the parenthesized comm field and must not be mistaken for a
     // second stat record.
-    assert(prctl(PR_SET_NAME, "line1\nline2", 0, 0, 0) == 0);
     char named_stat_buf[4096];
-    ProcFile *named_stat_file = ProcFile::ReadPid(
-        named_stat_buf, sizeof(named_stat_buf), getpid(), PROC_TYPE_STAT);
-    assert(named_stat_file != NULL);
-    ProcStat named_stat(named_stat_file);
-    assert(named_stat.Parse() == 0);
-    assert(strcmp(named_stat.comm, "line1\nline2") == 0);
+    const char *task_names[] = {"line1\nline2", "", "(paren)", "right) space", "(\n)"};
+    for (const char *name : task_names) {
+        assert(prctl(PR_SET_NAME, name, 0, 0, 0) == 0);
+        ProcFile *named_stat_file = ProcFile::ReadPid(
+            named_stat_buf, sizeof(named_stat_buf), getpid(), PROC_TYPE_STAT);
+        assert(named_stat_file != NULL);
+        ProcStat named_stat(named_stat_file);
+        assert(named_stat.Parse() == 0);
+        assert(strcmp(named_stat.comm, name) == 0);
+    }
     assert(prctl(PR_SET_NAME, "proc_test", 0, 0, 0) == 0);
 
     ProcMaps empty_maps;

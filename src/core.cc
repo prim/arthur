@@ -2744,7 +2744,7 @@ static int belongs_to_thread_group(pid_t leader, pid_t tid)
 int Coredump::monitor_threads(pid_t leader)
 {
     _monitor_tids.clear();
-    _ptrace_options = PTRACE_O_TRACEEXIT | PTRACE_O_TRACECLONE;
+    _ptrace_options = PTRACE_O_TRACEEXIT | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
 
     for (int round = 0; round < 64; round++) {
         std::set<pid_t> observed;
@@ -4171,6 +4171,16 @@ int Coredump::generate(const char *corefile)
 // verified completely), the caller falls back to a direct parent snapshot.
 static bool fork_snapshot_requires_direct_capture(pid_t pid, ProcMaps& maps)
 {
+    user_regs64_struct regs;
+    if (pt_getregs(pid, &regs) != 0) {
+        warn("cannot inspect syscall restart state; using direct snapshot");
+        return true;
+    }
+    if (regs_has_restart_return(regs)) {
+        info("target is in a restartable syscall; using direct snapshot");
+        return true;
+    }
+
     for (const MemRegion& region : maps) {
         if (region.perms != 0 && region.is_shared) {
             info("captured MAP_SHARED mapping found; using direct snapshot");
@@ -6093,6 +6103,16 @@ int Coredump::monitor(const char* corefile)
                 }
                 if (wr < 0) {
                     int wait_errno = errno;
+                    if (tid != _pid &&
+                        (wait_errno == ECHILD || wait_errno == ESRCH) &&
+                        belongs_to_thread_group(_pid, tid) == 0) {
+                        // A non-leader exec can retire its old TID before the
+                        // TGID's EXEC event is drained. kill(old_tid, 0) is not
+                        // a reliable membership test during this transition.
+                        _monitor_tids.erase(tid);
+                        progress = true;
+                        continue;
+                    }
                     if ((wait_errno == ECHILD || wait_errno == ESRCH) &&
                         kill(tid, 0) != 0 && errno == ESRCH) {
                         _monitor_tids.erase(tid);
@@ -6133,6 +6153,20 @@ int Coredump::monitor(const char* corefile)
 
                 int sig = WSTOPSIG(status);
                 int event = (status >> 16) & 0xffff;
+                if (event == PTRACE_EVENT_EXEC) {
+                    // A non-leader exec destroys its siblings and assumes the
+                    // TGID. Its old TID and the old leader's EXIT state no
+                    // longer describe the replacement process.
+                    _monitor_tids.clear();
+                    _monitor_tids.insert(_pid);
+                    _monitor_leader_exited = false;
+                    _monitor_relay_signals.clear();
+                    process_in_group_stop = false;
+                    if (!crash_found && !resume(tid, 0)) {
+                        return -1;
+                    }
+                    break; // Rebuild the iteration after the TID replacement.
+                }
                 if (event == PTRACE_EVENT_CLONE) {
                     unsigned long child = 0;
                     if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &child) != 0 || child == 0) {
@@ -6199,6 +6233,12 @@ int Coredump::monitor(const char* corefile)
                         }
                         process_in_group_stop = true;
                     } else if (!crash_found) {
+                        // SIGCONT resumes job control even when blocked or
+                        // ignored, so a delivery-stop need not follow. LISTEN
+                        // reports that wakeup as EVENT_STOP/SIGTRAP instead.
+                        if (event == PTRACE_EVENT_STOP && sig == SIGTRAP) {
+                            process_in_group_stop = false;
+                        }
                         if (!resume(tid, 0)) {
                             return -1;
                         }
@@ -6366,7 +6406,11 @@ int Coredump::monitor(const char* corefile)
             }
             info("writing out %s...", dump_path.c_str());
             signal_forkcore = forkcore_m(dump_path.c_str(), false);
-            info("writing out acore finished, resume monitoring");
+            if (signal_forkcore == 0 && !_monitor_recovery_failed) {
+                info("writing out acore finished, resume monitoring");
+            } else {
+                warn("SIGUSR1 snapshot did not complete (status %d)", signal_forkcore);
+            }
             if (_monitor_recovery_failed) {
                 error("SIGUSR1 snapshot could not restore every monitored thread");
                 detach_monitored_threads();

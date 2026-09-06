@@ -12,6 +12,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t trigger;
@@ -179,6 +180,25 @@ int main(int argc, char **argv)
         return 42;
     }
 
+    if (strcmp(argv[1], "syscall-read") == 0) {
+        int pipe_fds[2];
+        char byte;
+        if (pipe(pipe_fds) != 0) {
+            return 4;
+        }
+        ready();
+        for (;;) {
+            (void)read(pipe_fds[0], &byte, 1);
+        }
+    }
+    if (strcmp(argv[1], "syscall-sleep") == 0) {
+        ready();
+        for (;;) {
+            struct timespec duration = {60, 0};
+            nanosleep(&duration, NULL);
+        }
+    }
+
     if (strcmp(argv[1], "relay-cont") == 0) {
         signal(SIGCONT, on_signal);
         ready();
@@ -186,6 +206,24 @@ int main(int argc, char **argv)
             pause();
         }
         return 42;
+    }
+
+    if (strcmp(argv[1], "blocked-cont") == 0 ||
+        strcmp(argv[1], "ignored-cont") == 0) {
+        if (strcmp(argv[1], "blocked-cont") == 0) {
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCONT);
+            if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
+                return 3;
+            }
+        } else {
+            signal(SIGCONT, SIG_IGN);
+        }
+        ready();
+        for (;;) {
+            pause();
+        }
     }
 
     if (strcmp(argv[1], "exec") == 0) {

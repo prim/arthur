@@ -636,6 +636,16 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
         return NULL;
     }
 
+    // Neither a failed decode nor TailMark starts a new block sequence.
+    // Keep the terminal state and file position stable on repeated reads.
+    if (!_eof_clean) {
+        errno = EPROTO;
+        return NULL;
+    }
+    if (_tail_seen) {
+        return NULL;
+    }
+
     // next block
     _block_index++;
     Block& block = CurrentBlock(); 

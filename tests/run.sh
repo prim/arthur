@@ -38,6 +38,7 @@ wait_for_log() {
 start_fixture() {
     local mode=$1
     shift
+    : >"$TEST_TMP/fixture.log"
     "$TEST_TMP/fixture" "$mode" "$@" >"$TEST_TMP/fixture.log" 2>&1 &
     FIXTURE_PID=$!
     TARGET_PIDS+=("$FIXTURE_PID")
@@ -261,6 +262,103 @@ if [[ $STREAM_RC -eq 0 ]] ||
     exit 1
 fi
 grep -q "seekable input" "$TEST_TMP/stream.log"
+fi
+
+# A failed snapshot must not claim completion, and a later request can retry.
+if [[ $CASE == snapshot-failure || $CASE == all ]]; then
+CASE_RAN=1
+start_fixture memory 8
+ARTHUR_FAIL_FCLOSE="acore.$FIXTURE_PID." LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+    "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$TEST_TMP/snapshot-failure.acore" \
+    >"$TEST_TMP/snapshot-failure.log" 2>&1 &
+FAILURE_MONITOR_PID=$!
+TARGET_PIDS+=("$FAILURE_MONITOR_PID")
+wait_for_log "$TEST_TMP/snapshot-failure.log" "Launched in monitor mode"
+kill -USR1 "$FAILURE_MONITOR_PID"
+wait_for_log "$TEST_TMP/snapshot-failure.log" "forkcore failed"
+if grep -q 'writing out acore finished' "$TEST_TMP/snapshot-failure.log" ||
+   find "$TEST_TMP" -maxdepth 1 -name "acore.$FIXTURE_PID.*" | grep -q .; then
+    echo "failed snapshot claimed success or retained an output" >&2
+    cat "$TEST_TMP/snapshot-failure.log" >&2
+    exit 1
+fi
+kill -USR1 "$FAILURE_MONITOR_PID"
+wait_for_log "$TEST_TMP/snapshot-failure.log" "writing out acore finished"
+RECOVERED_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+    -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' -print -quit)
+[[ -n $RECOVERED_SNAPSHOT ]]
+expect_status 0 "$ARTHUR_BIN" -c "$RECOVERED_SNAPSHOT" -o "$TEST_TMP/recovered.core"
+kill -TERM "$FAILURE_MONITOR_PID"
+expect_status 0 wait "$FAILURE_MONITOR_PID"
+[[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+kill -TERM "$FIXTURE_PID"
+expect_status 143 wait "$FIXTURE_PID"
+fi
+
+if [[ $CASE == syscall-fallback || $CASE == all ]]; then
+CASE_RAN=1
+for syscall_mode in memory syscall-read syscall-sleep; do
+start_fixture "$syscall_mode" 8
+for _ in $(seq 1 200); do
+    [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == S ]] && break
+    sleep 0.01
+done
+expect_status 0 "$ARTHUR_BIN" -p "$FIXTURE_PID" -0 \
+    -o "$TEST_TMP/syscall.acore" >"$TEST_TMP/syscall.log" 2>&1
+grep -q 'restartable syscall; using direct snapshot' "$TEST_TMP/syscall.log"
+expect_status 0 "$ARTHUR_BIN" -c "$TEST_TMP/syscall.acore" -o "$TEST_TMP/syscall.core"
+[[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+kill -TERM "$FIXTURE_PID"
+expect_status 143 wait "$FIXTURE_PID"
+done
+fi
+
+if [[ $CASE == monitor-cont || $CASE == all ]]; then
+CASE_RAN=1
+for cont_mode in blocked-cont ignored-cont; do
+    start_fixture "$cont_mode"
+    "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$TEST_TMP/$cont_mode.acore" \
+        >"$TEST_TMP/$cont_mode.log" 2>&1 &
+    CONT_MONITOR_PID=$!
+    TARGET_PIDS+=("$CONT_MONITOR_PID")
+    wait_for_log "$TEST_TMP/$cont_mode.log" "Launched in monitor mode"
+    kill -STOP "$FIXTURE_PID"
+    for _ in $(seq 1 200); do
+        CONT_STATE=$(awk '{print $3}' "/proc/$FIXTURE_PID/stat")
+        [[ $CONT_STATE =~ ^[Tt]$ ]] && break
+        sleep 0.01
+    done
+    [[ $CONT_STATE =~ ^[Tt]$ ]]
+    kill -USR1 "$CONT_MONITOR_PID"
+    wait_for_log "$TEST_TMP/$cont_mode.log" "group-stop; skipping SIGUSR1 dump"
+    kill -CONT "$FIXTURE_PID"
+    for _ in $(seq 1 200); do
+        CONT_STATE=$(awk '{print $3}' "/proc/$FIXTURE_PID/stat")
+        [[ ! $CONT_STATE =~ ^[Tt]$ ]] && break
+        sleep 0.01
+    done
+    [[ ! $CONT_STATE =~ ^[TtZ]$ ]]
+    kill -USR1 "$CONT_MONITOR_PID"
+    if ! wait_for_log "$TEST_TMP/$cont_mode.log" "writing out acore finished"; then
+        cat "$TEST_TMP/$cont_mode.log" >&2
+        exit 1
+    fi
+    CONT_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+        -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' -print -quit)
+    if [[ -z $CONT_SNAPSHOT ]]; then
+        cat "$TEST_TMP/$cont_mode.log" >&2
+        exit 1
+    fi
+    expect_status 0 "$ARTHUR_BIN" -c "$CONT_SNAPSHOT" -o "$TEST_TMP/$cont_mode.core"
+    "$TEST_TMP/core_note_test" "$TEST_TMP/$cont_mode.core" \
+        "$(id -u)" "$(id -g)" 0 0x600 1 0 5
+    kill -TERM "$CONT_MONITOR_PID"
+    expect_status 0 wait "$CONT_MONITOR_PID"
+    [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+    [[ ! -e "$TEST_TMP/$cont_mode.acore" ]]
+    kill -TERM "$FIXTURE_PID"
+    expect_status 143 wait "$FIXTURE_PID"
+done
 fi
 
 # Stopping Arthur itself must release every ptrace relationship, leave the
@@ -1287,7 +1385,9 @@ fi
 # Monitor must follow the replacement image and continue tracing it.
 if [[ $CASE == exec || $CASE == all ]]; then
 CASE_RAN=1
+for exec_signal in TERM SEGV; do
 start_fixture exec
+: >"$TEST_TMP/exec-monitor.log"
 timeout 20s "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 \
     -o "$TEST_TMP/exec.acore" >"$TEST_TMP/exec-monitor.log" 2>&1 &
 MONITOR_PID=$!
@@ -1308,15 +1408,41 @@ for _ in $(seq 1 200); do
 done
 if [[ $EXEC_SEEN -ne 1 ]] || ! kill -0 "$MONITOR_PID" 2>/dev/null; then
     echo "monitor treated a successful exec as a fatal SIGTRAP" >&2
+    cat "$TEST_TMP/exec-monitor.log" >&2
     exit 1
 fi
-kill -TERM "$FIXTURE_PID"
-expect_status 143 wait "$FIXTURE_PID"
+# A non-leader exec replaces the old leader and takes over its PID. The
+# replacement must remain usable, not inherit a stale leader-exited flag.
+EXEC_MONITOR_PID=$(find_timeout_child "$MONITOR_PID")
+kill -USR1 "$EXEC_MONITOR_PID"
+if ! wait_for_log "$TEST_TMP/exec-monitor.log" "writing out acore finished"; then
+    cat "$TEST_TMP/exec-monitor.log" >&2
+    exit 1
+fi
+EXEC_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+    -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' -print -quit)
+if [[ -z $EXEC_SNAPSHOT ]]; then
+    cat "$TEST_TMP/exec-monitor.log" >&2
+    exit 1
+fi
+expect_status 0 "$ARTHUR_BIN" -c "$EXEC_SNAPSHOT" -o "$TEST_TMP/exec.core"
+kill -"$exec_signal" "$FIXTURE_PID"
+if [[ $exec_signal == TERM ]]; then
+    expect_status 143 wait "$FIXTURE_PID"
+else
+    expect_status 139 wait "$FIXTURE_PID"
+fi
 expect_status 0 wait "$MONITOR_PID"
-if [[ -e "$TEST_TMP/exec.acore" ]]; then
+if [[ $exec_signal == TERM && -e "$TEST_TMP/exec.acore" ]]; then
     echo "normal exec produced a false crash acore" >&2
     exit 1
 fi
+if [[ $exec_signal == SEGV ]]; then
+    expect_status 0 "$ARTHUR_BIN" -c "$TEST_TMP/exec.acore" -o "$TEST_TMP/exec-crash.core"
+    "$TEST_TMP/core_note_test" "$TEST_TMP/exec-crash.core" \
+        "$(id -u)" "$(id -g)" 0x600 0 1 11 11
+fi
+done
 fi
 
 # PTRACE_EVENT_CLONE can describe an independent process (non-SIGCHLD exit

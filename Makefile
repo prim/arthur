@@ -52,6 +52,7 @@ test: $(TARGET)
 	@bash tests/run.sh cli
 	@bash tests/run.sh stream
 	@bash tests/run.sh monitor-stop
+	@bash tests/run.sh monitor-cont
 	@bash tests/run.sh monitor-errors
 	@bash tests/run.sh recovery-errors
 	@bash tests/run.sh child-cleanup
@@ -66,6 +67,7 @@ test: $(TARGET)
 	@bash tests/run.sh restore-failure
 	@bash tests/run.sh mode0-relay
 	@bash tests/run.sh static-fallback
+	@bash tests/run.sh syscall-fallback
 	@bash tests/run.sh dontfork
 	@bash tests/run.sh shared
 	@bash tests/run.sh late-thread
@@ -82,6 +84,7 @@ test: $(TARGET)
 	@bash tests/run.sh group-stop
 	@bash tests/run.sh relay
 	@bash tests/run.sh snapshot
+	@bash tests/run.sh snapshot-failure
 	@bash tests/run.sh snapshot-collision
 	@bash tests/run.sh fork-cont
 	@bash tests/run.sh race
