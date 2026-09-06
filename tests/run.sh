@@ -264,6 +264,48 @@ fi
 grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
+# A signal-delivery stop can precede the requested INTERRUPT stop.
+if [[ $CASE == interrupt-relay || $CASE == all ]]; then
+CASE_RAN=1
+for interrupt_signal in 15 11; do
+    if [[ $interrupt_signal == 15 ]]; then
+        start_fixture relay-term
+        INTERRUPT_TARGET_STATUS=42
+    else
+        start_fixture memory 8
+        INTERRUPT_TARGET_STATUS=139
+    fi
+    ARTHUR_DELIVERY_BEFORE_INTERRUPT=$interrupt_signal LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+        "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 \
+        -o "$TEST_TMP/interrupt-$interrupt_signal.acore" \
+        >"$TEST_TMP/interrupt-$interrupt_signal.log" 2>&1 &
+    INTERRUPT_MONITOR_PID=$!
+    TARGET_PIDS+=("$INTERRUPT_MONITOR_PID")
+    wait_for_log "$TEST_TMP/interrupt-$interrupt_signal.log" "Launched in monitor mode"
+    kill -USR1 "$INTERRUPT_MONITOR_PID"
+    if ! wait_for_process_exit "$FIXTURE_PID"; then
+        cat "$TEST_TMP/interrupt-$interrupt_signal.log" >&2
+        exit 1
+    fi
+    expect_status "$INTERRUPT_TARGET_STATUS" wait "$FIXTURE_PID"
+    if ! wait_for_process_exit "$INTERRUPT_MONITOR_PID"; then
+        cat "$TEST_TMP/interrupt-$interrupt_signal.log" >&2
+        exit 1
+    fi
+    expect_status 0 wait "$INTERRUPT_MONITOR_PID"
+    grep -q "delivery $interrupt_signal stopped before INTERRUPT" \
+        "$TEST_TMP/interrupt-$interrupt_signal.log"
+    if [[ $interrupt_signal == 15 ]]; then
+        [[ ! -e "$TEST_TMP/interrupt-$interrupt_signal.acore" ]]
+    else
+        expect_status 0 "$ARTHUR_BIN" -c "$TEST_TMP/interrupt-$interrupt_signal.acore" \
+            -o "$TEST_TMP/interrupt.core"
+        "$TEST_TMP/core_note_test" "$TEST_TMP/interrupt.core" \
+            "$(id -u)" "$(id -g)" 0x600 0 1 11 11
+    fi
+done
+fi
+
 # A failed snapshot must not claim completion, and a later request can retry.
 if [[ $CASE == snapshot-failure || $CASE == all ]]; then
 CASE_RAN=1
@@ -1898,6 +1940,38 @@ if [[ $SEEK_RC -eq 0 || $SEEK_RC -eq 134 ]] ||
     exit 1
 fi
 grep -q "seek to ELF header failed" "$TEST_TMP/seek-fail.log"
+fi
+
+# A rollback failure leaves the displaced producer's bytes at the temporary
+# name. They must survive the outer capture/converter error cleanup.
+if [[ $CASE == atomic-recovery || $CASE == all ]]; then
+CASE_RAN=1
+start_fixture memory-spin 8
+for recovery_mode in 1 0 convert; do
+    RECOVERY_OUTPUT="$TEST_TMP/rollback-$recovery_mode.acore"
+    printf 'initial-output\n' >"$RECOVERY_OUTPUT"
+    if [[ $recovery_mode == convert ]]; then
+        recovery_args=(-c "$TEST_TMP/rollback-1.acore.published")
+    else
+        recovery_args=(-p "$FIXTURE_PID" "-$recovery_mode")
+    fi
+    expect_status 255 timeout 20s env ARTHUR_SWAP_OUTPUT_AFTER_LSTAT="$RECOVERY_OUTPUT" \
+        ARTHUR_MOVE_OUTPUT_BEFORE_ROLLBACK=1 LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+        "$ARTHUR_BIN" "${recovery_args[@]}" -o "$RECOVERY_OUTPUT" \
+        >"$TEST_TMP/rollback-$recovery_mode.log" 2>&1
+    grep -q 'rollback failed' "$TEST_TMP/rollback-$recovery_mode.log"
+    RECOVERY_SAVED=$(find "$TEST_TMP" -maxdepth 1 -type f \
+        -name "rollback-$recovery_mode.acore.tmp.*" -print -quit)
+    if [[ -z $RECOVERY_SAVED ]] ||
+       [[ $(<"$RECOVERY_SAVED") != last-window-writer-output ]]; then
+        echo "rollback failure deleted the displaced producer output" >&2
+        cat "$TEST_TMP/rollback-$recovery_mode.log" >&2
+        exit 1
+    fi
+    [[ -s "$RECOVERY_OUTPUT.published" && ! -e $RECOVERY_OUTPUT ]]
+done
+kill -TERM "$FIXTURE_PID"
+expect_status 143 wait "$FIXTURE_PID"
 fi
 
 # Opening a capture output must not truncate a prior artifact before Arthur

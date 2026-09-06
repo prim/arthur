@@ -281,12 +281,12 @@ int ProcMaps::Parse()
 
 int ProcCmdline::Parse()
 {
+    argv.clear();
     // B37: 原实现 std::string(p) 依赖 strlen——损坏 acore 的 cmdline 数据无 NUL
     // 终止时越界读。改用显式长度构造，并限定扫描范围。
     if (!_pf) {
         return 0;
     }
-    argv.clear();
     const char* end = _pf->f_data + _pf->f_size;
     const char* p = _pf->f_data;
     // R50-5: 无上限——构造的 NUL 密集 cmdline（GetFile 上限 64MB）可产生约 64M 个

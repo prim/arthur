@@ -52,6 +52,7 @@ int lstat(const char *pathname, struct stat *statbuf)
     static int (*real_lstat)(const char *, struct stat *);
     static unsigned matching_calls;
     static int swapped;
+    static int moved_published;
     if (!real_lstat) {
         real_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_NEXT, "lstat");
     }
@@ -75,6 +76,16 @@ int lstat(const char *pathname, struct stat *statbuf)
             }
         }
     }
+    if (rc == 0 && target && swapped && !moved_published &&
+        getenv("ARTHUR_MOVE_OUTPUT_BEFORE_ROLLBACK") &&
+        strncmp(pathname, target, strlen(target)) == 0 &&
+        strncmp(pathname + strlen(target), ".tmp.", 5) == 0) {
+        char published[4096];
+        int n = snprintf(published, sizeof(published), "%s.published", target);
+        if (n > 0 && (size_t)n < sizeof(published) && rename(target, published) == 0) {
+            moved_published = 1;
+        }
+    }
     return rc;
 }
 
@@ -92,6 +103,7 @@ long ptrace(enum __ptrace_request request, ...)
     static int failed_siginfo;
     static int failed_detach;
     static int injected_attach_delivery;
+    static int injected_interrupt_delivery;
     static unsigned setregs_calls;
     static int failed_setoptions;
     static int failed_cont;
@@ -112,6 +124,30 @@ long ptrace(enum __ptrace_request request, ...)
     void *addr = va_arg(ap, void *);
     void *data = va_arg(ap, void *);
     va_end(ap);
+
+    const char *interrupt_signal = getenv("ARTHUR_DELIVERY_BEFORE_INTERRUPT");
+    if (request == PTRACE_INTERRUPT && interrupt_signal && !injected_interrupt_delivery) {
+        int sig = atoi(interrupt_signal);
+        injected_interrupt_delivery = 1;
+        if (kill(pid, sig) != 0) {
+            return -1;
+        }
+        int stopped = 0;
+        for (int attempt = 0; attempt < 2000; attempt++) {
+            siginfo_t pending = {0};
+            if (waitid(P_PID, pid, &pending, __WALL | WSTOPPED | WNOHANG | WNOWAIT) == 0 &&
+                pending.si_pid == pid && pending.si_status == sig) {
+                stopped = 1;
+                break;
+            }
+            usleep(1000);
+        }
+        if (!stopped) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        fprintf(stderr, "delivery %d stopped before INTERRUPT\n", sig);
+    }
 
     int getregs = request == PTRACE_GETREGS ||
         (request == PTRACE_GETREGSET && (uintptr_t)addr == NT_PRSTATUS);

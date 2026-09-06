@@ -297,6 +297,8 @@ static int sync_output_directory(const char *path)
     return 0;
 }
 
+// Commit owns path cleanup. A failed exchange rollback leaves another
+// producer's file at temp_path; callers must not unlink it on error.
 static int commit_atomic_path(const std::string& temp_path, const std::string& final_path,
                               const AtomicOutputState& state)
 {
@@ -329,8 +331,9 @@ static int commit_atomic_path(const std::string& temp_path, const std::string& f
                 int inspect_errno = inspect_rc != 0 ? errno : EBUSY;
                 if (syscall(SYS_renameat2, AT_FDCWD, temp_path.c_str(),
                             AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
-                    error("output path %s changed during commit and rollback failed (%s)",
-                          final_path.c_str(), strerror(errno));
+                    error("output path %s changed during commit and rollback failed (%s); "
+                          "displaced output retained at %s",
+                          final_path.c_str(), strerror(errno), temp_path.c_str());
                     return -1;
                 }
                 unlink(temp_path.c_str());
@@ -4156,8 +4159,7 @@ int Coredump::generate(const char *corefile)
     // b167/b191: Close 返回关闭期错误（ENOSPC），不再静默返回 0
     if (commit_atomic_lz4(out, temp_corefile, final_corefile,
                           output_state) != 0) {
-        error("generate: final close failed, core removed");
-        unlink(corefile);
+        error("generate: final output commit failed");
         return -1;
     }
     return 0;
@@ -4487,8 +4489,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
         out.PrintStat();
         if (commit_atomic_lz4(out, temp_corefile, final_corefile,
                               output_state) != 0) {
-            error("forkcore direct fallback: final close failed, core removed");
-            unlink(corefile);
+            error("forkcore direct fallback: final output commit failed");
             return -1;
         }
         return 0;
@@ -4891,8 +4892,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     // b167/b191: Close 返回关闭期错误（ENOSPC），不再静默返回 0
     if (commit_atomic_lz4(out, temp_corefile, final_corefile,
                           output_state) != 0) {
-        error("forkcore: final close failed, core removed");
-        unlink(corefile);
+        error("forkcore: final output commit failed");
         return -1;
     }
     // R50-38: mode 2（sys_core）的元数据 acore 无 magic/LOADS/ELF/尾标
@@ -4973,10 +4973,9 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         }
     }
 
-    // stop tracee
-    // R50-1: pt_int 返回未检查——INTERRUPT 失败（目标已退出 ESRCH / 非 seize 态
-    // EIO）时静默继续，后续在未停住的目标上注入/采集。fail-closed。
-    if (pt_int(snapshot_tid) != 0) {
+    // Leave the resulting wait status for collect_threads: a real signal or
+    // ptrace event can win the race with INTERRUPT and must retain its identity.
+    if (ptrace(PTRACE_INTERRUPT, snapshot_tid, NULL, NULL) != 0) {
         error("cannot interrupt snapshot thread %d (%s)", snapshot_tid,
               strerror(errno));
         out.Close();
@@ -5114,8 +5113,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         out.PrintStat();
         if (commit_atomic_lz4(out, temp_corefile, final_corefile,
                               output_state) != 0) {
-            error("forkcore_m direct fallback: final close failed, core removed");
-            unlink(corefile);
+            error("forkcore_m direct fallback: final output commit failed");
             return -1;
         }
         return 0;
@@ -5901,8 +5899,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // 让 monitor 走 "forkcore failed" 继续监控（目标已恢复运行）。
     if (commit_atomic_lz4(out, temp_corefile, final_corefile,
                           output_state) != 0) {
-        error("forkcore_m: final close failed, partial acore removed");
-        unlink(corefile);
+        error("forkcore_m: final output commit failed");
         return -1;
     }
 
@@ -6594,8 +6591,7 @@ int Coredump::monitor(const char* corefile)
     // b167/b191: Close 返回关闭期错误（ENOSPC）；失败删除部分 core
     if (commit_atomic_lz4(out, temp_corefile, final_corefile,
                           output_state) != 0) {
-        error("monitor crash dump: final close failed, core removed");
-        unlink(corefile);
+        error("monitor crash dump: final output commit failed");
         return -1;
     }
     return 0;
@@ -6874,7 +6870,8 @@ int Coredump::decompress(const char* in_file, const char* out_core)
     // on every pre-rename failure.
     if (commit_atomic_file(fout, temp_out_core, final_out_core,
                            output_state) != 0) {
-        return fail_core();
+        cleanup_decompress();
+        return -1;
     }
     cleanup_decompress();
     info("saved corefile '%s'.", final_out_core.c_str());

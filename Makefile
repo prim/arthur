@@ -63,6 +63,7 @@ test: $(TARGET)
 	@bash tests/run.sh collect-event-error
 	@bash tests/run.sh detach
 	@bash tests/run.sh attach-relay
+	@bash tests/run.sh interrupt-relay
 	@bash tests/run.sh detach-failure
 	@bash tests/run.sh restore-failure
 	@bash tests/run.sh mode0-relay
@@ -92,6 +93,7 @@ test: $(TARGET)
 	@bash tests/run.sh register-failure
 	@bash tests/run.sh close
 	@bash tests/run.sh atomic
+	@bash tests/run.sh atomic-recovery
 	@bash tests/run.sh checksum
 	@bash tests/run.sh format
 	@bash tests/run.sh reuse

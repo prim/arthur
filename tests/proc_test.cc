@@ -122,6 +122,18 @@ int main()
     assert(excessive.Parse() < 0);
     free(cmdline_file);
 
+    const char reusable_cmdline[] = "program\0argument\0";
+    cmdline_file = make_proc_file(reusable_cmdline, sizeof(reusable_cmdline) - 1);
+    ProcCmdline reusable(cmdline_file);
+    assert(reusable.Parse() == 2);
+    assert(reusable.argv[0] == "program" && reusable.argv[1] == "argument");
+    reusable.setpf(NULL);
+    assert(reusable.Parse() == 0);
+    assert(reusable.argv.empty());
+    reusable.setpf(cmdline_file);
+    assert(reusable.Parse() == 2 && reusable.argv[1] == "argument");
+    free(cmdline_file);
+
     const uint64_t auxv[] = {
         AT_PAGESZ, 65536,
         AT_UID, 1000,
