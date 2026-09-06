@@ -125,6 +125,40 @@ long ptrace(enum __ptrace_request request, ...)
     void *data = va_arg(ap, void *);
     va_end(ap);
 
+    if (request == PTRACE_INTERRUPT && !injected_interrupt_delivery &&
+        getenv("ARTHUR_GROUP_STOP_BEFORE_INTERRUPT")) {
+        injected_interrupt_delivery = 1;
+        if (kill(pid, SIGSTOP) != 0) {
+            return -1;
+        }
+        // Complete real Linux job control before Arthur's stop request.
+        for (int stage = 0; stage < 2; stage++) {
+            int expected = SIGSTOP | (stage ? PTRACE_EVENT_STOP << 8 : 0);
+            int stopped = 0;
+            for (int attempt = 0; attempt < 2000; attempt++) {
+                siginfo_t pending = {0};
+                if (waitid(P_PID, pid, &pending, __WALL | WSTOPPED | WNOHANG | WNOWAIT) == 0 &&
+                    pending.si_pid == pid && pending.si_status == expected) {
+                    stopped = 1;
+                    break;
+                }
+                usleep(1000);
+            }
+            if (!stopped) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+            if (stage == 0) {
+                int status;
+                if (waitpid(pid, &status, __WALL | WNOHANG) != pid ||
+                    real_ptrace(PTRACE_CONT, pid, NULL, (void *)(uintptr_t)SIGSTOP) != 0) {
+                    return -1;
+                }
+            }
+        }
+        fprintf(stderr, "group-stop completed before INTERRUPT\n");
+    }
+
     if (request == PTRACE_INTERRUPT && child_detached_with_kill &&
         !injected_interrupt_delivery && getenv("ARTHUR_WAIT_FORK_BEFORE_INTERRUPT")) {
         injected_interrupt_delivery = 1;

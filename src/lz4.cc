@@ -299,6 +299,10 @@ int Lz4Stream::WriteRaw(const char *s, size_t n)
     // Raw protocol fields delimit compressed block sequences. Preserve bytes
     // already buffered by Write() before inserting the raw field; otherwise a
     // later Close() would emit the compressed block after the raw marker.
+    if (ferror(_file)) {
+        errno = EIO;
+        return -1;
+    }
     if (!CurrentBlock().isEmpty() && Flush() < 0) {
         return -1;
     }
@@ -357,6 +361,11 @@ int Lz4Stream::Flush()
 {
     if (!_file || !_enc) {
         errno = EBADF;
+        return -1;
+    }
+    // Even an empty block cannot turn an earlier partial write into success.
+    if (ferror(_file)) {
+        errno = EIO;
         return -1;
     }
 
@@ -438,6 +447,14 @@ int Lz4Stream::Write(const char *s, size_t n)
     // 防御性 fail-closed。
     if (n > INT_MAX) {
         error("Write: %zu bytes exceeds int return range", n);
+        return -1;
+    }
+
+    if (n == 0) {
+        return 0;
+    }
+    if (ferror(_file)) {
+        errno = EIO;
         return -1;
     }
 

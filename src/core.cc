@@ -1181,6 +1181,8 @@ static const int GROUP_STOP_SENTINEL = -3;
 // value means Arthur also failed to restore state it had already modified, so
 // a persistent monitor must not continue tracing the target as if it were sound.
 static const int PT_CALL_RECOVERY_FAILED = -4;
+// Unlike GROUP_STOP_SENTINEL, no snapshot has been committed for this stop.
+static const int SNAPSHOT_GROUP_STOP_SKIPPED = -5;
 
 // R50-51: 基于 wait 状态的 leader 崩溃/死亡确定性检出（C134）。崩溃 SIGCHLD 会被
 // coalescing（first-wins）合并进 INTERRUPT 噪音，纯 siginfo 分类无法检出（且注入完成
@@ -2806,6 +2808,7 @@ int Coredump::collect_threads(pid_t leader)
 
     if (!_monitor_tids.empty()) {
         std::set<pid_t> stopped;
+        std::set<pid_t> group_stopped;
         int fatal_sig = 0;
         bool stop_error = false;
         _monitor_relay_signals.clear();
@@ -2816,6 +2819,10 @@ int Coredump::collect_threads(pid_t leader)
             }
             int event = (status >> 16) & 0xffff;
             int sig = WSTOPSIG(status);
+            if (event == PTRACE_EVENT_STOP &&
+                (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU)) {
+                group_stopped.insert(tid);
+            }
             if (event == PTRACE_EVENT_CLONE) {
                 unsigned long child = 0;
                 if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &child) != 0 || child == 0) {
@@ -2983,6 +2990,29 @@ int Coredump::collect_threads(pid_t leader)
             _process._thrd_pid.assign(confirm.begin(), confirm.end());
             if (fatal_sig != 0) {
                 return fatal_sig;
+            }
+            if (!group_stopped.empty() && _monitor_crash_tid == 0) {
+                // Job control can finish after monitor's preflight. Preserve
+                // those stops and release only our interrupt stops; the kernel
+                // will complete pending job control on the remaining threads.
+                for (pid_t tid : confirm) {
+                    int rc;
+                    if (group_stopped.count(tid)) {
+                        rc = ptrace(PTRACE_LISTEN, tid, NULL, NULL);
+                    } else {
+                        auto pending = _monitor_relay_signals.find(tid);
+                        int relay = pending == _monitor_relay_signals.end() ? 0 : pending->second;
+                        rc = ptrace(PTRACE_CONT, tid, NULL, (uintptr_t)relay);
+                    }
+                    if (rc != 0 && errno != ESRCH) {
+                        error("cannot preserve group-stop for thread %d (%s)", tid, strerror(errno));
+                        _monitor_recovery_failed = true;
+                    }
+                }
+                _monitor_relay_signals.clear();
+                _process._thrd_pid.clear();
+                info("group-stop detected during collection; skipping SIGUSR1 dump");
+                return SNAPSHOT_GROUP_STOP_SKIPPED;
             }
             if (!_monitor_relay_signals.empty()) {
                 return -1;
@@ -4984,6 +5014,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // R50-6: leader 已被 INTERRUPT 停住；失败须还原（detach 兄弟 + 清 TRACEFORK +
     // CONT leader），否则目标冻结、monitor 误以为仍在监控。
     int collect_rc = collect_threads(_pid);
+    if (collect_rc == SNAPSHOT_GROUP_STOP_SKIPPED) {
+        out.Close();
+        unlink(corefile);
+        return collect_rc;
+    }
     if (collect_rc != 0) {
         error("failed to collect threads of %d", _pid);
         if (collect_rc > 0 && !_monitor_tids.empty()) {
@@ -6022,6 +6057,18 @@ int Coredump::monitor(const char* corefile)
             int status = 0;
             bool synthetic_status = false;
             pid_t wr = waitpid(tid, &status, __WALL | WUNTRACED | WNOHANG);
+            if (wr == 0 && tid == _pid && _monitor_leader_exited) {
+                // pthread_exit leaves the leader as a zombie until its workers
+                // finish. It cannot acknowledge INTERRUPT. Check current state
+                // as well as the EXIT event so an exec replacement is not skipped.
+                char stat_buffer[4096];
+                ProcFile *stat_file = ProcFile::ReadPid(stat_buffer, sizeof(stat_buffer),
+                                                       tid, PROC_TYPE_STAT);
+                ProcStat stat(stat_file);
+                if (stat_file && stat.Parse() == 0 && stat.pid == tid && stat.sname == 'Z') {
+                    continue;
+                }
+            }
             if (wr == 0) {
                 user_regs64_struct stopped_regs;
                 if (pt_getregs(tid, &stopped_regs) == 0) {
@@ -6363,11 +6410,6 @@ int Coredump::monitor(const char* corefile)
                 }
                 return (detach_rc == 0 && unlink_rc == 0) ? 0 : -1;
             }
-            if (signal_forkcore == GROUP_STOP_SENTINEL) {
-                process_in_group_stop = true;
-                signal_forkcore = 0;
-                continue;
-            }
             if (signal_forkcore < 0) {
                 info("forkcore failed (%d), continue monitoring", signal_forkcore);
                 signal_forkcore = 0;
@@ -6447,6 +6489,13 @@ int Coredump::monitor(const char* corefile)
                 out.Close();
                 unlink(corefile);
                 return -1;
+            }
+            // Install the stop before draining another event: a queued SIGCONT
+            // must be able to clear it, not be overwritten by a stale result.
+            if (signal_forkcore == GROUP_STOP_SENTINEL ||
+                signal_forkcore == SNAPSHOT_GROUP_STOP_SKIPPED) {
+                process_in_group_stop = true;
+                signal_forkcore = 0;
             }
             continue;
         }

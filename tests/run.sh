@@ -287,6 +287,132 @@ grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
 # A signal-delivery stop can precede the requested INTERRUPT stop.
+if [[ $CASE == leader-exit-stop || $CASE == all ]]; then
+CASE_RAN=1
+for leader_stop_mode in running stopped; do
+start_fixture leader-exit
+: >"$TEST_TMP/leader-stop.log"
+"$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$TEST_TMP/leader-stop.acore" \
+    >"$TEST_TMP/leader-stop.log" 2>&1 &
+LEADER_STOP_MONITOR=$!
+TARGET_PIDS+=("$LEADER_STOP_MONITOR")
+wait_for_log "$TEST_TMP/leader-stop.log" "Launched in monitor mode"
+wait_for_log "$TEST_TMP/fixture.log" "leader-worker-tid="
+LEADER_STOP_WORKER=$(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log" | tail -n 1)
+kill -USR2 "$FIXTURE_PID"
+for _ in $(seq 1 200); do
+    [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]] && break
+    sleep 0.01
+done
+[[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]]
+if [[ $leader_stop_mode == stopped ]]; then
+    kill -STOP "$FIXTURE_PID"
+    for _ in $(seq 1 200); do
+        [[ $(awk '{print $3}' "/proc/$LEADER_STOP_WORKER/stat") =~ ^[Tt]$ ]] && break
+        sleep 0.01
+    done
+    [[ $(awk '{print $3}' "/proc/$LEADER_STOP_WORKER/stat") =~ ^[Tt]$ ]]
+fi
+kill -TERM "$LEADER_STOP_MONITOR"
+if ! wait_for_process_exit "$LEADER_STOP_MONITOR" ||
+   ! expect_status 0 wait "$LEADER_STOP_MONITOR"; then
+    cat "$TEST_TMP/leader-stop.log" >&2
+    exit 1
+fi
+[[ $(awk '/^TracerPid:/ {print $2}' "/proc/$LEADER_STOP_WORKER/status") == 0 ]]
+[[ ! -e "$TEST_TMP/leader-stop.acore" ]]
+if [[ $leader_stop_mode == stopped ]]; then
+    [[ $(awk '{print $3}' "/proc/$LEADER_STOP_WORKER/stat") == T ]]
+    kill -CONT "$FIXTURE_PID"
+fi
+kill -TERM "$FIXTURE_PID"
+expect_status 143 wait "$FIXTURE_PID"
+done
+fi
+
+if [[ $CASE == snapshot-group-stop || $CASE == all ]]; then
+CASE_RAN=1
+for stop_mode in memory-spin spawn-worker leader-exit listen-failure; do
+    stop_fault=()
+    if [[ $stop_mode == listen-failure ]]; then
+        start_fixture memory-spin 8
+        stop_fault=(ARTHUR_FAIL_LISTEN=1)
+    else
+        start_fixture "$stop_mode" 8
+    fi
+    STOP_CONTROL_TID=$FIXTURE_PID
+    if [[ $stop_mode == spawn-worker ]]; then
+        kill -USR2 "$FIXTURE_PID"
+        wait_for_log "$TEST_TMP/fixture.log" "spawn-worker-tid="
+    fi
+    STOP_PREFIX="$TEST_TMP/snapshot-stop-$stop_mode"
+    env ARTHUR_GROUP_STOP_BEFORE_INTERRUPT=1 "${stop_fault[@]}" LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+        "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$STOP_PREFIX.acore" \
+        >"$STOP_PREFIX.log" 2>&1 &
+    STOP_MONITOR_PID=$!
+    TARGET_PIDS+=("$STOP_MONITOR_PID")
+    wait_for_log "$STOP_PREFIX.log" "Launched in monitor mode"
+    if [[ $stop_mode == leader-exit ]]; then
+        wait_for_log "$TEST_TMP/fixture.log" "leader-worker-tid="
+        STOP_CONTROL_TID=$(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log" | tail -n 1)
+        kill -USR2 "$FIXTURE_PID"
+        for _ in $(seq 1 200); do
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]] && break
+            sleep 0.01
+        done
+        [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]]
+    fi
+    kill -USR1 "$STOP_MONITOR_PID"
+    if ! wait_for_log "$STOP_PREFIX.log" "group-stop detected during collection; skipping"; then
+        cat "$STOP_PREFIX.log" >&2
+        exit 1
+    fi
+    grep -q 'group-stop completed before INTERRUPT' "$STOP_PREFIX.log"
+    if [[ $stop_mode == listen-failure ]]; then
+        wait_for_process_exit "$STOP_MONITOR_PID"
+        expect_status 255 wait "$STOP_MONITOR_PID"
+        [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+        [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]]
+        [[ ! -e "$STOP_PREFIX.acore" ]]
+        if find "$TEST_TMP" -maxdepth 1 -name "acore.$FIXTURE_PID.*" | grep -q .; then
+            echo "failed group-stop restoration published a snapshot" >&2
+            exit 1
+        fi
+        kill -CONT "$FIXTURE_PID"
+        kill -TERM "$FIXTURE_PID"
+        expect_status 143 wait "$FIXTURE_PID"
+        continue
+    fi
+    for task_stat in /proc/"$FIXTURE_PID"/task/*/stat; do
+        [[ $(awk '{print $3}' "$task_stat") =~ ^[TtZ]$ ]]
+    done
+    if find "$TEST_TMP" -maxdepth 1 -name "acore.$FIXTURE_PID.*" | grep -q .; then
+        echo "group-stopped target produced a snapshot" >&2
+        exit 1
+    fi
+    kill -CONT "$FIXTURE_PID"
+    for _ in $(seq 1 200); do
+        [[ ! $(awk '{print $3}' "/proc/$STOP_CONTROL_TID/stat") =~ ^[Tt]$ ]] && break
+        sleep 0.01
+    done
+    kill -USR1 "$STOP_MONITOR_PID"
+    wait_for_log "$STOP_PREFIX.log" "writing out acore finished"
+    STOP_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+        -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' -print -quit)
+    [[ -n $STOP_SNAPSHOT ]]
+    expect_status 0 "$ARTHUR_BIN" -c "$STOP_SNAPSHOT" -o "$STOP_PREFIX.core"
+    kill -TERM "$STOP_MONITOR_PID"
+    wait_for_process_exit "$STOP_MONITOR_PID"
+    if ! expect_status 0 wait "$STOP_MONITOR_PID"; then
+        cat "$STOP_PREFIX.log" >&2
+        exit 1
+    fi
+    [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$STOP_CONTROL_TID/status") == 0 ]]
+    kill -TERM "$FIXTURE_PID"
+    expect_status 143 wait "$FIXTURE_PID"
+done
+fi
+
 if [[ $CASE == recovery-fork || $CASE == all ]]; then
 CASE_RAN=1
 start_fixture fork-cont

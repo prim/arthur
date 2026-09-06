@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <string>
@@ -65,6 +66,37 @@ int main(int argc, char **argv)
     std::string truncated_stream = std::string(argv[2]) + ".truncated.z4";
     std::string trailing_stream = std::string(argv[2]) + ".trailing.z4";
     Lz4Stream writer(Lz4Stream::LZ4_Compress);
+
+    // A real kernel write error must remain visible after the limit is lifted.
+    // Empty application buffers do not make the damaged stream complete.
+    std::string failed_stream = std::string(argv[2]) + ".write-error.z4";
+    assert(writer.Open(failed_stream.c_str()) == 0);
+    struct rlimit old_limit;
+    assert(getrlimit(RLIMIT_FSIZE, &old_limit) == 0);
+    struct sigaction old_action, ignored_action = {};
+    ignored_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignored_action.sa_mask);
+    assert(sigaction(SIGXFSZ, &ignored_action, &old_action) == 0);
+    struct rlimit limited = old_limit;
+    limited.rlim_cur = 0;
+    assert(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+    std::string raw_payload(8192, 'x');
+    int failed_write = writer.WriteRaw(raw_payload.data(), raw_payload.size());
+    assert(setrlimit(RLIMIT_FSIZE, &old_limit) == 0);
+    assert(sigaction(SIGXFSZ, &old_action, NULL) == 0);
+    assert(failed_write < (int)raw_payload.size() && writer.IsError());
+    long failed_position = writer.Tell();
+    assert(writer.WriteRaw("x", 1) == -1);
+    assert(writer.Write("x", 1) == -1);
+    assert(writer.WriteBlock("x", 1, BLOCK_TYPE_STREAM) == -1);
+    assert(writer.Flush() == -1 && writer.Sync() == -1);
+    assert(writer.Tell() == failed_position);
+    assert(writer.Close() == -1);
+    assert(writer.Close() == 0);
+    assert(writer.Open(failed_stream.c_str()) == 0);
+    assert(writer.Write("healthy", 7) == 7);
+    assert(writer.Close() == 0);
+
     BlockHeader unopened_hdr;
     assert(writer.SetBlock(BLOCK_TYPE_PROCESS) == -1 && errno == EBADF);
     assert(writer.EnableBlockChecksums() == -1 && errno == EBADF);

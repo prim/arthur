@@ -63,6 +63,7 @@ test: $(TARGET)
 	@bash tests/run.sh stream
 	@bash tests/run.sh monitor-stop
 	@bash tests/run.sh monitor-cont
+	@bash tests/run.sh snapshot-group-stop
 	@bash tests/run.sh monitor-errors
 	@bash tests/run.sh recovery-errors
 	@bash tests/run.sh child-cleanup
@@ -90,6 +91,7 @@ test: $(TARGET)
 	@bash tests/run.sh rwx-file
 	@bash tests/run.sh worker
 	@bash tests/run.sh leader-exit
+	@bash tests/run.sh leader-exit-stop
 	@bash tests/run.sh exec
 	@bash tests/run.sh clone-process
 	@bash tests/run.sh fatal
