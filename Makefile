@@ -66,6 +66,7 @@ test: $(TARGET)
 	@bash tests/run.sh monitor-cont
 	@bash tests/run.sh snapshot-group-stop
 	@bash tests/run.sh monitor-errors
+	@bash tests/run.sh startup-rollback-relay
 	@bash tests/run.sh recovery-errors
 	@bash tests/run.sh child-cleanup
 	@bash tests/run.sh event-identity
@@ -80,6 +81,7 @@ test: $(TARGET)
 	@bash tests/run.sh recovery-fork
 	@bash tests/run.sh final-delivery
 	@bash tests/run.sh detach-failure
+	@bash tests/run.sh detach-vanished
 	@bash tests/run.sh restore-failure
 	@bash tests/run.sh mode0-relay
 	@bash tests/run.sh static-fallback

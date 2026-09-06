@@ -956,6 +956,8 @@ static inline int pt_detach(pid_t pid, int signal = 0)
         if (saved_errno == ESRCH) {
             int ownership = trace_ownership(pid);
             if (ownership == 0) {
+                // The /proc probe may replace ESRCH with ENOENT.
+                errno = ESRCH;
                 return -1;
             }
             if (ownership > 0) {
@@ -2826,10 +2828,15 @@ fail:
     // PTRACE_DETACH requires a ptrace-stop. Restore every thread seized before
     // the failure so a partial monitor attach cannot leave the target traced.
     for (pid_t tid : _monitor_tids) {
+        int status = -1;
         if (ptrace(PTRACE_INTERRUPT, tid, 0, 0) == 0) {
-            pt_wait(tid);
+            status = pt_wait(tid);
         }
-        if (pt_detach(tid) != 0 && errno != ESRCH) {
+        // SEIZE's synthetic stops carry an event code. An event-zero stop
+        // belongs to the target and must survive startup rollback.
+        int relay = status >= 0 && WIFSTOPPED(status) && (status >> 16) == 0
+            ? WSTOPSIG(status) : 0;
+        if (pt_detach(tid, relay) != 0 && errno != ESRCH) {
             error("cannot detach partially monitored thread %d (%s)",
                   tid, strerror(errno));
         }

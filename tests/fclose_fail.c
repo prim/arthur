@@ -104,6 +104,7 @@ long ptrace(enum __ptrace_request request, ...)
     static int failed_detach;
     static int injected_attach_delivery;
     static int injected_interrupt_delivery;
+    static int exited_before_detach;
     static unsigned setregs_calls;
     static int failed_setoptions;
     static int failed_cont;
@@ -359,6 +360,38 @@ long ptrace(enum __ptrace_request request, ...)
             kill(pid, SIGSEGV);
         }
     }
+    if (request == PTRACE_DETACH && pid == fault_target_pid() &&
+        !exited_before_detach && getenv("ARTHUR_EXIT_BEFORE_DETACH")) {
+        exited_before_detach = 1;
+        if (kill(pid, SIGKILL) != 0) {
+            return -1;
+        }
+        int terminal = 0;
+        for (int attempt = 0; attempt < 2000; attempt++) {
+            int status = 0;
+            pid_t waited = waitpid(pid, &status, __WALL | WNOHANG);
+            if (waited == pid && (WIFEXITED(status) || WIFSIGNALED(status))) {
+                terminal = 1;
+                break;
+            }
+            usleep(1000);
+        }
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/%d/status", (int)pid);
+        int gone = 0;
+        for (int attempt = 0; terminal && attempt < 2000; attempt++) {
+            if (access(proc_path, F_OK) != 0 && errno == ENOENT) {
+                gone = 1;
+                break;
+            }
+            usleep(1000);
+        }
+        if (!gone) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        fprintf(stderr, "target disappeared before DETACH\n");
+    }
     long rc = real_ptrace(request, pid, addr, data);
     if (rc == 0 && request == PTRACE_GETEVENTMSG && data != NULL) {
         last_event_child = (pid_t)*(unsigned long *)data;
@@ -372,13 +405,20 @@ long ptrace(enum __ptrace_request request, ...)
 DIR *opendir(const char *name)
 {
     static DIR *(*real_opendir)(const char *);
+    static unsigned task_scans;
     if (!real_opendir) {
         real_opendir = (DIR *(*)(const char *))dlsym(RTLD_NEXT, "opendir");
     }
-    DIR *dir = real_opendir(name);
     pid_t target = fault_target_pid();
     char expected[64];
     snprintf(expected, sizeof(expected), "/proc/%d/task/", (int)target);
+    if (target > 0 && strcmp(name, expected) == 0 &&
+        getenv("ARTHUR_FAIL_MONITOR_RESCAN") && ++task_scans == 2) {
+        fprintf(stderr, "monitor rescan failed after initial SEIZE\n");
+        errno = EIO;
+        return NULL;
+    }
+    DIR *dir = real_opendir(name);
     if (dir && target > 0 && getenv("ARTHUR_FAIL_TASK_READDIR") &&
         strcmp(name, expected) == 0) {
         injected_task_dir = dir;

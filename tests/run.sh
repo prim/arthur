@@ -286,6 +286,21 @@ fi
 grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
+if [[ $CASE == detach-vanished || $CASE == all ]]; then
+CASE_RAN=1
+start_fixture memory 8
+if ! expect_status 0 timeout 15s env ARTHUR_TARGET_PID="$FIXTURE_PID" \
+    ARTHUR_EXIT_BEFORE_DETACH=1 LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+    "$ARTHUR_BIN" -p "$FIXTURE_PID" -1 -o "$TEST_TMP/vanished-detach.acore" \
+    >"$TEST_TMP/vanished-detach.log" 2>&1; then
+    cat "$TEST_TMP/vanished-detach.log" >&2
+    exit 1
+fi
+grep -q 'target disappeared before DETACH' "$TEST_TMP/vanished-detach.log"
+expect_status 137 wait "$FIXTURE_PID"
+expect_status 0 "$ARTHUR_BIN" -c "$TEST_TMP/vanished-detach.acore" -o "$TEST_TMP/vanished-detach.core"
+fi
+
 # Daemon launchers may ignore SIGCHLD across exec.
 if [[ $CASE == inherited-sigchld || $CASE == all ]]; then
 CASE_RAN=1
@@ -970,6 +985,57 @@ kill -KILL "$FIXTURE_PID"
 set +e
 wait "$FIXTURE_PID" 2>/dev/null
 set -e
+fi
+
+if [[ $CASE == startup-rollback-relay || $CASE == all ]]; then
+CASE_RAN=1
+for startup_signal in 15 3 19 0; do
+    if [[ $startup_signal == 15 ]]; then
+        start_fixture relay-term-spin
+    elif [[ $startup_signal == 3 ]]; then
+        start_fixture relay-quit-spin
+    else
+        start_fixture memory-spin 8
+    fi
+    startup_env=(ARTHUR_TARGET_PID="$FIXTURE_PID" ARTHUR_FAIL_MONITOR_RESCAN=1)
+    [[ $startup_signal == 0 ]] || startup_env+=(ARTHUR_DELIVERY_BEFORE_INTERRUPT="$startup_signal")
+    STARTUP_PREFIX="$TEST_TMP/startup-$startup_signal"
+    printf 'previous-output\n' >"$STARTUP_PREFIX.acore"
+    cp "$STARTUP_PREFIX.acore" "$STARTUP_PREFIX.expected"
+    if ! expect_status 255 timeout 15s env "${startup_env[@]}" \
+        LD_PRELOAD="$TEST_TMP/fclose_fail.so" "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 \
+        -o "$STARTUP_PREFIX.acore" >"$STARTUP_PREFIX.log" 2>&1; then
+        cat "$STARTUP_PREFIX.log" >&2
+        exit 1
+    fi
+    grep -q 'monitor rescan failed after initial SEIZE' "$STARTUP_PREFIX.log"
+    if [[ $startup_signal != 0 ]]; then
+        grep -q "delivery $startup_signal stopped before INTERRUPT" "$STARTUP_PREFIX.log"
+    fi
+    if [[ $startup_signal == 15 || $startup_signal == 3 ]]; then
+        if ! wait_for_process_exit "$FIXTURE_PID"; then
+            cat "$STARTUP_PREFIX.log" >&2
+            exit 1
+        fi
+        expect_status 42 wait "$FIXTURE_PID"
+    else
+        [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+        if [[ $startup_signal == 19 ]]; then
+            for _ in $(seq 1 200); do
+                [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]] && break
+                sleep 0.01
+            done
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]]
+            kill -CONT "$FIXTURE_PID"
+        else
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") != [TtZ] ]]
+        fi
+        kill -TERM "$FIXTURE_PID"
+        expect_status 143 wait "$FIXTURE_PID"
+    fi
+    cmp "$STARTUP_PREFIX.expected" "$STARTUP_PREFIX.acore"
+    [[ -z $(find "$TEST_TMP" -name '*.tmp.*' -print -quit) ]]
+done
 fi
 
 # Monitor event collection errors are state-machine failures, not empty polls.
