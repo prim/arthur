@@ -286,7 +286,143 @@ fi
 grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
-# A signal-delivery stop can precede the requested INTERRUPT stop.
+# Daemon launchers may ignore SIGCHLD across exec.
+if [[ $CASE == inherited-sigchld || $CASE == all ]]; then
+CASE_RAN=1
+start_fixture memory-spin 8
+bash -c 'trap "" CHLD; exec "$@"' arthur "$ARTHUR_BIN" \
+    -p "$FIXTURE_PID" -3 -o "$TEST_TMP/inherited.acore" \
+    >"$TEST_TMP/inherited.log" 2>&1 &
+INHERITED_MONITOR=$!
+TARGET_PIDS+=("$INHERITED_MONITOR")
+wait_for_log "$TEST_TMP/inherited.log" "Launched in monitor mode"
+INHERITED_SIGIGN=$(awk '/^SigIgn:/ {print $2}' "/proc/$INHERITED_MONITOR/status")
+(( (16#$INHERITED_SIGIGN & 65536) == 0 ))
+kill -USR1 "$INHERITED_MONITOR"
+wait_for_log "$TEST_TMP/inherited.log" "writing out acore finished"
+INHERITED_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+    -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' -print -quit)
+[[ -n $INHERITED_SNAPSHOT ]]
+expect_status 0 "$ARTHUR_BIN" -c "$INHERITED_SNAPSHOT" -o "$TEST_TMP/inherited-snapshot.core"
+for _ in $(seq 1 200); do
+    [[ $(<"/proc/$INHERITED_MONITOR/wchan") == *sigtimedwait* ]] && break
+    sleep 0.01
+done
+kill -BUS "$FIXTURE_PID"
+if ! wait_for_process_exit "$FIXTURE_PID" || ! wait_for_process_exit "$INHERITED_MONITOR"; then
+    cat "$TEST_TMP/inherited.log" >&2
+    exit 1
+fi
+expect_status 135 wait "$FIXTURE_PID"
+expect_status 0 wait "$INHERITED_MONITOR"
+expect_status 0 "$ARTHUR_BIN" -c "$TEST_TMP/inherited.acore" -o "$TEST_TMP/inherited.core"
+fi
+
+# An already-exited leader must not hide its surviving workers.
+if [[ $CASE == leader-exit-start || $CASE == all ]]; then
+CASE_RAN=1
+for late_end in term crash stop exec group; do
+    if [[ $late_end == exec ]]; then
+        start_fixture leader-exit-exec
+    else
+        start_fixture leader-exit
+    fi
+    wait_for_log "$TEST_TMP/fixture.log" "leader-worker-tid="
+    LATE_WORKER=$(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log" | tail -n 1)
+    kill -USR2 "$FIXTURE_PID"
+    for _ in $(seq 1 200); do
+        [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]] && break
+        sleep 0.01
+    done
+    [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]]
+    if [[ $late_end == group ]]; then
+        kill -STOP "$FIXTURE_PID"
+        for _ in $(seq 1 200); do
+            [[ $(awk '{print $3}' "/proc/$LATE_WORKER/stat") == T ]] && break
+            sleep 0.01
+        done
+        [[ $(awk '{print $3}' "/proc/$LATE_WORKER/stat") == T ]]
+    fi
+    LATE_PREFIX="$TEST_TMP/late-start-$late_end"
+    "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$LATE_PREFIX.acore" \
+        >"$LATE_PREFIX.log" 2>&1 &
+    LATE_MONITOR=$!
+    TARGET_PIDS+=("$LATE_MONITOR")
+    if ! wait_for_log "$LATE_PREFIX.log" "Launched in monitor mode"; then
+        cat "$LATE_PREFIX.log" >&2
+        exit 1
+    fi
+    if [[ $late_end == group ]]; then
+        kill -USR1 "$LATE_MONITOR"
+        wait_for_log "$LATE_PREFIX.log" "group-stop; skipping SIGUSR1 dump"
+        if find "$TEST_TMP" -maxdepth 1 -name "acore.$FIXTURE_PID.*" | grep -q .; then
+            echo "late-start group-stop unexpectedly published a snapshot" >&2
+            exit 1
+        fi
+        kill -CONT "$FIXTURE_PID"
+        for _ in $(seq 1 200); do
+            [[ ! $(awk '{print $3}' "/proc/$LATE_WORKER/stat") =~ ^[Tt]$ ]] && break
+            sleep 0.01
+        done
+    fi
+    kill -USR1 "$LATE_MONITOR"
+    if ! wait_for_log "$LATE_PREFIX.log" "writing out acore finished"; then
+        cat "$LATE_PREFIX.log" >&2
+        exit 1
+    fi
+    LATE_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+        -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' -print -quit)
+    [[ -n $LATE_SNAPSHOT ]]
+    expect_status 0 "$ARTHUR_BIN" -c "$LATE_SNAPSHOT" -o "$LATE_PREFIX.snapshot.core"
+    if [[ $late_end == exec ]]; then
+        kill -USR1 "$FIXTURE_PID"
+        for _ in $(seq 1 200); do
+            [[ $(readlink "/proc/$FIXTURE_PID/exe" 2>/dev/null || true) == */sleep ]] && break
+            sleep 0.01
+        done
+        [[ $(readlink "/proc/$FIXTURE_PID/exe") == */sleep ]]
+        kill -USR1 "$LATE_MONITOR"
+        LATE_EXEC_SNAPSHOT=
+        for _ in $(seq 1 200); do
+            LATE_EXEC_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
+                -name "acore.$FIXTURE_PID.*" ! -name '*.tmp.*' ! -path "$LATE_SNAPSHOT" -print -quit)
+            [[ -n $LATE_EXEC_SNAPSHOT ]] && break
+            sleep 0.05
+        done
+        if [[ -z $LATE_EXEC_SNAPSHOT ]]; then
+            cat "$LATE_PREFIX.log" >&2
+            exit 1
+        fi
+        expect_status 0 "$ARTHUR_BIN" -c "$LATE_EXEC_SNAPSHOT" -o "$LATE_PREFIX.exec.core"
+    fi
+    if [[ $late_end == stop ]]; then
+        kill -TERM "$LATE_MONITOR"
+        wait_for_process_exit "$LATE_MONITOR"
+        expect_status 0 wait "$LATE_MONITOR"
+        [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$LATE_WORKER/status") == 0 ]]
+    fi
+    if [[ $late_end == crash ]]; then
+        kill -SEGV "$FIXTURE_PID"
+        expected_late_exit=139
+    else
+        kill -TERM "$FIXTURE_PID"
+        expected_late_exit=143
+    fi
+    if ! wait_for_process_exit "$FIXTURE_PID" || ! wait_for_process_exit "$LATE_MONITOR"; then
+        cat "$LATE_PREFIX.log" >&2
+        exit 1
+    fi
+    expect_status "$expected_late_exit" wait "$FIXTURE_PID"
+    [[ $late_end == stop ]] || expect_status 0 wait "$LATE_MONITOR"
+    if [[ $late_end == crash ]]; then
+        expect_status 0 "$ARTHUR_BIN" -c "$LATE_PREFIX.acore" -o "$LATE_PREFIX.core"
+        "$TEST_TMP/core_note_test" "$LATE_PREFIX.core" "$(id -u)" "$(id -g)" 0x600 0 1 11 11
+    else
+        [[ ! -e "$LATE_PREFIX.acore" ]]
+    fi
+done
+fi
+
 if [[ $CASE == leader-exit-stop || $CASE == all ]]; then
 CASE_RAN=1
 for leader_stop_mode in running stopped; do

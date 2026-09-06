@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t trigger;
+static volatile sig_atomic_t exec_after_exit;
 static volatile pid_t first_decoy_tid;
 static volatile pid_t late_tid;
 static volatile pid_t spawned_tid;
@@ -34,6 +35,12 @@ static void on_signal(int sig)
 {
     (void)sig;
     trigger = 1;
+}
+
+static void on_exec_after_exit(int sig)
+{
+    (void)sig;
+    exec_after_exit = 1;
 }
 
 static void *crash_worker(void *unused)
@@ -72,15 +79,26 @@ static void *spin_worker(void *unused)
 
 static void *leader_exit_worker(void *unused)
 {
-    (void)unused;
+    int allow_exec = unused != NULL;
     sigset_t blocked;
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGUSR2);
     pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+    if (allow_exec) {
+        signal(SIGUSR1, on_exec_after_exit);
+    }
     printf("leader-worker-tid=%ld\n", syscall(SYS_gettid));
     fflush(stdout);
     for (;;) {
-        pause();
+        if (allow_exec) {
+            if (exec_after_exit) {
+                execl("/bin/sleep", "sleep", "30", (char *)NULL);
+                _exit(5);
+            }
+            usleep(1000);
+        } else {
+            pause();
+        }
     }
     return NULL;
 }
@@ -158,10 +176,11 @@ int main(int argc, char **argv)
         }
     }
 
-    if (strcmp(argv[1], "leader-exit") == 0) {
+    if (strcmp(argv[1], "leader-exit") == 0 || strcmp(argv[1], "leader-exit-exec") == 0) {
         signal(SIGUSR2, on_signal);
         pthread_t worker;
-        if (pthread_create(&worker, NULL, leader_exit_worker, NULL) != 0) {
+        void *allow_exec = strcmp(argv[1], "leader-exit-exec") == 0 ? argv[1] : NULL;
+        if (pthread_create(&worker, NULL, leader_exit_worker, allow_exec) != 0) {
             return 3;
         }
         ready();

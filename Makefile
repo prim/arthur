@@ -62,6 +62,7 @@ test: $(TARGET)
 	@bash tests/run.sh build-version
 	@bash tests/run.sh stream
 	@bash tests/run.sh monitor-stop
+	@bash tests/run.sh inherited-sigchld
 	@bash tests/run.sh monitor-cont
 	@bash tests/run.sh snapshot-group-stop
 	@bash tests/run.sh monitor-errors
@@ -92,6 +93,7 @@ test: $(TARGET)
 	@bash tests/run.sh worker
 	@bash tests/run.sh leader-exit
 	@bash tests/run.sh leader-exit-stop
+	@bash tests/run.sh leader-exit-start
 	@bash tests/run.sh exec
 	@bash tests/run.sh clone-process
 	@bash tests/run.sh fatal

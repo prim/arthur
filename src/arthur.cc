@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <assert.h>
 #include <stdio.h>
+#include <signal.h>
 #include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
@@ -250,8 +251,18 @@ int main(int argc, char *argv[])
                 return dump.generate(fout);
             case 2: 
                 return dump.forkcore(fout, 1);
-            case 3:
+            case 3: {
+                // SIG_IGN survives exec and suppresses ptrace notifications.
+                // Normalize only this standalone monitor's signal disposition.
+                struct sigaction action = {};
+                action.sa_handler = SIG_DFL;
+                sigemptyset(&action.sa_mask);
+                if (sigaction(SIGCHLD, &action, NULL) != 0) {
+                    error("cannot enable monitor SIGCHLD notifications (%s)", strerror(errno));
+                    return -1;
+                }
                 return dump.monitor(fout);
+            }
             default: 
                 help();
                 exit(1);

@@ -2731,6 +2731,26 @@ static bool traced_by_self(pid_t tid)
     return trace_ownership(tid) > 0;
 }
 
+static int task_is_zombie(pid_t tid)
+{
+    char buffer[4096];
+    bool truncated = false;
+    ProcFile *file = ProcFile::ReadPid(buffer, sizeof(buffer), tid, PROC_TYPE_STAT, &truncated);
+    if (!file) {
+        return -1;
+    }
+    if (truncated) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    ProcStat stat(file);
+    if (stat.Parse() != 0 || stat.pid != tid) {
+        errno = EPROTO;
+        return -1;
+    }
+    return stat.sname == 'Z' ? 1 : 0;
+}
+
 // 1: member, 0: task disappeared or is not a member, -1: identity unknown.
 static int belongs_to_thread_group(pid_t leader, pid_t tid)
 {
@@ -2746,6 +2766,12 @@ int Coredump::monitor_threads(pid_t leader)
 {
     _monitor_tids.clear();
     _ptrace_options = PTRACE_O_TRACEEXIT | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
+    int leader_state = task_is_zombie(leader);
+    if (leader_state < 0) {
+        error("cannot inspect leader %d before monitor attach", leader);
+        return -1;
+    }
+    _monitor_leader_exited = leader_state == 1;
 
     for (int round = 0; round < 64; round++) {
         std::set<pid_t> observed;
@@ -2756,10 +2782,20 @@ int Coredump::monitor_threads(pid_t leader)
 
         size_t before = _monitor_tids.size();
         for (pid_t tid : observed) {
+            if (tid == leader && _monitor_leader_exited) {
+                continue;
+            }
             if (_monitor_tids.count(tid)) {
                 continue;
             }
             if (ptrace(PTRACE_SEIZE, tid, NULL, _ptrace_options) != 0) {
+                int seize_errno = errno;
+                if (tid == leader && (seize_errno == ESRCH || seize_errno == EPERM) &&
+                    task_is_zombie(leader) == 1) {
+                    _monitor_leader_exited = true;
+                    continue;
+                }
+                errno = seize_errno;
                 if (errno == ESRCH) {
                     continue;
                 }
@@ -2777,8 +2813,8 @@ int Coredump::monitor_threads(pid_t leader)
             _monitor_tids.insert(tid);
         }
 
-        if (!_monitor_tids.count(leader)) {
-            error("leader %d vanished while attaching monitor", leader);
+        if (_monitor_tids.empty() || (!_monitor_leader_exited && !_monitor_tids.count(leader))) {
+            error("process %d has no usable monitored thread set", leader);
             break;
         }
         if (_monitor_tids.size() == before) {
@@ -6061,11 +6097,7 @@ int Coredump::monitor(const char* corefile)
                 // pthread_exit leaves the leader as a zombie until its workers
                 // finish. It cannot acknowledge INTERRUPT. Check current state
                 // as well as the EXIT event so an exec replacement is not skipped.
-                char stat_buffer[4096];
-                ProcFile *stat_file = ProcFile::ReadPid(stat_buffer, sizeof(stat_buffer),
-                                                       tid, PROC_TYPE_STAT);
-                ProcStat stat(stat_file);
-                if (stat_file && stat.Parse() == 0 && stat.pid == tid && stat.sname == 'Z') {
+                if (task_is_zombie(tid) == 1) {
                     continue;
                 }
             }
@@ -6365,6 +6397,35 @@ int Coredump::monitor(const char* corefile)
                         return -1;
                     }
                 }
+            }
+            if (_monitor_tids.empty()) {
+                // With a pre-exited leader there will be no leader wait status.
+                // Reconcile an exec-renamed TID before declaring the group gone.
+                std::set<pid_t> remaining;
+                if (list_task_tids(_pid, remaining) != 0) {
+                    if (errno == ENOENT || errno == ESRCH) {
+                        return 2;
+                    }
+                    error("cannot inspect process %d after final worker exit", _pid);
+                    return -1;
+                }
+                for (pid_t tid : remaining) {
+                    if (traced_by_self(tid)) {
+                        _monitor_tids.insert(tid);
+                        continue;
+                    }
+                    int zombie = task_is_zombie(tid);
+                    if (zombie == 1 || (zombie < 0 && (errno == ENOENT || errno == ESRCH))) {
+                        continue;
+                    }
+                    error("live thread %d is outside monitor ownership", tid);
+                    return -1;
+                }
+                if (_monitor_tids.empty()) {
+                    info("process %d has no remaining monitored workers", _pid);
+                    return 2;
+                }
+                progress = true;
             }
         } while (progress);
         return crash_found ? 1 : 0;
