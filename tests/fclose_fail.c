@@ -125,8 +125,30 @@ long ptrace(enum __ptrace_request request, ...)
     void *data = va_arg(ap, void *);
     va_end(ap);
 
+    if (request == PTRACE_INTERRUPT && child_detached_with_kill &&
+        !injected_interrupt_delivery && getenv("ARTHUR_WAIT_FORK_BEFORE_INTERRUPT")) {
+        injected_interrupt_delivery = 1;
+        int stopped = 0;
+        for (int attempt = 0; attempt < 2000; attempt++) {
+            siginfo_t pending = {0};
+            if (waitid(P_PID, pid, &pending, __WALL | WSTOPPED | WNOHANG | WNOWAIT) == 0 &&
+                pending.si_pid == pid &&
+                pending.si_status == (SIGTRAP | (PTRACE_EVENT_FORK << 8))) {
+                stopped = 1;
+                break;
+            }
+            usleep(1000);
+        }
+        if (!stopped) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        fprintf(stderr, "fork event stopped before INTERRUPT\n");
+    }
+
     const char *interrupt_signal = getenv("ARTHUR_DELIVERY_BEFORE_INTERRUPT");
-    if (request == PTRACE_INTERRUPT && interrupt_signal && !injected_interrupt_delivery) {
+    if (request == PTRACE_INTERRUPT && interrupt_signal && !injected_interrupt_delivery &&
+        (!getenv("ARTHUR_DELIVERY_AFTER_CHILD_KILL") || child_detached_with_kill)) {
         int sig = atoi(interrupt_signal);
         injected_interrupt_delivery = 1;
         if (kill(pid, sig) != 0) {

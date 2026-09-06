@@ -171,11 +171,16 @@ int main(int argc, char **argv)
         pthread_exit(NULL);
     }
 
-    if (strcmp(argv[1], "relay-term") == 0) {
-        signal(SIGTERM, on_signal);
+    if (strcmp(argv[1], "relay-term") == 0 || strcmp(argv[1], "relay-term-spin") == 0 ||
+        strcmp(argv[1], "relay-quit-spin") == 0) {
+        signal(strcmp(argv[1], "relay-quit-spin") == 0 ? SIGQUIT : SIGTERM, on_signal);
         ready();
         while (!trigger) {
-            pause();
+            if (strcmp(argv[1], "relay-term") != 0) {
+                __asm__ __volatile__("" ::: "memory");
+            } else {
+                pause();
+            }
         }
         return 42;
     }

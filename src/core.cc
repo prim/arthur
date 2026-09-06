@@ -1810,12 +1810,8 @@ static inline int pt_int(pid_t pid)
     if (rc != 0) {
         return rc;
     }
-    // R50-22: 同 pt_attach——INTERRUPT 后未停靠（D 态）时传播超时失败。
-    if (pt_wait(pid) < 0) {
-        return -1;
-    }
-
-    return rc;
+    // Return the actual stop, not merely the successful request result.
+    return pt_wait(pid);
 }
 
 static inline int pt_cont(pid_t pid) {
@@ -5518,9 +5514,30 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         if (pt_terminate_tracee(_core_pid) != 0) {
             _monitor_recovery_failed = true;
         }
-        if (pt_int(_pid) != 0) {                            // 停住 leader 才能 SETOPTIONS
+        if (ptrace(PTRACE_INTERRUPT, _pid, NULL, NULL) != 0) {
             error("late recovery: interrupt leader %d failed (%s)",
                   _pid, strerror(errno));
+            _monitor_recovery_failed = true;
+            return;
+        }
+        // Keep delivery/child/exit events waitable for monitor's dispatcher.
+        // Consuming a stop here and continuing with signal 0 loses its meaning.
+        siginfo_t pending = {};
+        const long long start = monotonic_ms();
+        while (monotonic_ms() - start < 10000) {
+            int wait_rc = waitid(P_PID, _pid, &pending,
+                                __WALL | WSTOPPED | WEXITED | WNOHANG | WNOWAIT);
+            if (wait_rc < 0 && errno != EINTR) {
+                break;
+            }
+            if (wait_rc == 0 && pending.si_pid == _pid) {
+                break;
+            }
+            usleep(1000);
+        }
+        if (pending.si_pid != _pid ||
+            (pending.si_code != CLD_TRAPPED && pending.si_code != CLD_STOPPED)) {
+            error("late recovery: leader %d has no pending ptrace stop", _pid);
             _monitor_recovery_failed = true;
             return;
         }
@@ -5529,11 +5546,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
                   _pid, strerror(errno));
             _monitor_recovery_failed = true;
         }
-        if (ptrace(PTRACE_CONT, _pid, NULL, NULL) != 0) {
-            error("late recovery: continue leader %d failed (%s)",
-                  _pid, strerror(errno));
-            _monitor_recovery_failed = true;
-        }
+        // The main loop consumes the preserved event and resumes the target.
     };
 
     // TBD: dump memory regions
@@ -5610,6 +5623,17 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         wait_status_failed = true;
         _monitor_recovery_failed = true;
     }
+    if (wr <= 0) {
+        int stop = pt_int(_pid);
+        if (stop < 0) {
+            error("re-interrupt of %d after snapshot failed (%s)", _pid, strerror(errno));
+            wait_status_failed = true;
+            _monitor_recovery_failed = true;
+        } else {
+            s = stop;
+            wr = _pid;
+        }
+    }
     if (wr > 0 && WIFSIGNALED(s)) {
         error("%s: process %d died during dump (no core written)",
               strsignal(WTERMSIG(s)), _pid);
@@ -5634,12 +5658,10 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     }
     // tracee will stop if signaled on exit
     bool stopped_at_ptrace_event = false;
-    // R50-50: SEIZE 下组停靠（SIGSTOP/TSTP/TTIN/TTOU）报为 PTRACE_EVENT_STOP（事件
-    // 128），WSTOPSIG=SIGTRAP——与 FORK/CLONE 同属 ptrace 事件。B66 把"所有事件→
-    // CONT 清除"泛化，对组停靠错误：CONT 会静默解除作业控制停靠（Ctrl+Z 后目标
-    // 继续跑），且 monitor 的 leader_in_group_stop 不会置位。组停靠须 PTRACE_LISTEN
-    // 保持停靠，等目标自身的 SIGCONT 恢复。
+    // EVENT_STOP/SIGTRAP is an interrupt; job control retains its stop signal.
+    // Only the former permits injection. A group-stop must remain in LISTEN.
     bool group_stop_event = false;
+    bool interrupt_stop = false;
     // B189: 注入期间 leader 崩溃（B158 fail-closed 检测到）后保留 delivery-stop——
     // 置位后下方 pt_cont 跳过（CONT(0) 会抑制崩溃信号、目标复活、崩溃丢失）。
     // relay_sig：被捕获崩溃的中继信号——延迟到 SETOPTIONS（清 TRACEFORK，需 leader
@@ -5649,6 +5671,10 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     int relay_sig = 0;
     if(WIFSTOPPED(s)) {
         sig = WSTOPSIG(s);
+        int event = (s >> 16) & 0xffff;
+        interrupt_stop = event == PTRACE_EVENT_STOP && sig == SIGTRAP;
+        group_stop_event = event == PTRACE_EVENT_STOP &&
+            (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU);
         // B66: dump 窗口（pt_cont 后 TRACEFORK 仍设）内 leader 自己 fork 会触发
         // PTRACE_EVENT_FORK 停靠，WSTOPSIG 返回 SIGTRAP(5)——但这是 ptrace 事件
         // 停靠，不是真实信号。返回给 monitor 会被当中继信号投递 → 目标被 SIGTRAP
@@ -5656,16 +5682,12 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
         // 泛化到所有 ptrace event（FORK/CLONE/EXEC/VFORK/EXIT）：wait status 的
         // 高字节含事件码即为事件停靠。事件停靠不算信号：清零，且结尾必须 CONT
         // 清除该事件停靠（否则 leader 冻结）。
-        stopped_at_ptrace_event =
-            (WIFSTOPPED(s) &&
-             ((s >> 8) & 0xff) == SIGTRAP &&
-             ((s >> 16) & 0xff) != 0);
-        if (stopped_at_ptrace_event) {
+        stopped_at_ptrace_event = event != 0 && !interrupt_stop;
+        if (event != 0) {
             sig = 0;
-            // R50-50: 识别 PTRACE_EVENT_STOP（组停靠）——见 stopped_at_ptrace_event
-            // 声明处注释，与 FORK/CLONE 的事件处理分开。
-            int ev = (int)((s >> 16) & 0xff);
-            group_stop_event = (ev == PTRACE_EVENT_STOP);
+        }
+        if (stopped_at_ptrace_event) {
+            int ev = event;
             // B67: TRACEFORK auto-attach 的 fork 子进程残留在 arthur 上（TracerPid=arthur、
             // state=t），monitor 继续运行时不 CONT 它 → 永久冻结。GETEVENTMSG 拿子进程
             // pid 并 DETACH(0) 解冻，让它正常继续运行而不合成 SIGCONT。
@@ -5695,16 +5717,6 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
                 }
             }
         }
-    } else {
-        // now the process becomes zombie,
-        // we have to waitpid the forked pid.
-        // R50-1: pt_int 返回未检查——失败时 leader 未停住，注入 waitpid 跑在运行中
-        // 目标上。acore 已有效，告警（child 可能残留 zombie）。
-        if (pt_int(_pid) != 0) {
-            error("re-interrupt of %d after snapshot failed (%s)",
-                  _pid, strerror(errno));
-            _monitor_recovery_failed = true;
-        }
     }
     // B151: 目标在 dump 窗口内崩溃（真实信号 delivery-stop，非 ptrace 事件）。
     // 若仍做 waitpid 注入，pt_call 的 CONT(0) 会把 pending 的崩溃信号抑制掉
@@ -5714,6 +5726,18 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
     // fork 子进程已在上方 SIGKILL，leader 崩溃后由其 reaper（init）收尸，无需注入。
     bool crashed_in_window =
         WIFSTOPPED(s) && !stopped_at_ptrace_event && is_core_dump_signal(sig);
+    bool snapshot_child_signal = false;
+    if (sig == SIGCHLD && !stopped_at_ptrace_event) {
+        siginfo_t child_signal = {};
+        if (ptrace(PTRACE_GETSIGINFO, _pid, NULL, &child_signal) == 0 &&
+            child_signal.si_signo == SIGCHLD && child_signal.si_pid == (pid_t)_core_pid &&
+            (child_signal.si_code == CLD_EXITED || child_signal.si_code == CLD_KILLED ||
+             child_signal.si_code == CLD_DUMPED)) {
+            // Reap Arthur's own child before relaying its notification. Treating
+            // this as an unrelated delivery would leak a zombie on each dump.
+            snapshot_child_signal = true;
+        }
+    }
     if (wait_status_failed) {
         // The status identity is unknown, so an injected libc call could
         // suppress a delivery stop or run from a ptrace event. The else branch
@@ -5747,18 +5771,20 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             }
             info("leader %d stopped at non-default %s during dump; relaying "
                  "(not crash collection)", _pid, strsignal(sig));
-            if (ptrace(PTRACE_CONT, _pid, NULL, (uintptr_t)sig) != 0 &&
-                errno != ESRCH) {
-                error("relay %s to leader %d failed (%s)",
-                      strsignal(sig), _pid, strerror(errno));
-                _monitor_recovery_failed = true;
-            }
+            relay_sig = sig;
+            crash_preserved = true;
             sig = 0;
         } else {
             info("leader %d crashed in %s delivery-stop during dump; "
                  "skipping waitpid injection to preserve crash stop",
                  _pid, strsignal(sig));
         }
+    } else if (sig != 0 && !snapshot_child_signal) {
+        // An ordinary delivery-stop is not a context for a remote waitpid.
+        // Clear TRACEFORK while stopped, then relay the original signal once.
+        relay_sig = sig;
+        sig = 0;
+        crash_preserved = true;
     } else if (pt_getregs(_pid, &saved_regs) != 0) {
         error("save registers of %d for waitpid cleanup failed (%s)",
               _pid, strerror(errno));
@@ -5841,6 +5867,11 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             }
         }
     }
+    if (snapshot_child_signal && !crash_preserved) {
+        relay_sig = SIGCHLD;
+        sig = 0;
+        crash_preserved = true;
+    }
     // B39: 本函数开头设了 PTRACE_O_TRACEFORK，若不清除则 monitor 继续运行时目标
     // 后续每个 fork 的子进程都被自动 attach+SIGSTOP 冻结（实证：state=t、
     // TracerPid=arthur）。SETOPTIONS 需 tracee 停止——此刻 leader 刚被 pt_attach
@@ -5879,7 +5910,7 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
                 _monitor_recovery_failed = true;
             }
         }
-    } else if(!WIFSTOPPED(s) || stopped_at_ptrace_event) {
+    } else if(!WIFSTOPPED(s) || stopped_at_ptrace_event || interrupt_stop) {
         if (pt_cont(_pid) != 0 && errno != ESRCH) {
             error("resume leader %d after snapshot cleanup failed (%s)",
                   _pid, strerror(errno));
@@ -6164,7 +6195,8 @@ int Coredump::monitor(const char* corefile)
                     }
                     break; // Rebuild the iteration after the TID replacement.
                 }
-                if (event == PTRACE_EVENT_CLONE) {
+                if (event == PTRACE_EVENT_CLONE || event == PTRACE_EVENT_FORK ||
+                    event == PTRACE_EVENT_VFORK) {
                     unsigned long child = 0;
                     if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &child) != 0 || child == 0) {
                         error("cannot read clone event from thread %d (%s)",
@@ -6403,7 +6435,8 @@ int Coredump::monitor(const char* corefile)
             }
             info("writing out %s...", dump_path.c_str());
             signal_forkcore = forkcore_m(dump_path.c_str(), false);
-            if (signal_forkcore == 0 && !_monitor_recovery_failed) {
+            if ((signal_forkcore == 0 || signal_forkcore == GROUP_STOP_SENTINEL) &&
+                !_monitor_recovery_failed) {
                 info("writing out acore finished, resume monitoring");
             } else {
                 warn("SIGUSR1 snapshot did not complete (status %d)", signal_forkcore);

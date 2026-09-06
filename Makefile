@@ -26,11 +26,20 @@ TARGET_G = arthur_g
 PACKAGE = Arthur-$(GIT_VERSION)-$(shell uname -s)-$(shell uname -p).tar.gz
 PACKAGE_G = Arthur-$(GIT_VERSION)-$(shell uname -s)-$(shell uname -p)-Debug.tar.gz
 
-.PHONY: clean all test cleanall distclean package
+.PHONY: clean all test cleanall distclean package FORCE
 .SUFFIXES:
 .SECONDARY:
 
 all: $(TARGET)
+
+FORCE:
+
+build/version: FORCE
+	@mkdir -p build
+	@printf '%s\n' "$(GIT_VERSION)" > $@.tmp
+	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
+
+build/arthur.o: build/version
 
 build/$(TARGET_G): $(OBJ)
 	@echo LINK $(notdir $@)
@@ -50,6 +59,7 @@ build/%.o: src/%.cc
 test: $(TARGET)
 	@bash tests/run.sh proc
 	@bash tests/run.sh cli
+	@bash tests/run.sh build-version
 	@bash tests/run.sh stream
 	@bash tests/run.sh monitor-stop
 	@bash tests/run.sh monitor-cont
@@ -64,6 +74,9 @@ test: $(TARGET)
 	@bash tests/run.sh detach
 	@bash tests/run.sh attach-relay
 	@bash tests/run.sh interrupt-relay
+	@bash tests/run.sh recovery-delivery
+	@bash tests/run.sh recovery-fork
+	@bash tests/run.sh final-delivery
 	@bash tests/run.sh detach-failure
 	@bash tests/run.sh restore-failure
 	@bash tests/run.sh mode0-relay

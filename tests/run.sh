@@ -141,6 +141,28 @@ ${CXX:-g++} -std=c++11 -Wall -Wextra \
     "$ARTHUR_DIR/tests/core_note_test.cc" \
     -o "$TEST_TMP/core_note_test"
 
+if [[ $CASE == build-version || $CASE == all ]]; then
+CASE_RAN=1
+VERSION_TREE="$TEST_TMP/version-build"
+mkdir "$VERSION_TREE"
+cp "$ARTHUR_DIR/Makefile" "$VERSION_TREE/Makefile"
+for version_input in src include lib; do
+    ln -s "$ARTHUR_DIR/$version_input" "$VERSION_TREE/$version_input"
+done
+make -C "$VERSION_TREE" -j1 GIT_VERSION=review-version-a >"$TEST_TMP/version-a.log" 2>&1
+[[ $("$VERSION_TREE/arthur" -v) == review-version-a ]]
+make -C "$VERSION_TREE" -j1 GIT_VERSION=review-version-b >"$TEST_TMP/version-b.log" 2>&1
+if [[ $("$VERSION_TREE/arthur" -v) != review-version-b ]]; then
+    echo "incremental build retained the previous version string" >&2
+    exit 1
+fi
+make -C "$VERSION_TREE" -j1 GIT_VERSION=review-version-b >"$TEST_TMP/version-stable.log" 2>&1
+if grep -Eq '^(CC |LINK )' "$TEST_TMP/version-stable.log"; then
+    echo "unchanged version rebuilt the program unnecessarily" >&2
+    exit 1
+fi
+fi
+
 if [[ $CASE == proc || $CASE == all ]]; then
 CASE_RAN=1
     "$TEST_TMP/proc_test"
@@ -265,6 +287,82 @@ grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
 # A signal-delivery stop can precede the requested INTERRUPT stop.
+if [[ $CASE == recovery-fork || $CASE == all ]]; then
+CASE_RAN=1
+start_fixture fork-cont
+ARTHUR_FAIL_PROC_MEM_EOF=1 ARTHUR_WAIT_FORK_BEFORE_INTERRUPT=1 \
+    LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+    "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$TEST_TMP/recovery-fork.acore" \
+    >"$TEST_TMP/recovery-fork.log" 2>&1 &
+RECOVERY_FORK_MONITOR=$!
+TARGET_PIDS+=("$RECOVERY_FORK_MONITOR")
+wait_for_log "$TEST_TMP/recovery-fork.log" "Launched in monitor mode"
+kill -USR1 "$RECOVERY_FORK_MONITOR"
+wait_for_log "$TEST_TMP/recovery-fork.log" "fork event stopped before INTERRUPT"
+wait_for_log "$TEST_TMP/recovery-fork.log" "forkcore failed"
+while read -r child; do
+    if [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$child/status" 2>/dev/null || true) == "$RECOVERY_FORK_MONITOR" ]]; then
+        echo "late recovery retained a traced business child" >&2
+        exit 1
+    fi
+done < <(pgrep -P "$FIXTURE_PID" || true)
+kill -TERM "$RECOVERY_FORK_MONITOR"
+wait_for_process_exit "$RECOVERY_FORK_MONITOR"
+expect_status 0 wait "$RECOVERY_FORK_MONITOR"
+[[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+if find "$TEST_TMP" -maxdepth 1 -name "acore.$FIXTURE_PID.*" | grep -q .; then
+    echo "failed fork-event snapshot published an output" >&2
+    exit 1
+fi
+kill -TERM "$FIXTURE_PID"
+expect_status 143 wait "$FIXTURE_PID"
+fi
+
+if [[ $CASE == recovery-delivery || $CASE == final-delivery || $CASE == all ]]; then
+CASE_RAN=1
+for delivery_stage in recovery final; do
+    [[ $CASE != all && $CASE != "$delivery_stage-delivery" ]] && continue
+    for delivery_signal in 15 11 3; do
+        if [[ $delivery_signal == 15 ]]; then
+            start_fixture relay-term-spin
+            DELIVERY_TARGET_STATUS=42
+        elif [[ $delivery_signal == 3 ]]; then
+            start_fixture relay-quit-spin
+            DELIVERY_TARGET_STATUS=42
+        else
+            start_fixture memory-spin 8
+            DELIVERY_TARGET_STATUS=139
+        fi
+        delivery_env=(ARTHUR_DELIVERY_BEFORE_INTERRUPT=$delivery_signal
+                      ARTHUR_DELIVERY_AFTER_CHILD_KILL=1)
+        [[ $delivery_stage == recovery ]] && delivery_env+=(ARTHUR_FAIL_PROC_MEM_EOF=1)
+        DELIVERY_PREFIX="$TEST_TMP/$delivery_stage-$delivery_signal"
+        env "${delivery_env[@]}" LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+            "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$DELIVERY_PREFIX.acore" \
+            >"$DELIVERY_PREFIX.log" 2>&1 &
+        DELIVERY_MONITOR_PID=$!
+        TARGET_PIDS+=("$DELIVERY_MONITOR_PID")
+        wait_for_log "$DELIVERY_PREFIX.log" "Launched in monitor mode"
+        kill -USR1 "$DELIVERY_MONITOR_PID"
+        if ! wait_for_process_exit "$FIXTURE_PID" ||
+           ! wait_for_process_exit "$DELIVERY_MONITOR_PID"; then
+            cat "$DELIVERY_PREFIX.log" >&2
+            exit 1
+        fi
+        expect_status "$DELIVERY_TARGET_STATUS" wait "$FIXTURE_PID"
+        expect_status 0 wait "$DELIVERY_MONITOR_PID"
+        grep -q "delivery $delivery_signal stopped before INTERRUPT" "$DELIVERY_PREFIX.log"
+        if [[ $delivery_signal == 11 ]]; then
+            expect_status 0 "$ARTHUR_BIN" -c "$DELIVERY_PREFIX.acore" -o "$DELIVERY_PREFIX.core"
+            "$TEST_TMP/core_note_test" "$DELIVERY_PREFIX.core" \
+                "$(id -u)" "$(id -g)" 0x600 0 1 11 11
+        else
+            [[ ! -e "$DELIVERY_PREFIX.acore" ]]
+        fi
+    done
+done
+fi
+
 if [[ $CASE == interrupt-relay || $CASE == all ]]; then
 CASE_RAN=1
 for interrupt_signal in 15 11; do
@@ -2599,6 +2697,7 @@ CHILD_ESRCH_SNAPSHOT=$(find "$TEST_TMP" -maxdepth 1 -type f \
     -name "acore.$FIXTURE_PID.*" -print -quit)
 if [[ -z $CHILD_ESRCH_SNAPSHOT ]] || pgrep -P "$FIXTURE_PID" >/dev/null; then
     echo "DETACH ESRCH fallback did not publish cleanly or retained child" >&2
+    cat "$TEST_TMP/child-detach-esrch.log" >&2
     exit 1
 fi
 expect_status 0 "$ARTHUR_BIN" -c "$CHILD_ESRCH_SNAPSHOT" \
