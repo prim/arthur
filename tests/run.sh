@@ -319,6 +319,128 @@ expect_status 0 "$ARTHUR_BIN" -c "$TEST_TMP/inherited.acore" -o "$TEST_TMP/inher
 fi
 
 # An already-exited leader must not hide its surviving workers.
+if [[ $CASE == leader-exit-capture-errors || $CASE == all ]]; then
+CASE_RAN=1
+for capture_mode in 1 0; do
+    for capture_fault in regs close relay; do
+        ERROR_WORKERS=3
+        if [[ $capture_fault == relay ]]; then
+            start_fixture leader-exit
+            ERROR_WORKERS=1
+        else
+            start_fixture leader-exit-multi
+        fi
+        for _ in $(seq 1 200); do
+            [[ $(grep -c '^leader-worker-tid=' "$TEST_TMP/fixture.log") == "$ERROR_WORKERS" ]] && break
+            sleep 0.01
+        done
+        [[ $(grep -c '^leader-worker-tid=' "$TEST_TMP/fixture.log") == "$ERROR_WORKERS" ]]
+        kill -USR2 "$FIXTURE_PID"
+        for _ in $(seq 1 200); do
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]] && break
+            sleep 0.01
+        done
+        [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]]
+        ERROR_PREFIX="$TEST_TMP/capture-error-$capture_mode-$capture_fault"
+        printf 'prior-output\n' >"$ERROR_PREFIX.acore"
+        capture_expected=255
+        case $capture_fault in
+            regs) capture_env=(ARTHUR_FAIL_GETREGS=1) ;;
+            close) capture_env=(ARTHUR_FAIL_FCLOSE="capture-error-$capture_mode-close.acore") ;;
+            relay) capture_env=(ARTHUR_ATTACH_DELIVERY_SIGNAL=15); capture_expected=0 ;;
+        esac
+        if ! expect_status "$capture_expected" timeout 15s env "${capture_env[@]}" \
+            LD_PRELOAD="$TEST_TMP/fclose_fail.so" "$ARTHUR_BIN" -p "$FIXTURE_PID" \
+            "-$capture_mode" -o "$ERROR_PREFIX.acore" >"$ERROR_PREFIX.log" 2>&1; then
+            cat "$ERROR_PREFIX.log" >&2
+            exit 1
+        fi
+        if [[ $capture_fault == relay ]]; then
+            wait_for_process_exit "$FIXTURE_PID"
+            expect_status 143 wait "$FIXTURE_PID"
+            expect_status 0 "$ARTHUR_BIN" -c "$ERROR_PREFIX.acore" -o "$ERROR_PREFIX.core"
+            "$TEST_TMP/core_note_test" "$ERROR_PREFIX.core" "$(id -u)" "$(id -g)" 0 0x600 1 0 15
+        else
+            [[ $(<"$ERROR_PREFIX.acore") == prior-output ]]
+            while read -r worker; do
+                [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$worker/status") == 0 ]]
+                [[ ! $(awk '{print $3}' "/proc/$worker/stat") =~ ^[TtZ]$ ]]
+            done < <(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log")
+            kill -TERM "$FIXTURE_PID"
+            expect_status 143 wait "$FIXTURE_PID"
+        fi
+        if find "$TEST_TMP" -maxdepth 1 -name "capture-error-$capture_mode-$capture_fault.acore.tmp.*" | grep -q .; then
+            echo "failed one-shot capture retained a temporary output" >&2
+            exit 1
+        fi
+    done
+done
+fi
+
+if [[ $CASE == leader-exit-capture || $CASE == all ]]; then
+CASE_RAN=1
+for capture_fixture in leader-exit leader-exit-multi; do
+    CAPTURE_THREADS=1
+    [[ $capture_fixture == leader-exit-multi ]] && CAPTURE_THREADS=3
+for capture_mode in 1 0; do
+    for capture_state in running stopped; do
+        start_fixture "$capture_fixture"
+        wait_for_log "$TEST_TMP/fixture.log" "leader-worker-tid="
+        for _ in $(seq 1 200); do
+            [[ $(grep -c '^leader-worker-tid=' "$TEST_TMP/fixture.log") == "$CAPTURE_THREADS" ]] && break
+            sleep 0.01
+        done
+        [[ $(grep -c '^leader-worker-tid=' "$TEST_TMP/fixture.log") == "$CAPTURE_THREADS" ]]
+        CAPTURE_WORKER=$(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log" | sort -n | head -n 1)
+        kill -USR2 "$FIXTURE_PID"
+        for _ in $(seq 1 200); do
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]] && break
+            sleep 0.01
+        done
+        [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == Z ]]
+        if [[ $capture_state == stopped ]]; then
+            kill -STOP "$FIXTURE_PID"
+            for _ in $(seq 1 200); do
+                [[ $(awk '{print $3}' "/proc/$CAPTURE_WORKER/stat") == T ]] && break
+                sleep 0.01
+            done
+            [[ $(awk '{print $3}' "/proc/$CAPTURE_WORKER/stat") == T ]]
+        fi
+        CAPTURE_PREFIX="$TEST_TMP/leader-capture-$capture_fixture-$capture_mode-$capture_state"
+        if ! expect_status 0 timeout 15s "$ARTHUR_BIN" -p "$FIXTURE_PID" "-$capture_mode" \
+            -o "$CAPTURE_PREFIX.acore" >"$CAPTURE_PREFIX.log" 2>&1; then
+            cat "$CAPTURE_PREFIX.log" >&2
+            exit 1
+        fi
+        expect_status 0 "$ARTHUR_BIN" -c "$CAPTURE_PREFIX.acore" -o "$CAPTURE_PREFIX.core"
+        "$TEST_TMP/core_note_test" "$CAPTURE_PREFIX.core" "$(id -u)" "$(id -g)" 0 0x600 1 \
+            >"$CAPTURE_PREFIX.notes.log"
+        grep -q "prstatus=$CAPTURE_THREADS$" "$CAPTURE_PREFIX.notes.log"
+        gdb -q -nx -batch -ex 'info threads' -ex 'p *(int *)&trigger' \
+            "$TEST_TMP/fixture" "$CAPTURE_PREFIX.core" >"$CAPTURE_PREFIX.gdb.log" 2>&1
+        grep -Eq "^\\*.*LWP $CAPTURE_WORKER([ )]|$)" "$CAPTURE_PREFIX.gdb.log"
+        grep -q '\$1 = 1' "$CAPTURE_PREFIX.gdb.log"
+        while read -r worker; do
+            [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$worker/status") == 0 ]]
+            if [[ $capture_state == stopped ]]; then
+                [[ $(awk '{print $3}' "/proc/$worker/stat") == T ]]
+            else
+                [[ ! $(awk '{print $3}' "/proc/$worker/stat") =~ ^[TtZ]$ ]]
+            fi
+        done < <(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log")
+        if [[ $capture_state == stopped ]]; then
+            [[ $(awk '{print $3}' "/proc/$CAPTURE_WORKER/stat") == T ]]
+            kill -CONT "$FIXTURE_PID"
+        else
+            [[ ! $(awk '{print $3}' "/proc/$CAPTURE_WORKER/stat") =~ ^[TtZ]$ ]]
+        fi
+        kill -TERM "$FIXTURE_PID"
+        expect_status 143 wait "$FIXTURE_PID"
+    done
+done
+done
+fi
+
 if [[ $CASE == leader-exit-start || $CASE == all ]]; then
 CASE_RAN=1
 for late_end in term crash stop exec group; do

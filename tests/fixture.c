@@ -176,12 +176,16 @@ int main(int argc, char **argv)
         }
     }
 
-    if (strcmp(argv[1], "leader-exit") == 0 || strcmp(argv[1], "leader-exit-exec") == 0) {
+    if (strcmp(argv[1], "leader-exit") == 0 || strcmp(argv[1], "leader-exit-exec") == 0 ||
+        strcmp(argv[1], "leader-exit-multi") == 0) {
         signal(SIGUSR2, on_signal);
         pthread_t worker;
         void *allow_exec = strcmp(argv[1], "leader-exit-exec") == 0 ? argv[1] : NULL;
-        if (pthread_create(&worker, NULL, leader_exit_worker, allow_exec) != 0) {
-            return 3;
+        int count = strcmp(argv[1], "leader-exit-multi") == 0 ? 3 : 1;
+        for (int i = 0; i < count; i++) {
+            if (pthread_create(&worker, NULL, leader_exit_worker, allow_exec) != 0) {
+                return 3;
+            }
         }
         ready();
         while (!trigger) {

@@ -2838,7 +2838,7 @@ fail:
     return -1;
 }
 
-int Coredump::collect_threads(pid_t leader)
+int Coredump::collect_threads(pid_t leader, pid_t attached_tid)
 {
     _process._thrd_pid.clear();
 
@@ -3059,10 +3059,16 @@ int Coredump::collect_threads(pid_t leader)
         return -1;
     }
 
-    _process._thrd_pid.push_back(leader);   // leader is already attached by caller
+    if (attached_tid == 0) {
+        attached_tid = leader;
+    }
+    _process._thrd_pid.push_back(attached_tid);
     std::set<pid_t> stopped;
     std::set<pid_t> unavailable;
-    stopped.insert(leader);
+    stopped.insert(attached_tid);
+    if (attached_tid != leader) {
+        unavailable.insert(leader); // Confirmed zombie, not an omitted live thread.
+    }
 
     // A single readdir pass is not a thread-group snapshot: an untraced
     // sibling can clone after its directory entry was visited. Attach every
@@ -3070,7 +3076,7 @@ int Coredump::collect_threads(pid_t leader)
     // stopped, the set cannot grow and the fixed point is stable.
     for (int round = 0; round < 64; round++) {
         std::set<pid_t> observed;
-        if (list_task_tids(leader, observed) != 0 || !observed.count(leader)) {
+        if (list_task_tids(leader, observed) != 0 || !observed.count(attached_tid)) {
             error("cannot enumerate complete thread set of %d", leader);
             return -1;
         }
@@ -3107,7 +3113,7 @@ int Coredump::collect_threads(pid_t leader)
         }
 
         std::set<pid_t> confirm;
-        if (list_task_tids(leader, confirm) != 0 || !confirm.count(leader)) {
+        if (list_task_tids(leader, confirm) != 0 || !confirm.count(attached_tid)) {
             error("cannot confirm thread set of %d", leader);
             return -1;
         }
@@ -3119,6 +3125,10 @@ int Coredump::collect_threads(pid_t leader)
             }
         }
         if (complete) {
+            if (attached_tid != leader && task_is_zombie(leader) != 1) {
+                error("leader identity changed while collecting process %d", leader);
+                return -1;
+            }
             return 0;
         }
     }
@@ -4100,9 +4110,33 @@ int Coredump::generate(const char *corefile)
         return -1;
     }
 
-    // attach main thread
+    // A live worker can control a process whose original leader has exited.
+    // Keep _pid as the TGID; v6 stores its process stat separately from THREADs.
+    pid_t control_tid = _pid;
     int leader_relay_signal = 0;
-    if (pt_attach(_pid, &leader_relay_signal) != 0) {
+    if (task_is_zombie(_pid) == 1) {
+        std::set<pid_t> candidates;
+        rc = -1;
+        if (list_task_tids(_pid, candidates) == 0) {
+            for (pid_t tid : candidates) {
+                if (tid == _pid || task_is_zombie(tid) == 1) {
+                    continue;
+                }
+                leader_relay_signal = 0;
+                rc = pt_attach(tid, &leader_relay_signal);
+                if (rc == 0) {
+                    control_tid = tid;
+                    break;
+                }
+                if (errno != ESRCH && errno != EAGAIN) {
+                    break;
+                }
+            }
+        }
+    } else {
+        rc = pt_attach(_pid, &leader_relay_signal);
+    }
+    if (rc != 0) {
         // 目标不存在/无权限：干净报错而非深层 assert 崩溃
         // b41 (Codex review): 只依赖析构关文件会留下 8 字节空 acore；显式清理，
         // 避免无效/无权限 pid 产出误导性文件。
@@ -4112,7 +4146,7 @@ int Coredump::generate(const char *corefile)
         return -1;
     }
     if (leader_relay_signal != 0) {
-        _monitor_relay_signals[_pid] = leader_relay_signal;
+        _monitor_relay_signals[control_tid] = leader_relay_signal;
     }
 
     auto detach_collected_threads = [&]() -> int {
@@ -4133,7 +4167,7 @@ int Coredump::generate(const char *corefile)
     // B77: collect_threads 失败（opendir / 非 ESRCH attach 错误）时 fail-closed。
     // R50-6: leader 已 attach（SIGSTOP）；失败须 detach 已 attach 线程，
     // 否则目标冻结（内核自动 detach 不恢复 TASK_STOPPED）。
-    if (collect_threads(_pid) != 0) {
+    if (collect_threads(_pid, control_tid) != 0) {
         error("failed to collect threads of %d", _pid);
         detach_collected_threads();
         out.Close();
@@ -4144,7 +4178,7 @@ int Coredump::generate(const char *corefile)
     ProcMaps maps;
     // N4: WriteProcessMeta 失败（/proc 读失败）时继续写会让 acore 缺进程元数据，
     // 解压错位；直接失败。
-    if (WriteProcessMeta(out, maps) != 0) {
+    if (WriteProcessMeta(out, maps, control_tid) != 0) {
         error("write process meta failed");
         // R50-1: 失败路径残留部分 acore + 已 attach 线程未 detach。清理并还原。
         detach_collected_threads();
@@ -4155,8 +4189,8 @@ int Coredump::generate(const char *corefile)
     // handle  leader first and then rest
     // R50-1: WriteThreadMeta 现在会因写失败返回 -1；忽略则线程块缺失仍继续
     // LOADS/ELF → 坏 acore。检查并清理部分产物。
-    if (WriteThreadMeta(out, _pid, true) != 0) {
-        error("write leader thread meta failed");
+    if (WriteThreadMeta(out, control_tid, control_tid == _pid) != 0) {
+        error("write control thread meta failed");
         // B178: 同函数其余失败路径全部 detach——缺 detach 时已 attach 线程（含 leader）
         // 残留 PT_PTRACED+SIGSTOP，arthur 退出后内核自动 detach 不恢复 TASK_STOPPED，
         // 目标永久冻结（磁盘满等 WriteThreadMeta 失败是 B64-B70 同触发类）。
@@ -4166,7 +4200,7 @@ int Coredump::generate(const char *corefile)
         return -1;
     }
     for(pid_t& tid : _process._thrd_pid) {
-        if (tid == _pid)
+        if (tid == control_tid)
             continue;
 
         if (WriteThreadMeta(out, tid) != 0) {
@@ -4183,7 +4217,7 @@ int Coredump::generate(const char *corefile)
     {
         // B65: WriteLoads 失败（/proc/pid/mem 打不开，dumpable=0/进程消失）时
         // 静默产出无内存的空 core；显式失败。
-        if (WriteLoads(out, _pid, maps) != 0) {
+        if (WriteLoads(out, control_tid, maps) != 0) {
             error("failed to dump memory of %d", _pid);
             // R50-1: 清理部分 acore + detach 已 attach 线程。
             detach_collected_threads();
@@ -4315,6 +4349,10 @@ static bool fork_snapshot_requires_direct_capture(pid_t pid, ProcMaps& maps)
 
 int Coredump::forkcore(const char *corefile, bool sys_core)
 {
+    if (!sys_core && task_is_zombie(_pid) == 1) {
+        info("leader has exited; using a live-worker direct snapshot");
+        return generate(corefile);
+    }
     // 每次采集前清空跨调用累积的 _phdrs
     _phdrs.clear();
     _core_pid = 0;

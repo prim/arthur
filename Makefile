@@ -94,6 +94,8 @@ test: $(TARGET)
 	@bash tests/run.sh leader-exit
 	@bash tests/run.sh leader-exit-stop
 	@bash tests/run.sh leader-exit-start
+	@bash tests/run.sh leader-exit-capture
+	@bash tests/run.sh leader-exit-capture-errors
 	@bash tests/run.sh exec
 	@bash tests/run.sh clone-process
 	@bash tests/run.sh fatal

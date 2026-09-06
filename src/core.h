@@ -352,7 +352,8 @@ private:
     int WriteThreadMeta(Lz4Stream& out, pid_t pid, bool is_main = false);
     // 枚举 /proc/<leader>/task/ 全部线程并 attach 非主线程；attach 失败的
     // （线程已退出）从列表剔除，保证线程计数与实际写出的 THREAD 块一致。
-    int collect_threads(pid_t leader);
+    // One-shot capture may supply an attached worker after the leader exits.
+    int collect_threads(pid_t leader, pid_t attached_tid = 0);
     // monitor 持久 SEIZE 全部现有线程，并用 TRACECLONE 维护后续线程。
     int monitor_threads(pid_t leader);
     // 采集失败（fail-closed）时还原目标：detach 兄弟线程、resume leader、
