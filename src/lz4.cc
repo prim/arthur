@@ -891,7 +891,8 @@ ProcFile* Lz4Stream::GetFile()
             free(pf);
             return NULL;
         }
-        rc = block->Read(p+i, MIN(size-i, BLOCK_SIZE));
+        // FILE fragments need not fill the decoder's maximum block size.
+        rc = block->Read(p+i, block->Size());
         if (rc <= 0) {
             break;   // 读不动了，防死循环
         }

@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <string>
+#include <vector>
 
 #include "core.h"
 
@@ -46,10 +47,158 @@ static void copy_with_trailing_byte(const char *source, const char *destination)
     assert(fclose(out) == 0);
 }
 
+static uint32_t fragment_crc(uint32_t crc, const void *data, size_t size)
+{
+    const unsigned char *bytes = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < size; i++) {
+        crc ^= bytes[i];
+        for (unsigned bit = 0; bit < 8; bit++) {
+            crc = (crc >> 1) ^ ((crc & 1U) ? 0xedb88320U : 0U);
+        }
+    }
+    return crc;
+}
+
+static void write_fragment_block(FILE *out, BlockHeader header,
+                                  const char *data, size_t size, bool checksums)
+{
+    assert(size > 0 && size <= BLOCK_SIZE);
+    std::vector<char> compressed(LZ4_compressBound((int)size));
+    // Independent LZ4 blocks are valid streaming blocks too.
+    int encoded = LZ4_compress_default(data, compressed.data(), (int)size,
+                                      (int)compressed.size());
+    assert(encoded > 0);
+    header.size = (uint32_t)encoded;
+    assert(fwrite(&header, 1, sizeof(header), out) == sizeof(header));
+    assert(fwrite(compressed.data(), 1, encoded, out) == (size_t)encoded);
+    if (checksums) {
+        uint32_t crc = fragment_crc(0xffffffffU, &header, sizeof(header));
+        crc = fragment_crc(crc, data, size) ^ 0xffffffffU;
+        assert(fwrite(&crc, 1, sizeof(crc), out) == sizeof(crc));
+    }
+}
+
+static void write_fragmented_file(FILE *out, const char *data, uint32_t size,
+                                  size_t fragment, bool checksums)
+{
+    assert(fwrite(&size, 1, sizeof(size), out) == sizeof(size));
+    for (size_t offset = 0; offset < size; offset += fragment) {
+        BlockHeader header;
+        header.block_type = BLOCK_TYPE_FILE;
+        header.prev_cont = offset != 0;
+        write_fragment_block(out, header, data + offset,
+                              MIN(fragment, size - offset), checksums);
+    }
+}
+
+static void rewrite_file_fragments(const char *source, const char *destination)
+{
+    Lz4Stream in(Lz4Stream::LZ4_Decompress);
+    assert(in.Open(source) == 0);
+    AcoreHeader header;
+    assert(in.ReadRaw(reinterpret_cast<char *>(&header), sizeof(header)) == (int)sizeof(header));
+    bool checksums = header.m.version >= 4;
+    assert(in.EnableBlockChecksums(checksums) == 0);
+    FILE *out = fopen(destination, "wb");
+    assert(out != NULL);
+    assert(fwrite(&header, 1, sizeof(header), out) == sizeof(header));
+
+    BlockHeader block_header;
+    Block *block = in.ReadBlock(block_header);
+    assert(block && block_header.block_type == BLOCK_TYPE_PROCESS);
+    assert(block->Length() >= 3 * sizeof(uint32_t));
+    uint32_t threads = 0;
+    memcpy(&threads, block->rBuf() + 2 * sizeof(uint32_t), sizeof(threads));
+    write_fragment_block(out, block_header, block->rBuf(), block->Length(), checksums);
+    auto copy_file = [&]() {
+        ProcFile *file = in.GetFile();
+        assert(file != NULL);
+        write_fragmented_file(out, reinterpret_cast<const char *>(file),
+                               (uint32_t)file->Size(), 7, checksums);
+        free(file);
+    };
+    for (unsigned i = 0; i < (header.m.version >= 6 ? 7U : 6U); i++) {
+        copy_file();
+    }
+    for (uint32_t i = 0; i < threads; i++) {
+        block = in.ReadBlock(block_header);
+        assert(block && block_header.block_type == BLOCK_TYPE_THREAD);
+        write_fragment_block(out, block_header, block->rBuf(), block->Length(), checksums);
+        copy_file();
+    }
+    while ((block = in.ReadBlock(block_header)) != NULL) {
+        write_fragment_block(out, block_header, block->rBuf(), block->Length(), checksums);
+    }
+    assert(in.TailSeen() && in.LastReadClean() && in.VerifyPhysicalEof() == 0);
+    assert(in.Close() == 0);
+    BlockHeader tail = BlockHeader::TailMark();
+    assert(fwrite(&tail, 1, sizeof(tail), out) == sizeof(tail));
+    assert(fclose(out) == 0);
+}
+
+static bool check_file_fragments(const char *prefix)
+{
+    std::vector<char> files[2];
+    for (unsigned i = 0; i < 2; i++) {
+        ProcFile header = {};
+        header.f_pid = 1234 + i;
+        header.f_type = PROC_TYPE_ENVIRON;
+        header.f_size = i == 0 ? 2 * BLOCK_SIZE + 17 : 0;
+        files[i].resize(header.Size());
+        memcpy(files[i].data(), &header, sizeof(header));
+        const char entry[] = "VALUE=abcdefghijklmnopqrstuvwxyz";
+        for (size_t j = 0; j < header.f_size; j++) {
+            files[i][sizeof(header) + j] = entry[j % sizeof(entry)];
+        }
+        if (header.f_size != 0) {
+            files[i].back() = '\0';
+        }
+    }
+
+    const size_t fragments[] = {BLOCK_SIZE, BLOCK_SIZE / 2, 4096, 7};
+    Lz4Stream reader(Lz4Stream::LZ4_Decompress);
+    for (unsigned checksums = 0; checksums < 2; checksums++) {
+        for (size_t fragment : fragments) {
+            std::string path = std::string(prefix) + ".fragments-" +
+                std::to_string(fragment) + "-" + std::to_string(checksums);
+            FILE *out = fopen(path.c_str(), "wb");
+            assert(out != NULL);
+            for (const std::vector<char>& file : files) {
+                write_fragmented_file(out, file.data(), (uint32_t)file.size(),
+                                       fragment, checksums != 0);
+            }
+            BlockHeader tail = BlockHeader::TailMark();
+            assert(fwrite(&tail, 1, sizeof(tail), out) == sizeof(tail));
+            assert(fclose(out) == 0);
+
+            assert(reader.Open(path.c_str()) == 0);
+            assert(reader.EnableBlockChecksums(checksums != 0) == 0);
+            for (const std::vector<char>& file : files) {
+                ProcFile *decoded = reader.GetFile();
+                if (!decoded) {
+                    fprintf(stderr, "valid ProcFile fragments rejected: size=%zu checksums=%u\n",
+                            fragment, checksums);
+                    return false;
+                }
+                assert(decoded->Size() == file.size());
+                assert(memcmp(decoded, file.data(), file.size()) == 0);
+                free(decoded);
+            }
+            assert(reader.ReadBlock(tail) == NULL && reader.TailSeen() && reader.LastReadClean());
+            assert(reader.VerifyPhysicalEof() == 0);
+            assert(reader.Close() == 0);
+        }
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4) {
         return 2;
+    }
+    if (!check_file_fragments(argv[2])) {
+        return 1;
     }
 
     sigset_t before, after;
@@ -330,12 +479,14 @@ int main(int argc, char **argv)
     std::string corrupt_acore = std::string(argv[2]) + ".corrupt.acore";
     std::string rejected_core = std::string(argv[2]) + ".rejected.core";
     copy_with_trailing_byte(argv[1], corrupt_acore.c_str());
+    std::string fragmented_acore = std::string(argv[2]) + ".fragmented.acore";
+    rewrite_file_fragments(argv[1], fragmented_acore.c_str());
 
     Coredump dump(0);
     if (dump.decompress(argv[1], argv[2]) != 0 ||
         dump.decompress(corrupt_acore.c_str(), rejected_core.c_str()) == 0 ||
         access(rejected_core.c_str(), F_OK) == 0 ||
-        dump.decompress(argv[1], argv[3]) != 0) {
+        dump.decompress(fragmented_acore.c_str(), argv[3]) != 0) {
         fprintf(stderr, "reusing one Coredump instance failed\n");
         return 1;
     }

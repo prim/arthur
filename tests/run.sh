@@ -1518,7 +1518,11 @@ if [[ $CLONE_WAIT_RC -eq 0 || $CLONE_WAIT_RC -eq 124 ]] ||
     echo "clone child wait failure continued, timed out, or retained target" >&2
     exit 1
 fi
-grep -q "detaching tracked clone child" "$TEST_TMP/clone-wait-error.log"
+if ! grep -q "detaching tracked clone child" "$TEST_TMP/clone-wait-error.log"; then
+    cat "$TEST_TMP/clone-wait-error.log" >&2
+    echo "clone wait failure cleanup did not explicitly detach its child" >&2
+    exit 1
+fi
 kill -TERM "$FIXTURE_PID"
 expect_status 143 wait "$FIXTURE_PID"
 fi
