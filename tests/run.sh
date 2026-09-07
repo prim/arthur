@@ -1146,8 +1146,11 @@ wait "$FIXTURE_PID" 2>/dev/null
 set -e
 fi
 
-if [[ $CASE == startup-rollback-relay || $CASE == all ]]; then
+if [[ $CASE == startup-rollback-relay || $CASE == startup-rollback-wait || $CASE == all ]]; then
 CASE_RAN=1
+for startup_wait in clean error; do
+    [[ $CASE == startup-rollback-relay && $startup_wait == error ]] && continue
+    [[ $CASE == startup-rollback-wait && $startup_wait == clean ]] && continue
 for startup_signal in 15 3 19 0; do
     if [[ $startup_signal == 15 ]]; then
         start_fixture relay-term-spin
@@ -1157,8 +1160,9 @@ for startup_signal in 15 3 19 0; do
         start_fixture memory-spin 8
     fi
     startup_env=(ARTHUR_TARGET_PID="$FIXTURE_PID" ARTHUR_FAIL_MONITOR_RESCAN=1)
+    [[ $startup_wait != error ]] || startup_env+=(ARTHUR_FAIL_WAITPID=1)
     [[ $startup_signal == 0 ]] || startup_env+=(ARTHUR_DELIVERY_BEFORE_INTERRUPT="$startup_signal")
-    STARTUP_PREFIX="$TEST_TMP/startup-$startup_signal"
+    STARTUP_PREFIX="$TEST_TMP/startup-$startup_wait-$startup_signal"
     printf 'previous-output\n' >"$STARTUP_PREFIX.acore"
     cp "$STARTUP_PREFIX.acore" "$STARTUP_PREFIX.expected"
     if ! expect_status 255 timeout 15s env "${startup_env[@]}" \
@@ -1194,6 +1198,7 @@ for startup_signal in 15 3 19 0; do
     fi
     cmp "$STARTUP_PREFIX.expected" "$STARTUP_PREFIX.acore"
     [[ -z $(find "$TEST_TMP" -name '*.tmp.*' -print -quit) ]]
+done
 done
 fi
 
@@ -1363,6 +1368,55 @@ if [[ $EVENT_TARGET_RC -ne 143 ]]; then
     echo "event identity failure changed target termination status $EVENT_TARGET_RC" >&2
     exit 1
 fi
+fi
+
+if [[ $CASE == detach-stop-race || $CASE == all ]]; then
+CASE_RAN=1
+for shutdown_poll in empty error; do
+    for shutdown_signal in 15 3 19; do
+        case $shutdown_signal in
+            15) start_fixture relay-term-spin ;;
+            3) start_fixture relay-quit-spin ;;
+            19) start_fixture memory-spin 8 ;;
+        esac
+        SHUTDOWN_PREFIX="$TEST_TMP/shutdown-$shutdown_poll-$shutdown_signal"
+        printf 'previous-output\n' >"$SHUTDOWN_PREFIX.acore"
+        cp "$SHUTDOWN_PREFIX.acore" "$SHUTDOWN_PREFIX.expected"
+        shutdown_env=(ARTHUR_TARGET_PID="$FIXTURE_PID" ARTHUR_SHUTDOWN_DELIVERY="$shutdown_signal")
+        [[ $shutdown_poll != error ]] || shutdown_env+=(ARTHUR_SHUTDOWN_WAIT_ERROR=1)
+        env "${shutdown_env[@]}" LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+            "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$SHUTDOWN_PREFIX.acore" \
+            >"$SHUTDOWN_PREFIX.log" 2>&1 &
+        SHUTDOWN_MONITOR=$!
+        TARGET_PIDS+=("$SHUTDOWN_MONITOR")
+        wait_for_log "$SHUTDOWN_PREFIX.log" 'Launched in monitor mode'
+        kill -TERM "$SHUTDOWN_MONITOR"
+        wait_for_process_exit "$SHUTDOWN_MONITOR" 2>>"$SHUTDOWN_PREFIX.log"
+        SHUTDOWN_EXPECTED=0
+        [[ $shutdown_poll != error ]] || SHUTDOWN_EXPECTED=255
+        expect_status "$SHUTDOWN_EXPECTED" wait "$SHUTDOWN_MONITOR"
+        grep -q "delivery $shutdown_signal arrived after empty shutdown poll" "$SHUTDOWN_PREFIX.log"
+        if [[ $shutdown_signal == 19 ]]; then
+            for _ in $(seq 1 200); do
+                [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]] && break
+                sleep 0.01
+            done
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]]
+            [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+            kill -CONT "$FIXTURE_PID"
+            kill -TERM "$FIXTURE_PID"
+            expect_status 143 wait "$FIXTURE_PID"
+        else
+            if ! wait_for_process_exit "$FIXTURE_PID"; then
+                cat "$SHUTDOWN_PREFIX.log" >&2
+                exit 1
+            fi
+            expect_status 42 wait "$FIXTURE_PID"
+        fi
+        cmp "$SHUTDOWN_PREFIX.expected" "$SHUTDOWN_PREFIX.acore"
+        [[ -z $(find "$TEST_TMP" -name '*.tmp.*' -print -quit) ]]
+    done
+done
 fi
 
 # On monitor shutdown an event-zero SEIZE status is a real delivery stop. A

@@ -2848,6 +2848,10 @@ fail:
         int status = -1;
         if (ptrace(PTRACE_INTERRUPT, tid, 0, 0) == 0) {
             status = pt_wait(tid);
+            if (status < 0 && errno != ESRCH && errno != ETIMEDOUT) {
+                // Recover the stop identity after a transient query error.
+                status = pt_wait(tid);
+            }
         }
         // SEIZE's synthetic stops carry an event code. An event-zero stop
         // belongs to the target and must survive startup rollback.
@@ -6147,6 +6151,24 @@ int Coredump::monitor(const char* corefile)
 
     auto detach_monitored_threads = [&]() -> int {
         int detach_rc = 0;
+        auto read_stopped_status = [&](pid_t tid, int& status, bool& synthetic) -> void {
+            // GETREGS proves a stop, not that its wait status was consumed.
+            // Delivery can race with the earlier empty/failed waitpid poll.
+            pid_t wr;
+            do {
+                wr = waitpid(tid, &status, __WALL | WUNTRACED | WNOHANG);
+            } while (wr < 0 && errno == EINTR);
+            if (wr < 0) {
+                warn("cannot recover stopped thread %d status for detach (%s)",
+                     tid, strerror(errno));
+                detach_rc = -1;
+            }
+            // A repeated failure retains the existing best-effort detach.
+            synthetic = wr != tid;
+            if (synthetic) {
+                status = (SIGSTOP << 8) | 0x7f;
+            }
+        };
         std::set<pid_t> pending = _monitor_tids;
         while (!pending.empty()) {
             pid_t tid = *pending.begin();
@@ -6166,10 +6188,7 @@ int Coredump::monitor(const char* corefile)
             if (wr == 0) {
                 user_regs64_struct stopped_regs;
                 if (pt_getregs(tid, &stopped_regs) == 0) {
-                    // The stop status was consumed by the failing operation;
-                    // GETREGSET proves the tracee is still detach-ready.
-                    status = (SIGSTOP << 8) | 0x7f;
-                    synthetic_status = true;
+                    read_stopped_status(tid, status, synthetic_status);
                 } else if (ptrace(PTRACE_INTERRUPT, tid, 0, 0) != 0) {
                     if (errno != ESRCH) {
                         warn("cannot interrupt monitored thread %d for detach (%s)",
@@ -6211,8 +6230,7 @@ int Coredump::monitor(const char* corefile)
                         continue;
                     }
                 } else {
-                    status = (SIGSTOP << 8) | 0x7f;
-                    synthetic_status = true;
+                    read_stopped_status(tid, status, synthetic_status);
                 }
             }
 

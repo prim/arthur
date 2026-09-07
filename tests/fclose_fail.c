@@ -33,6 +33,7 @@ static int child_detached_with_kill;
 static int saw_interrupt;
 static DIR *injected_task_dir;
 static int injected_task_seen;
+static int monitor_terminating;
 
 int gettimeofday(struct timeval *value, void *zone)
 {
@@ -523,6 +524,33 @@ pid_t waitpid(pid_t pid, int *status, int options)
     if (!real_waitpid) {
         real_waitpid = (pid_t (*)(pid_t, int *, int))dlsym(RTLD_NEXT, "waitpid");
     }
+    const char *shutdown_signal = getenv("ARTHUR_SHUTDOWN_DELIVERY");
+    if (!injected && monitor_terminating && shutdown_signal && pid == fault_target_pid()) {
+        pid_t rc = real_waitpid(pid, status, options);
+        if (rc != 0) {
+            return rc;
+        }
+        int sig = atoi(shutdown_signal);
+        if (kill(pid, sig) != 0) {
+            return -1;
+        }
+        for (int attempt = 0; attempt < 2000; attempt++) {
+            siginfo_t pending = {0};
+            if (waitid(P_PID, pid, &pending, __WALL | WSTOPPED | WNOHANG | WNOWAIT) == 0 &&
+                pending.si_pid == pid && pending.si_status == sig) {
+                injected = 1;
+                fprintf(stderr, "delivery %d arrived after empty shutdown poll\n", sig);
+                if (getenv("ARTHUR_SHUTDOWN_WAIT_ERROR")) {
+                    errno = EIO;
+                    return -1;
+                }
+                return 0;
+            }
+            usleep(1000);
+        }
+        errno = ETIMEDOUT;
+        return -1;
+    }
     const char *attach_wait_error = getenv("ARTHUR_FAIL_ATTACH_WAIT");
     if (!injected && attach_wait_error && pid == fault_target_pid()) {
         for (int attempt = 0; attempt < 2000; attempt++) {
@@ -601,7 +629,11 @@ int sigwaitinfo(const sigset_t *set, siginfo_t *info)
         errno = EIO;
         return -1;
     }
-    return real_sigwaitinfo(set, info);
+    int rc = real_sigwaitinfo(set, info);
+    if (rc == SIGTERM || rc == SIGINT) {
+        monitor_terminating = 1;
+    }
+    return rc;
 }
 
 int fsync(int fd)

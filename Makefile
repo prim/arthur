@@ -68,10 +68,12 @@ test: $(TARGET)
 	@bash tests/run.sh snapshot-group-stop
 	@bash tests/run.sh monitor-errors
 	@bash tests/run.sh startup-rollback-relay
+	@bash tests/run.sh startup-rollback-wait
 	@bash tests/run.sh recovery-errors
 	@bash tests/run.sh child-cleanup
 	@bash tests/run.sh event-identity
 	@bash tests/run.sh detach-relay-error
+	@bash tests/run.sh detach-stop-race
 	@bash tests/run.sh final-wait-error
 	@bash tests/run.sh clone-wait-error
 	@bash tests/run.sh collect-event-error
