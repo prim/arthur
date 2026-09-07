@@ -286,6 +286,113 @@ fi
 grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
+if [[ $CASE == attach-wait-error || $CASE == all ]]; then
+CASE_RAN=1
+for attach_mode in 1 0; do
+    for attach_error in EIO ECHILD; do
+    for attach_state in running stopped; do
+        start_fixture leader-exit-multi
+        for _ in $(seq 1 200); do
+            [[ $(grep -c '^leader-worker-tid=' "$TEST_TMP/fixture.log") == 3 ]] && break
+            sleep 0.01
+        done
+        [[ $(grep -c '^leader-worker-tid=' "$TEST_TMP/fixture.log") == 3 ]]
+        ATTACH_WORKER=$(sed -n 's/^leader-worker-tid=//p' "$TEST_TMP/fixture.log" | sort -n | head -n 1)
+        if [[ $attach_state == stopped ]]; then
+            kill -STOP "$FIXTURE_PID"
+            for task in /proc/"$FIXTURE_PID"/task/*; do
+                for _ in $(seq 1 200); do
+                    [[ $(awk '{print $3}' "$task/stat") == T ]] && break
+                    sleep 0.01
+                done
+                [[ $(awk '{print $3}' "$task/stat") == T ]]
+            done
+        fi
+        ATTACH_PREFIX="$TEST_TMP/attach-wait-$attach_mode-$attach_error-$attach_state"
+        printf 'previous-output\n' >"$ATTACH_PREFIX.acore"
+        cp "$ATTACH_PREFIX.acore" "$ATTACH_PREFIX.expected"
+        set +e
+        timeout 15s env ARTHUR_TARGET_PID="$ATTACH_WORKER" ARTHUR_FAIL_ATTACH_WAIT="$attach_error" \
+            LD_PRELOAD="$TEST_TMP/fclose_fail.so" "$ARTHUR_BIN" -p "$FIXTURE_PID" "-$attach_mode" \
+            -o "$ATTACH_PREFIX.acore" >"$ATTACH_PREFIX.log" 2>&1
+        ATTACH_RC=$?
+        set -e
+        grep -q "attach wait failed for stopped task $ATTACH_WORKER" "$ATTACH_PREFIX.log"
+        if [[ $ATTACH_RC != 255 ]]; then
+            cat "$ATTACH_PREFIX.log" >&2
+            if [[ $ATTACH_RC == 0 ]]; then
+                "$ARTHUR_BIN" -c "$ATTACH_PREFIX.acore" -o "$ATTACH_PREFIX.core"
+                "$TEST_TMP/core_note_test" "$ATTACH_PREFIX.core" "$(id -u)" "$(id -g)" 0 0x600 1
+            fi
+            echo "attach wait $attach_error must fail capture, got $ATTACH_RC" >&2
+            exit 1
+        fi
+        ! grep -q 'D-state' "$ATTACH_PREFIX.log"
+        cmp "$ATTACH_PREFIX.expected" "$ATTACH_PREFIX.acore"
+        [[ -z $(find "$TEST_TMP" -name '*.tmp.*' -print -quit) ]]
+        for task in /proc/"$FIXTURE_PID"/task/*; do
+            [[ $(awk '/^TracerPid:/ {print $2}' "$task/status") == 0 ]]
+            if [[ $attach_state == stopped ]]; then
+                [[ $(awk '{print $3}' "$task/stat") == T ]]
+            else
+                [[ ! $(awk '{print $3}' "$task/stat") =~ ^[TtZ]$ ]]
+            fi
+        done
+        [[ $attach_state != stopped ]] || kill -CONT "$FIXTURE_PID"
+        kill -TERM "$FIXTURE_PID"
+        expect_status 143 wait "$FIXTURE_PID"
+    done
+    done
+done
+fi
+
+if [[ $CASE == attach-wait-signals || $CASE == all ]]; then
+CASE_RAN=1
+for attach_mode in 1 0; do
+    for attach_signal in cont term quit stop; do
+        attach_env=(ARTHUR_FAIL_ATTACH_WAIT=EIO)
+        case $attach_signal in
+            cont) start_fixture relay-cont ;;
+            term) start_fixture relay-term-spin; attach_env+=(ARTHUR_ATTACH_DELIVERY_SIGNAL=15) ;;
+            quit) start_fixture relay-quit-spin; attach_env+=(ARTHUR_ATTACH_DELIVERY_SIGNAL=3) ;;
+            stop) start_fixture memory-spin 8; attach_env+=(ARTHUR_ATTACH_DELIVERY_SIGNAL=19) ;;
+        esac
+        ATTACH_PREFIX="$TEST_TMP/attach-signal-$attach_mode-$attach_signal"
+        if ! expect_status 255 timeout 15s env "${attach_env[@]}" ARTHUR_TARGET_PID="$FIXTURE_PID" \
+            LD_PRELOAD="$TEST_TMP/fclose_fail.so" "$ARTHUR_BIN" -p "$FIXTURE_PID" "-$attach_mode" \
+            -o "$ATTACH_PREFIX.acore" >"$ATTACH_PREFIX.log" 2>&1; then
+            cat "$ATTACH_PREFIX.log" >&2
+            exit 1
+        fi
+        grep -q 'attach wait failed for stopped task' "$ATTACH_PREFIX.log"
+        [[ ! -e "$ATTACH_PREFIX.acore" ]]
+        [[ -z $(find "$TEST_TMP" -name '*.tmp.*' -print -quit) ]]
+        if [[ $attach_signal == cont ]]; then
+            sleep 0.1
+            [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+            [[ ! $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") =~ ^[TtZ]$ ]]
+            kill -CONT "$FIXTURE_PID"
+        elif [[ $attach_signal == stop ]]; then
+            for _ in $(seq 1 200); do
+                [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]] && break
+                sleep 0.01
+            done
+            [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]]
+            [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+            kill -CONT "$FIXTURE_PID"
+            kill -TERM "$FIXTURE_PID"
+        fi
+        if ! wait_for_process_exit "$FIXTURE_PID"; then
+            cat "$ATTACH_PREFIX.log" >&2
+            exit 1
+        fi
+        ATTACH_TARGET_RC=42
+        [[ $attach_signal != stop ]] || ATTACH_TARGET_RC=143
+        expect_status "$ATTACH_TARGET_RC" wait "$FIXTURE_PID"
+    done
+done
+fi
+
 if [[ $CASE == detach-vanished || $CASE == all ]]; then
 CASE_RAN=1
 start_fixture memory 8

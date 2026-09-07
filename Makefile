@@ -76,6 +76,8 @@ test: $(TARGET)
 	@bash tests/run.sh collect-event-error
 	@bash tests/run.sh detach
 	@bash tests/run.sh attach-relay
+	@bash tests/run.sh attach-wait-error
+	@bash tests/run.sh attach-wait-signals
 	@bash tests/run.sh interrupt-relay
 	@bash tests/run.sh recovery-delivery
 	@bash tests/run.sh recovery-fork

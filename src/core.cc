@@ -1763,18 +1763,26 @@ static inline int pt_attach(pid_t pid, int *relay_signal = NULL)
     // 后 SIGCONT 先于 SIGSTOP 处理并取消它，线程继续运行，不再冻结）。best-effort：
     // 正常路径（tracee 及时停靠）不触发，无副作用。
     int status = pt_wait(pid);
+    int wait_errno = status < 0 ? errno : 0;
+    if (status < 0 && wait_errno != ESRCH && wait_errno != ETIMEDOUT) {
+        // A wait error is not evidence of an uninterruptible task. Recover a
+        // real stop for cleanup, but keep the original capture failure.
+        status = pt_wait(pid);
+    }
     if (status < 0) {
-        if (kill(pid, SIGCONT) != 0) {
-            warn("pt_attach: SIGCONT %d after timeout failed (%s)", pid, strerror(errno));
+        int cleanup_errno = errno;
+        if (wait_errno != ESRCH && cleanup_errno != ESRCH) {
+            if (cleanup_errno == ETIMEDOUT && kill(pid, SIGCONT) != 0) {
+                warn("pt_attach: SIGCONT %d after timeout failed (%s)", pid, strerror(errno));
+            }
+            // A failed wait may still leave the task in a detachable stop.
+            ptrace(PTRACE_DETACH, pid, NULL, NULL);
         }
-        // 顺带 best-effort DETACH（tracee 若碰巧已停靠则清 PT_PTRACED；运行中/D 态
-        // 返回 ESRCH，无副作用）。
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
         // B185: 超时（D 态不可停）显式置 EAGAIN——调用方（collect_threads）据此与
         // ESRCH 同待遇跳过该线程而非 abort（崩溃采集/正常 dump 都不该为一个不可停
         // 的线程丢整个现场）。原实现靠 DETACH 失败残留的 ESRCH errno 碰巧跳过，
         // 脆弱（DETACH 碰巧成功则 errno=0 → 误 abort）。
-        errno = EAGAIN;
+        errno = wait_errno == ETIMEDOUT ? EAGAIN : wait_errno;
         return -1;
     }
 
@@ -1785,24 +1793,33 @@ static inline int pt_attach(pid_t pid, int *relay_signal = NULL)
     // SIGSTOP has non-kernel siginfo and must be re-injected on detach.
     int event = (status >> 16) & 0xffff;
     int stop_signal = WSTOPSIG(status);
-    if (relay_signal && event == 0) {
+    int pending_signal = 0;
+    if ((relay_signal || wait_errno != 0) && event == 0) {
         if (stop_signal != SIGSTOP) {
-            *relay_signal = stop_signal;
+            pending_signal = stop_signal;
         } else {
             siginfo_t stop_info = {};
             if (ptrace(PTRACE_GETSIGINFO, pid, 0, &stop_info) == 0) {
                 if (stop_info.si_code != SI_KERNEL) {
-                    *relay_signal = SIGSTOP;
+                    pending_signal = SIGSTOP;
                 }
             } else if (errno != EINVAL) {
                 int saved_errno = errno;
                 pt_detach(pid);
-                errno = saved_errno;
+                errno = wait_errno != 0 ? wait_errno : saved_errno;
                 return -1;
             }
         }
     }
 
+    if (wait_errno != 0) {
+        pt_detach(pid, pending_signal);
+        errno = wait_errno;
+        return -1;
+    }
+    if (relay_signal) {
+        *relay_signal = pending_signal;
+    }
     return rc;
 }
 

@@ -499,6 +499,23 @@ pid_t waitpid(pid_t pid, int *status, int options)
     if (!real_waitpid) {
         real_waitpid = (pid_t (*)(pid_t, int *, int))dlsym(RTLD_NEXT, "waitpid");
     }
+    const char *attach_wait_error = getenv("ARTHUR_FAIL_ATTACH_WAIT");
+    if (!injected && attach_wait_error && pid == fault_target_pid()) {
+        for (int attempt = 0; attempt < 2000; attempt++) {
+            siginfo_t pending = {0};
+            if (waitid(P_PID, pid, &pending, __WALL | WSTOPPED | WNOHANG | WNOWAIT) == 0 &&
+                pending.si_pid == pid && pending.si_code == CLD_TRAPPED) {
+                injected = 1;
+                fprintf(stderr, "attach wait failed for stopped task %d (%s)\n",
+                        (int)pid, attach_wait_error);
+                errno = strcmp(attach_wait_error, "ECHILD") == 0 ? ECHILD : EIO;
+                return -1;
+            }
+            usleep(1000);
+        }
+        errno = ETIMEDOUT;
+        return -1;
+    }
     if (!injected && getenv("ARTHUR_FAIL_WAITPID")) {
         injected = 1;
         errno = EIO;
