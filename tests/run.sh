@@ -286,6 +286,58 @@ fi
 grep -q "seekable input" "$TEST_TMP/stream.log"
 fi
 
+if [[ $CASE == pause-clock || $CASE == all ]]; then
+CASE_RAN=1
+for clock_mode in 0 3; do
+    for clock_fixture in memory memory-spin; do
+    for clock_step in -3600 3600; do
+        start_fixture "$clock_fixture" 8
+        CLOCK_DIR="$TEST_TMP/clock-$clock_mode-$clock_fixture-$clock_step"
+        mkdir "$CLOCK_DIR"
+        if [[ $clock_mode == 0 ]]; then
+            expect_status 0 timeout 15s env ARTHUR_WALL_CLOCK_STEP="$clock_step" \
+                LD_PRELOAD="$TEST_TMP/fclose_fail.so" "$ARTHUR_BIN" -p "$FIXTURE_PID" -0 \
+                -o "$CLOCK_DIR/capture.acore" >"$CLOCK_DIR/arthur.log" 2>&1
+            CLOCK_ACORE="$CLOCK_DIR/capture.acore"
+        else
+            env ARTHUR_WALL_CLOCK_STEP="$clock_step" LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
+                "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$CLOCK_DIR/monitor.acore" \
+                >"$CLOCK_DIR/arthur.log" 2>&1 &
+            CLOCK_MONITOR=$!
+            TARGET_PIDS+=("$CLOCK_MONITOR")
+            wait_for_log "$CLOCK_DIR/arthur.log" 'Launched in monitor mode'
+            kill -USR1 "$CLOCK_MONITOR"
+            wait_for_log "$CLOCK_DIR/arthur.log" 'writing out acore finished'
+            CLOCK_ACORE=$(find "$CLOCK_DIR" -maxdepth 1 -name 'acore.*' -print -quit)
+            [[ -n $CLOCK_ACORE ]]
+            kill -TERM "$CLOCK_MONITOR"
+            wait_for_process_exit "$CLOCK_MONITOR" 2>>"$CLOCK_DIR/arthur.log"
+            expect_status 0 wait "$CLOCK_MONITOR"
+            [[ ! -e "$CLOCK_DIR/monitor.acore" ]]
+        fi
+        grep -q "wall clock stepped $clock_step seconds" "$CLOCK_DIR/arthur.log"
+        if [[ $clock_fixture == memory-spin ]]; then
+            grep -q 'child_pid = ' "$CLOCK_DIR/arthur.log"
+            ! grep -q 'direct fallback' "$CLOCK_DIR/arthur.log"
+        else
+            grep -q 'direct fallback' "$CLOCK_DIR/arthur.log"
+        fi
+        if ! awk '/Process [0-9]+ paused / { seen++; if ($6 < 0 || $6 >= 10000) bad=1 }
+            END { exit !(seen == 1 && !bad) }' "$CLOCK_DIR/arthur.log"; then
+            cat "$CLOCK_DIR/arthur.log" >&2
+            echo 'pause duration followed a wall-clock step' >&2
+            exit 1
+        fi
+        expect_status 0 "$ARTHUR_BIN" -c "$CLOCK_ACORE" -o "$CLOCK_DIR/capture.core"
+        [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+        [[ ! $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") =~ ^[TtZ]$ ]]
+        kill -TERM "$FIXTURE_PID"
+        expect_status 143 wait "$FIXTURE_PID"
+    done
+    done
+done
+fi
+
 if [[ $CASE == attach-wait-error || $CASE == all ]]; then
 CASE_RAN=1
 for attach_mode in 1 0; do

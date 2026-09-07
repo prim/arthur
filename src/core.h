@@ -6,6 +6,7 @@
 
 #include <sys/ptrace.h>
 #include <sys/time.h>
+#include <chrono>
 #include <vector>
 #include <map>
 #include <set>
@@ -391,9 +392,9 @@ private:
     off_t _offset_load;
 };
 
-// time stamp for debug
+// Elapsed pause time must not follow wall-clock adjustments.
 struct TS {
-    struct timeval _begin, _end;
+    std::chrono::steady_clock::time_point _begin, _end;
  
 #if 0
     /* only work on x86-64, test purpose.
@@ -405,34 +406,19 @@ struct TS {
     }
 #endif
     
-    static struct timeval _utime_diff(struct timeval &a, struct timeval &b)
-    {
-        struct timeval ret;
-        if (b.tv_usec >= a.tv_usec) {
-            ret.tv_usec = b.tv_usec - a.tv_usec;
-            ret.tv_sec = b.tv_sec - a.tv_sec;
-        } else {
-            ret.tv_usec = 1000000 + b.tv_usec - a.tv_usec;
-            ret.tv_sec = b.tv_sec - a.tv_sec - 1;
-        }
-        return ret;
-    }
-
     void begin()
     {
-        gettimeofday(&_begin, 0);
+        _begin = std::chrono::steady_clock::now();
     }   
 
     void end()
     {
-        gettimeofday(&_end, 0);
+        _end = std::chrono::steady_clock::now();
     }
 
     double timediff()
     {
-        struct timeval result = _utime_diff(_begin, _end); 
-        double gap = result.tv_sec + result.tv_usec / 1000000.0;
-        return gap;
+        return std::chrono::duration<double>(_end - _begin).count();
     }
 };
 

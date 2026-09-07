@@ -61,6 +61,7 @@ test: $(TARGET)
 	@bash tests/run.sh cli
 	@bash tests/run.sh build-version
 	@bash tests/run.sh stream
+	@bash tests/run.sh pause-clock
 	@bash tests/run.sh monitor-stop
 	@bash tests/run.sh inherited-sigchld
 	@bash tests/run.sh monitor-cont

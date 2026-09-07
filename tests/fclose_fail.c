@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/user.h>
@@ -32,6 +33,29 @@ static int child_detached_with_kill;
 static int saw_interrupt;
 static DIR *injected_task_dir;
 static int injected_task_seen;
+
+int gettimeofday(struct timeval *value, void *zone)
+{
+    static int (*real_gettimeofday)(struct timeval *, void *);
+    static int stepped;
+    if (!real_gettimeofday) {
+        real_gettimeofday = (int (*)(struct timeval *, void *))
+            dlsym(RTLD_NEXT, "gettimeofday");
+    }
+    int rc = real_gettimeofday(value, zone);
+    const char *step = getenv("ARTHUR_WALL_CLOCK_STEP");
+    if (rc == 0 && step) {
+        // PROCESS metadata uses a timezone argument, between TS begin/end.
+        if (zone != NULL && !stepped) {
+            stepped = 1;
+            fprintf(stderr, "wall clock stepped %s seconds\n", step);
+        }
+        if (stepped) {
+            value->tv_sec += strtol(step, NULL, 10);
+        }
+    }
+    return rc;
+}
 
 time_t time(time_t *result)
 {
