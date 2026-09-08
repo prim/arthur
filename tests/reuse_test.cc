@@ -115,6 +115,18 @@ static uint32_t fragment_crc(uint32_t crc, const void *data, size_t size)
     return crc;
 }
 
+static void toggle_stored_crc(const char *path, long offset)
+{
+    FILE *file = fopen(path, "r+b");
+    assert(file != NULL && fseek(file, offset, SEEK_SET) == 0);
+    uint32_t crc = 0;
+    assert(fread(&crc, 1, sizeof(crc), file) == sizeof(crc));
+    crc ^= 1U;
+    assert(fseek(file, offset, SEEK_SET) == 0);
+    assert(fwrite(&crc, 1, sizeof(crc), file) == sizeof(crc));
+    assert(fclose(file) == 0);
+}
+
 static void write_encoded_block(FILE *out, BlockHeader header, const char *data,
                                  size_t size, const char *compressed, int encoded,
                                  bool checksums)
@@ -257,9 +269,14 @@ static bool check_file_fragments(const char *prefix)
 
 static bool check_linked_file_fragments(const char *prefix)
 {
-    const size_t fragments[] = {64, 4096, 16384};
+    const std::vector<size_t> patterns[] = {
+        {64}, {4096}, {16384},
+        {BLOCK_SIZE, 7, 7, 7, 4096, 64, 16384, 1024, 8192}
+    };
     Lz4Stream reader(Lz4Stream::LZ4_Decompress);
-    for (size_t fragment : fragments) {
+    for (const std::vector<size_t>& pattern : patterns) {
+        bool mixed = pattern.size() != 1;
+        std::string pattern_name = mixed ? "mixed" : std::to_string(pattern.front());
         ProcFile file_header = {};
         file_header.f_pid = 1234;
         file_header.f_type = PROC_TYPE_ENVIRON;
@@ -269,14 +286,23 @@ static bool check_linked_file_fragments(const char *prefix)
         for (char& byte : file) {
             byte = (char)random();
         }
+        if (mixed) {
+            // Long-distance references remain valid across tiny blocks and wrap.
+            for (size_t i = 32749; i < file.size(); i++) {
+                file[i] = file[i % 32749];
+            }
+        }
         memcpy(file.data(), &file_header, sizeof(file_header));
-        for (size_t offset = 2 * fragment; offset < file.size(); offset += 3 * fragment) {
-            memcpy(file.data() + offset, file.data() + offset - 2 * fragment,
-                   MIN(fragment, file.size() - offset));
+        if (!mixed) {
+            size_t fragment = pattern.front();
+            for (size_t offset = 2 * fragment; offset < file.size(); offset += 3 * fragment) {
+                memcpy(file.data() + offset, file.data() + offset - 2 * fragment,
+                       MIN(fragment, file.size() - offset));
+            }
         }
         for (unsigned checksums = 0; checksums < 2; checksums++) {
             std::string path = std::string(prefix) + ".linked-" +
-                std::to_string(fragment) + "-" + std::to_string(checksums);
+                pattern_name + "-" + std::to_string(checksums);
             FILE *out = fopen(path.c_str(), "wb");
             assert(out != NULL);
             uint32_t size = (uint32_t)file.size();
@@ -284,14 +310,17 @@ static bool check_linked_file_fragments(const char *prefix)
             LZ4_stream_t *encoder = LZ4_createStream();
             LZ4_streamDecode_t *reference = LZ4_createStreamDecode();
             assert(encoder && reference && LZ4_setStreamDecode(reference, NULL, 0) == 1);
-            std::vector<char> compressed(LZ4_compressBound((int)fragment));
+            std::vector<char> compressed(LZ4_compressBound(BLOCK_SIZE));
             std::vector<char> decoded(file.size());
-            for (size_t offset = 0; offset < file.size(); offset += fragment) {
+            long corrupt_crc_offset = -1;
+            size_t index = 0;
+            for (size_t offset = 0; offset < file.size(); index++) {
+                size_t fragment = pattern[index % pattern.size()];
                 size_t length = MIN(fragment, file.size() - offset);
                 int encoded = LZ4_compress_fast_continue(encoder, file.data() + offset,
                     compressed.data(), (int)length, (int)compressed.size(), 1);
                 assert(encoded > 0);
-                if (offset == 2 * fragment) {
+                if ((!mixed && index == 2) || (mixed && index == 4)) {
                     assert(encoded < (int)length / 2);
                 }
                 assert(LZ4_decompress_safe_continue(reference, compressed.data(),
@@ -299,8 +328,14 @@ static bool check_linked_file_fragments(const char *prefix)
                 BlockHeader header;
                 header.block_type = BLOCK_TYPE_FILE;
                 header.prev_cont = offset != 0;
+                if (mixed && checksums && corrupt_crc_offset < 0 && offset >= 3 * BLOCK_SIZE) {
+                    long block_offset = ftell(out);
+                    assert(block_offset >= 0);
+                    corrupt_crc_offset = block_offset + sizeof(header) + encoded;
+                }
                 write_encoded_block(out, header, file.data() + offset, length,
                                      compressed.data(), encoded, checksums != 0);
+                offset += length;
             }
             assert(decoded == file);
             LZ4_freeStream(encoder);
@@ -319,8 +354,8 @@ static bool check_linked_file_fragments(const char *prefix)
             assert(reader.EnableBlockChecksums(checksums != 0) == 0);
             ProcFile *actual = reader.GetFile();
             if (!actual) {
-                fprintf(stderr, "linked FILE rejected after reference decode passed: size=%zu checksums=%u\n",
-                        fragment, checksums);
+                fprintf(stderr, "linked FILE rejected after reference decode passed: pattern=%s checksums=%u\n",
+                        pattern_name.c_str(), checksums);
                 return false;
             }
             assert(actual->Size() == file.size());
@@ -331,6 +366,23 @@ static bool check_linked_file_fragments(const char *prefix)
             assert(reader.Close() == 0);
             if (input_fd >= 0) {
                 assert(fcntl(input_fd, F_GETFD) == -1 && errno == EBADF);
+            }
+            if (mixed && checksums) {
+                assert(corrupt_crc_offset >= 0);
+                toggle_stored_crc(path.c_str(), corrupt_crc_offset);
+                assert(reader.Open(path.c_str()) == 0 && reader.EnableBlockChecksums() == 0);
+                assert(reader.GetFile() == NULL && !reader.LastReadClean() && !reader.TailSeen());
+                long failed_position = reader.Tell();
+                assert(reader.ReadBlock(tail) == NULL && reader.Tell() == failed_position);
+                assert(reader.Close() == 0);
+                toggle_stored_crc(path.c_str(), corrupt_crc_offset);
+                assert(reader.Open(path.c_str()) == 0 && reader.EnableBlockChecksums() == 0);
+                actual = reader.GetFile();
+                assert(actual && actual->Size() == file.size());
+                assert(memcmp(actual, file.data(), file.size()) == 0);
+                free(actual);
+                assert(reader.ReadBlock(tail) == NULL && reader.TailSeen());
+                assert(reader.VerifyPhysicalEof() == 0 && reader.Close() == 0);
             }
         }
     }
