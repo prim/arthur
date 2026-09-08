@@ -26,7 +26,8 @@ const char* szBlockType(BlockType t)
 }
 
 Lz4Stream::Lz4Stream(lz4_mode mode) :
-    _block_index(0), _file(NULL), _enc(NULL), _dec(NULL)
+    _block_index(0), _file(NULL), _enc(NULL), _dec(NULL),
+    _decode_ring(NULL), _decode_ring_size(0), _decode_offset(0)
 {
     _mode = mode;
     _size_real = 0;
@@ -58,6 +59,10 @@ void Lz4Stream::ReleaseCodec()
         LZ4_freeStreamDecode(_dec);
         _dec = NULL;
     }
+    free(_decode_ring);
+    _decode_ring = NULL;
+    _decode_ring_size = 0;
+    _decode_offset = 0;
 }
 
 void Lz4Stream::ResetState()
@@ -69,6 +74,7 @@ void Lz4Stream::ResetState()
     _eof_clean = true;
     _tail_seen = false;
     _block_checksums = false;
+    _decode_offset = 0;
     for (size_t i = 0; i < MAX_RING_BUF; i++) {
         _blocks[i].Clear();
     }
@@ -94,6 +100,17 @@ int Lz4Stream::InitCodec()
             error("Fail to create decode stream");
             return -1;
         }
+        int ring_size = LZ4_decoderRingBufferSize(BLOCK_SIZE);
+        if (ring_size <= 0) {
+            error("invalid LZ4 decoder ring size");
+            return -1;
+        }
+        _decode_ring = static_cast<char *>(malloc((size_t)ring_size));
+        if (!_decode_ring) {
+            error("Fail to allocate decode history");
+            return -1;
+        }
+        _decode_ring_size = (size_t)ring_size;
 
         // 1 for okay and 0 for error
         if(!(LZ4_setStreamDecode(_dec, NULL, 0))) {
@@ -722,12 +739,20 @@ Block* Lz4Stream::ReadBlock(BlockHeader& hdr)
     // R50-15 (T3): `rc < 0` 只拒负值——构造的块可解出 0 字节（rc==0），空块被当
     // 成功返回（写侧 Compress 对空块提前返回、从不写 0 字节块，故 rc==0 恒异常）。
     // ReadLoads 会静默写 0 字节继续（最终靠 loads/expected 校验兜底）；统一拒。
-    rc = LZ4_decompress_safe_continue(_dec, buf, block.wBuf(), hdr.size, BLOCK_SIZE);
+    // Keep decoded blocks adjacent as required by LZ4's unsynchronized ring
+    // contract. Alternating short Block buffers discards older dictionary data.
+    if (_decode_ring_size - _decode_offset < BLOCK_SIZE) {
+        _decode_offset = 0;
+    }
+    char *decoded = _decode_ring + _decode_offset;
+    rc = LZ4_decompress_safe_continue(_dec, buf, decoded, hdr.size, BLOCK_SIZE);
     if (rc <= 0) {
         _eof_clean = false;
         error("decode failed rc = %d\n", rc);
         return NULL;
     }
+    _decode_offset += (size_t)rc;
+    memcpy(block.wBuf(), decoded, (size_t)rc);
     block._length = rc;
     if (_block_checksums) {
         uint32_t actual_checksum = block_checksum(hdr, block.rBuf(), block.Length());

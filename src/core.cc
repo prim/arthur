@@ -6151,6 +6151,40 @@ int Coredump::monitor(const char* corefile)
 
     auto detach_monitored_threads = [&]() -> int {
         int detach_rc = 0;
+        auto wait_stopped_for_detach = [&](pid_t tid) -> int {
+            int status = pt_wait(tid);
+            if (status >= 0) {
+                return status;
+            }
+            int wait_errno = errno;
+            detach_rc = -1;
+            if (wait_errno == ESRCH || wait_errno == ETIMEDOUT) {
+                return -1;
+            }
+            // A new clone may not have stopped when waitpid first fails.
+            // Preserve its eventual delivery/event stop until DETACH handles it.
+            warn("waitpid stop query for %d failed (%s); using waitid recovery",
+                 tid, strerror(wait_errno));
+            const long long start = monotonic_ms();
+            while (monotonic_ms() - start < 10000) {
+                siginfo_t pending = {};
+                int rc = waitid(P_PID, tid, &pending,
+                                __WALL | WSTOPPED | WEXITED | WNOHANG | WNOWAIT);
+                if (rc < 0 && errno != EINTR) {
+                    return -1;
+                }
+                if (rc == 0 && pending.si_pid == tid) {
+                    if (pending.si_code == CLD_TRAPPED || pending.si_code == CLD_STOPPED) {
+                        return (pending.si_status << 8) | 0x7f;
+                    }
+                    errno = ESRCH;
+                    return -1;
+                }
+                usleep(1000);
+            }
+            errno = ETIMEDOUT;
+            return -1;
+        };
         auto read_stopped_status = [&](pid_t tid, int& status, bool& synthetic) -> void {
             // GETREGS proves a stop, not that its wait status was consumed.
             // Delivery can race with the earlier empty/failed waitpid poll.
@@ -6197,7 +6231,7 @@ int Coredump::monitor(const char* corefile)
                     }
                     continue;
                 } else {
-                    status = pt_wait(tid);
+                    status = wait_stopped_for_detach(tid);
                     if (status < 0) {
                         warn("monitored thread %d did not stop for detach", tid);
                         detach_rc = -1;
@@ -6223,7 +6257,7 @@ int Coredump::monitor(const char* corefile)
                         }
                         continue;
                     }
-                    status = pt_wait(tid);
+                    status = wait_stopped_for_detach(tid);
                     if (status < 0) {
                         warn("monitored thread %d did not stop after wait error", tid);
                         detach_rc = -1;

@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <string>
+#include <random>
 #include <vector>
 
 #include "core.h"
@@ -59,6 +60,20 @@ static uint32_t fragment_crc(uint32_t crc, const void *data, size_t size)
     return crc;
 }
 
+static void write_encoded_block(FILE *out, BlockHeader header, const char *data,
+                                 size_t size, const char *compressed, int encoded,
+                                 bool checksums)
+{
+    header.size = (uint32_t)encoded;
+    assert(fwrite(&header, 1, sizeof(header), out) == sizeof(header));
+    assert(fwrite(compressed, 1, encoded, out) == (size_t)encoded);
+    if (checksums) {
+        uint32_t crc = fragment_crc(0xffffffffU, &header, sizeof(header));
+        crc = fragment_crc(crc, data, size) ^ 0xffffffffU;
+        assert(fwrite(&crc, 1, sizeof(crc), out) == sizeof(crc));
+    }
+}
+
 static void write_fragment_block(FILE *out, BlockHeader header,
                                   const char *data, size_t size, bool checksums)
 {
@@ -68,14 +83,7 @@ static void write_fragment_block(FILE *out, BlockHeader header,
     int encoded = LZ4_compress_default(data, compressed.data(), (int)size,
                                       (int)compressed.size());
     assert(encoded > 0);
-    header.size = (uint32_t)encoded;
-    assert(fwrite(&header, 1, sizeof(header), out) == sizeof(header));
-    assert(fwrite(compressed.data(), 1, encoded, out) == (size_t)encoded);
-    if (checksums) {
-        uint32_t crc = fragment_crc(0xffffffffU, &header, sizeof(header));
-        crc = fragment_crc(crc, data, size) ^ 0xffffffffU;
-        assert(fwrite(&crc, 1, sizeof(crc), out) == sizeof(crc));
-    }
+    write_encoded_block(out, header, data, size, compressed.data(), encoded, checksums);
 }
 
 static void write_fragmented_file(FILE *out, const char *data, uint32_t size,
@@ -192,12 +200,97 @@ static bool check_file_fragments(const char *prefix)
     return true;
 }
 
+static bool check_linked_file_fragments(const char *prefix)
+{
+    const size_t fragments[] = {64, 4096, 16384};
+    Lz4Stream reader(Lz4Stream::LZ4_Decompress);
+    for (size_t fragment : fragments) {
+        ProcFile file_header = {};
+        file_header.f_pid = 1234;
+        file_header.f_type = PROC_TYPE_ENVIRON;
+        file_header.f_size = 10 * BLOCK_SIZE;
+        std::vector<char> file(file_header.Size());
+        std::mt19937 random(12345);
+        for (char& byte : file) {
+            byte = (char)random();
+        }
+        memcpy(file.data(), &file_header, sizeof(file_header));
+        for (size_t offset = 2 * fragment; offset < file.size(); offset += 3 * fragment) {
+            memcpy(file.data() + offset, file.data() + offset - 2 * fragment,
+                   MIN(fragment, file.size() - offset));
+        }
+        for (unsigned checksums = 0; checksums < 2; checksums++) {
+            std::string path = std::string(prefix) + ".linked-" +
+                std::to_string(fragment) + "-" + std::to_string(checksums);
+            FILE *out = fopen(path.c_str(), "wb");
+            assert(out != NULL);
+            uint32_t size = (uint32_t)file.size();
+            assert(fwrite(&size, 1, sizeof(size), out) == sizeof(size));
+            LZ4_stream_t *encoder = LZ4_createStream();
+            LZ4_streamDecode_t *reference = LZ4_createStreamDecode();
+            assert(encoder && reference && LZ4_setStreamDecode(reference, NULL, 0) == 1);
+            std::vector<char> compressed(LZ4_compressBound((int)fragment));
+            std::vector<char> decoded(file.size());
+            for (size_t offset = 0; offset < file.size(); offset += fragment) {
+                size_t length = MIN(fragment, file.size() - offset);
+                int encoded = LZ4_compress_fast_continue(encoder, file.data() + offset,
+                    compressed.data(), (int)length, (int)compressed.size(), 1);
+                assert(encoded > 0);
+                if (offset == 2 * fragment) {
+                    assert(encoded < (int)length / 2);
+                }
+                assert(LZ4_decompress_safe_continue(reference, compressed.data(),
+                    decoded.data() + offset, encoded, (int)length) == (int)length);
+                BlockHeader header;
+                header.block_type = BLOCK_TYPE_FILE;
+                header.prev_cont = offset != 0;
+                write_encoded_block(out, header, file.data() + offset, length,
+                                     compressed.data(), encoded, checksums != 0);
+            }
+            assert(decoded == file);
+            LZ4_freeStream(encoder);
+            LZ4_freeStreamDecode(reference);
+            BlockHeader tail = BlockHeader::TailMark();
+            assert(fwrite(&tail, 1, sizeof(tail), out) == sizeof(tail));
+            assert(fclose(out) == 0);
+
+            int input_fd = -1;
+            if (checksums == 0) {
+                input_fd = open(path.c_str(), O_RDONLY);
+                assert(input_fd >= 0 && reader.OpenFd(input_fd) == 0);
+            } else {
+                assert(reader.Open(path.c_str()) == 0);
+            }
+            assert(reader.EnableBlockChecksums(checksums != 0) == 0);
+            ProcFile *actual = reader.GetFile();
+            if (!actual) {
+                fprintf(stderr, "linked FILE rejected after reference decode passed: size=%zu checksums=%u\n",
+                        fragment, checksums);
+                return false;
+            }
+            assert(actual->Size() == file.size());
+            assert(memcmp(actual, file.data(), file.size()) == 0);
+            free(actual);
+            assert(reader.ReadBlock(tail) == NULL && reader.TailSeen() && reader.LastReadClean());
+            assert(reader.VerifyPhysicalEof() == 0 && reader.Close() == 0);
+            assert(reader.Close() == 0);
+            if (input_fd >= 0) {
+                assert(fcntl(input_fd, F_GETFD) == -1 && errno == EBADF);
+            }
+        }
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4) {
         return 2;
     }
     if (!check_file_fragments(argv[2])) {
+        return 1;
+    }
+    if (!check_linked_file_fragments(argv[2])) {
         return 1;
     }
 

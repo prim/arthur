@@ -1372,7 +1372,7 @@ fi
 
 if [[ $CASE == detach-stop-race || $CASE == all ]]; then
 CASE_RAN=1
-for shutdown_poll in empty error; do
+for shutdown_poll in empty error fallback; do
     for shutdown_signal in 15 3 19; do
         case $shutdown_signal in
             15) start_fixture relay-term-spin ;;
@@ -1384,6 +1384,9 @@ for shutdown_poll in empty error; do
         cp "$SHUTDOWN_PREFIX.acore" "$SHUTDOWN_PREFIX.expected"
         shutdown_env=(ARTHUR_TARGET_PID="$FIXTURE_PID" ARTHUR_SHUTDOWN_DELIVERY="$shutdown_signal")
         [[ $shutdown_poll != error ]] || shutdown_env+=(ARTHUR_SHUTDOWN_WAIT_ERROR=1)
+        if [[ $shutdown_poll == fallback ]]; then
+            shutdown_env+=(ARTHUR_SHUTDOWN_WAIT_ERROR=always ARTHUR_FAIL_GETREGS=1)
+        fi
         env "${shutdown_env[@]}" LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
             "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$SHUTDOWN_PREFIX.acore" \
             >"$SHUTDOWN_PREFIX.log" 2>&1 &
@@ -1393,9 +1396,12 @@ for shutdown_poll in empty error; do
         kill -TERM "$SHUTDOWN_MONITOR"
         wait_for_process_exit "$SHUTDOWN_MONITOR" 2>>"$SHUTDOWN_PREFIX.log"
         SHUTDOWN_EXPECTED=0
-        [[ $shutdown_poll != error ]] || SHUTDOWN_EXPECTED=255
+        [[ $shutdown_poll == empty ]] || SHUTDOWN_EXPECTED=255
         expect_status "$SHUTDOWN_EXPECTED" wait "$SHUTDOWN_MONITOR"
         grep -q "delivery $shutdown_signal arrived after empty shutdown poll" "$SHUTDOWN_PREFIX.log"
+        if [[ $shutdown_poll == fallback ]]; then
+            grep -q 'using waitid recovery' "$SHUTDOWN_PREFIX.log"
+        fi
         if [[ $shutdown_signal == 19 ]]; then
             for _ in $(seq 1 200); do
                 [[ $(awk '{print $3}' "/proc/$FIXTURE_PID/stat") == T ]] && break
@@ -1496,10 +1502,15 @@ fi
 
 # A clone PID becomes owned as soon as GETEVENTMSG succeeds. If its initial
 # wait fails, cleanup must still detach that PID rather than only the creator.
-if [[ $CASE == clone-wait-error || $CASE == all ]]; then
+if [[ $CASE == clone-wait-error || $CASE == clone-wait-delayed || $CASE == all ]]; then
 CASE_RAN=1
+for clone_wait_mode in normal delayed; do
+[[ $CASE == clone-wait-error && $clone_wait_mode == delayed ]] && continue
+[[ $CASE == clone-wait-delayed && $clone_wait_mode == normal ]] && continue
 start_fixture clone-process-crash
-timeout 10s env ARTHUR_FAIL_CLONE_CHILD_WAIT=1 \
+clone_wait_env=(ARTHUR_FAIL_CLONE_CHILD_WAIT=1)
+[[ $clone_wait_mode != delayed ]] || clone_wait_env+=(ARTHUR_FAIL_CLONE_CHILD_REGS_ONCE=1)
+timeout 10s env "${clone_wait_env[@]}" \
     LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
     "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 \
     -o "$TEST_TMP/clone-wait-error.acore" \
@@ -1523,8 +1534,14 @@ if ! grep -q "detaching tracked clone child" "$TEST_TMP/clone-wait-error.log"; t
     echo "clone wait failure cleanup did not explicitly detach its child" >&2
     exit 1
 fi
+if [[ $clone_wait_mode == delayed ]]; then
+    grep -q 'clone registers temporarily unavailable' "$TEST_TMP/clone-wait-error.log"
+    grep -q 'using waitid recovery' "$TEST_TMP/clone-wait-error.log"
+fi
+grep -q 'detached tracked clone child.*successfully' "$TEST_TMP/clone-wait-error.log"
 kill -TERM "$FIXTURE_PID"
 expect_status 143 wait "$FIXTURE_PID"
+done
 fi
 
 # The late-thread fixture creates a worker only after another TID enters a

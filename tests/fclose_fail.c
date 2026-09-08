@@ -124,6 +124,7 @@ long ptrace(enum __ptrace_request request, ...)
 {
     static long (*real_ptrace)(enum __ptrace_request, ...);
     static int failed_getregs;
+    static int failed_clone_getregs;
     static int failed_fpregs;
     static int failed_siginfo;
     static int failed_detach;
@@ -233,6 +234,13 @@ long ptrace(enum __ptrace_request request, ...)
 
     int getregs = request == PTRACE_GETREGS ||
         (request == PTRACE_GETREGSET && (uintptr_t)addr == NT_PRSTATUS);
+    if (getregs && pid == last_event_child && !failed_clone_getregs &&
+        getenv("ARTHUR_FAIL_CLONE_CHILD_REGS_ONCE")) {
+        failed_clone_getregs = 1;
+        fprintf(stderr, "clone registers temporarily unavailable for %d\n", (int)pid);
+        errno = ESRCH;
+        return -1;
+    }
     int setregs = request == PTRACE_SETREGS ||
         (request == PTRACE_SETREGSET && (uintptr_t)addr == NT_PRSTATUS);
     int getfpregs = request == PTRACE_GETFPREGS ||
@@ -418,6 +426,10 @@ long ptrace(enum __ptrace_request request, ...)
         fprintf(stderr, "target disappeared before DETACH\n");
     }
     long rc = real_ptrace(request, pid, addr, data);
+    if (rc == 0 && request == PTRACE_DETACH && pid == last_event_child &&
+        getenv("ARTHUR_FAIL_CLONE_CHILD_WAIT")) {
+        fprintf(stderr, "detached tracked clone child %d successfully\n", (int)pid);
+    }
     if (rc == 0 && request == PTRACE_GETEVENTMSG && data != NULL) {
         last_event_child = (pid_t)*(unsigned long *)data;
     }
@@ -525,6 +537,12 @@ pid_t waitpid(pid_t pid, int *status, int options)
         real_waitpid = (pid_t (*)(pid_t, int *, int))dlsym(RTLD_NEXT, "waitpid");
     }
     const char *shutdown_signal = getenv("ARTHUR_SHUTDOWN_DELIVERY");
+    const char *shutdown_error = getenv("ARTHUR_SHUTDOWN_WAIT_ERROR");
+    if (injected && monitor_terminating && shutdown_signal &&
+        pid == fault_target_pid() && shutdown_error && strcmp(shutdown_error, "always") == 0) {
+        errno = EIO;
+        return -1;
+    }
     if (!injected && monitor_terminating && shutdown_signal && pid == fault_target_pid()) {
         pid_t rc = real_waitpid(pid, status, options);
         if (rc != 0) {

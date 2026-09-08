@@ -350,6 +350,9 @@ private:
     lz4_mode _mode;
     LZ4_stream_t *_enc;             // lz4 compresser.
     LZ4_streamDecode_t *_dec;       // lz4 decompresser.
+    char *_decode_ring;
+    size_t _decode_ring_size;
+    size_t _decode_offset;
 
     // counter
     size_t _size_real;          // real bytes, decompressed data size.
