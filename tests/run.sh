@@ -1502,14 +1502,16 @@ fi
 
 # A clone PID becomes owned as soon as GETEVENTMSG succeeds. If its initial
 # wait fails, cleanup must still detach that PID rather than only the creator.
-if [[ $CASE == clone-wait-error || $CASE == clone-wait-delayed || $CASE == all ]]; then
+if [[ $CASE == clone-wait-error || $CASE == clone-wait-delayed || $CASE == clone-wait-retry || $CASE == all ]]; then
 CASE_RAN=1
-for clone_wait_mode in normal delayed; do
-[[ $CASE == clone-wait-error && $clone_wait_mode == delayed ]] && continue
-[[ $CASE == clone-wait-delayed && $clone_wait_mode == normal ]] && continue
+for clone_wait_mode in normal delayed retry; do
+[[ $CASE == clone-wait-error && $clone_wait_mode != normal ]] && continue
+[[ $CASE == clone-wait-delayed && $clone_wait_mode != delayed ]] && continue
+[[ $CASE == clone-wait-retry && $clone_wait_mode != retry ]] && continue
 start_fixture clone-process-crash
 clone_wait_env=(ARTHUR_FAIL_CLONE_CHILD_WAIT=1)
-[[ $clone_wait_mode != delayed ]] || clone_wait_env+=(ARTHUR_FAIL_CLONE_CHILD_REGS_ONCE=1)
+[[ $clone_wait_mode == normal ]] || clone_wait_env+=(ARTHUR_FAIL_CLONE_CHILD_REGS_ONCE=1)
+[[ $clone_wait_mode != retry ]] || clone_wait_env+=(ARTHUR_RETRY_WAITID=1)
 timeout 10s env "${clone_wait_env[@]}" \
     LD_PRELOAD="$TEST_TMP/fclose_fail.so" \
     "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 \
@@ -1534,9 +1536,13 @@ if ! grep -q "detaching tracked clone child" "$TEST_TMP/clone-wait-error.log"; t
     echo "clone wait failure cleanup did not explicitly detach its child" >&2
     exit 1
 fi
-if [[ $clone_wait_mode == delayed ]]; then
+if [[ $clone_wait_mode != normal ]]; then
     grep -q 'clone registers temporarily unavailable' "$TEST_TMP/clone-wait-error.log"
     grep -q 'using waitid recovery' "$TEST_TMP/clone-wait-error.log"
+fi
+if [[ $clone_wait_mode == retry ]]; then
+    grep -q 'injected waitid EINTR' "$TEST_TMP/clone-wait-error.log"
+    grep -q 'injected empty waitid poll' "$TEST_TMP/clone-wait-error.log"
 fi
 grep -q 'detached tracked clone child.*successfully' "$TEST_TMP/clone-wait-error.log"
 kill -TERM "$FIXTURE_PID"
@@ -3110,7 +3116,7 @@ ${CXX:-g++} -std=c++11 -Wall -Wextra -Wno-missing-field-initializers \
     "$ARTHUR_DIR/tests/reuse_test.cc" \
     "$ARTHUR_DIR/build/core.o" "$ARTHUR_DIR/build/proc.o" \
     "$ARTHUR_DIR/build/lz4.o" -L"$ARTHUR_DIR/lib" "$LZ4_TEST_LIBRARY" \
-    -ldl -no-pie -o "$TEST_TMP/reuse_test"
+    -ldl -no-pie -Wl,--wrap=malloc -o "$TEST_TMP/reuse_test"
 start_fixture memory 8
 expect_status 0 "$ARTHUR_BIN" -p "$FIXTURE_PID" -1 \
     -o "$TEST_TMP/reuse.acore"

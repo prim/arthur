@@ -13,6 +13,22 @@
 
 using namespace arthur;
 
+static bool fail_decode_allocation;
+static unsigned decode_allocation_failures;
+
+extern "C" void *__real_malloc(size_t size);
+
+extern "C" void *__wrap_malloc(size_t size)
+{
+    if (fail_decode_allocation && size == LZ4_DECODER_RING_BUFFER_SIZE(BLOCK_SIZE)) {
+        fail_decode_allocation = false;
+        decode_allocation_failures++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_malloc(size);
+}
+
 static void write_stream(Lz4Stream& out, const char *path, bool with_tail)
 {
     static const char payload[] = "stream state reuse";
@@ -25,6 +41,45 @@ static void write_stream(Lz4Stream& out, const char *path, bool with_tail)
                (int)sizeof(tail));
     }
     assert(out.Close() == 0);
+}
+
+static void check_decode_allocation_failure(const char *prefix)
+{
+    std::string path = std::string(prefix) + ".allocation-failure.z4";
+    Lz4Stream writer(Lz4Stream::LZ4_Compress);
+    write_stream(writer, path.c_str(), true);
+    Lz4Stream reader(Lz4Stream::LZ4_Decompress);
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        // Open() must close its own descriptor when codec allocation fails.
+        int probe_fd = open(path.c_str(), O_RDONLY);
+        assert(probe_fd >= 0 && close(probe_fd) == 0);
+        unsigned failures = decode_allocation_failures;
+        fail_decode_allocation = true;
+        assert(reader.Open(path.c_str()) == -1);
+        assert(!fail_decode_allocation && decode_allocation_failures == failures + 1);
+        assert(fcntl(probe_fd, F_GETFD) == -1 && errno == EBADF);
+        assert(reader.Close() == 0);
+
+        // OpenFd() must leave ownership and position unchanged on failure.
+        int fd = open(path.c_str(), O_RDONLY);
+        assert(fd >= 0);
+        failures = decode_allocation_failures;
+        fail_decode_allocation = true;
+        assert(reader.OpenFd(fd) == -1);
+        assert(!fail_decode_allocation && decode_allocation_failures == failures + 1);
+        assert(fcntl(fd, F_GETFD) != -1 && lseek(fd, 0, SEEK_CUR) == 0);
+        assert(reader.Close() == 0 && fcntl(fd, F_GETFD) != -1);
+        assert(reader.OpenFd(fd) == 0);
+        BlockHeader header;
+        Block *block = reader.ReadBlock(header);
+        const char expected[] = "stream state reuse";
+        assert(block && header.block_type == BLOCK_TYPE_PROCESS);
+        assert(block->Length() == sizeof(expected));
+        assert(memcmp(block->rBuf(), expected, sizeof(expected)) == 0);
+        assert(reader.ReadBlock(header) == NULL && reader.TailSeen());
+        assert(reader.VerifyPhysicalEof() == 0 && reader.Close() == 0);
+        assert(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+    }
 }
 
 static void copy_with_trailing_byte(const char *source, const char *destination)
@@ -287,6 +342,7 @@ int main(int argc, char **argv)
     if (argc != 4) {
         return 2;
     }
+    check_decode_allocation_failure(argv[2]);
     if (!check_file_fragments(argv[2])) {
         return 1;
     }

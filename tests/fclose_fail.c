@@ -634,6 +634,32 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     return real_pread(fd, buf, count, offset);
 }
 
+int waitid(idtype_t type, id_t id, siginfo_t *info, int options)
+{
+    static int (*real_waitid)(idtype_t, id_t, siginfo_t *, int);
+    static unsigned retry_stage;
+    if (!real_waitid) {
+        real_waitid = (int (*)(idtype_t, id_t, siginfo_t *, int))
+            dlsym(RTLD_NEXT, "waitid");
+    }
+    if (type == P_PID && last_event_child > 0 && id == (id_t)last_event_child &&
+        (options & WNOWAIT) && getenv("ARTHUR_RETRY_WAITID")) {
+        if (retry_stage == 0) {
+            retry_stage++;
+            fprintf(stderr, "injected waitid EINTR for %u\n", (unsigned)id);
+            errno = EINTR;
+            return -1;
+        }
+        if (retry_stage == 1) {
+            retry_stage++;
+            memset(info, 0, sizeof(*info));
+            fprintf(stderr, "injected empty waitid poll for %u\n", (unsigned)id);
+            return 0;
+        }
+    }
+    return real_waitid(type, id, info, options);
+}
+
 int sigwaitinfo(const sigset_t *set, siginfo_t *info)
 {
     static int (*real_sigwaitinfo)(const sigset_t *, siginfo_t *);

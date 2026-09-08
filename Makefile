@@ -77,6 +77,7 @@ test: $(TARGET)
 	@bash tests/run.sh final-wait-error
 	@bash tests/run.sh clone-wait-error
 	@bash tests/run.sh clone-wait-delayed
+	@bash tests/run.sh clone-wait-retry
 	@bash tests/run.sh collect-event-error
 	@bash tests/run.sh detach
 	@bash tests/run.sh attach-relay
