@@ -58,6 +58,7 @@ build/%.o: src/%.cc
 
 test: $(TARGET)
 	@bash tests/run.sh proc
+	@bash tests/run.sh metadata
 	@bash tests/run.sh cli
 	@bash tests/run.sh build-version
 	@bash tests/run.sh stream
@@ -113,6 +114,7 @@ test: $(TARGET)
 	@bash tests/run.sh group-stop
 	@bash tests/run.sh relay
 	@bash tests/run.sh snapshot
+	@bash tests/run.sh snapshot-reap
 	@bash tests/run.sh snapshot-failure
 	@bash tests/run.sh snapshot-collision
 	@bash tests/run.sh fork-cont

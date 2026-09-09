@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,6 +22,17 @@ static volatile sig_atomic_t exec_after_exit;
 static volatile pid_t first_decoy_tid;
 static volatile pid_t late_tid;
 static volatile pid_t spawned_tid;
+static volatile sig_atomic_t child_notice;
+
+static void on_child_exit(int sig, siginfo_t *info, void *context)
+{
+    (void)sig;
+    (void)context;
+    int saved_errno = errno;
+    child_notice = info->si_pid;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    errno = saved_errno;
+}
 
 #if defined(__x86_64__)
 __attribute__((naked, noinline, noreturn)) static void leaf_stack_spin(void)
@@ -159,6 +172,49 @@ int main(int argc, char **argv)
     setrlimit(RLIMIT_CORE, &no_core);
     if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) != 0 || argc < 2) {
         return 2;
+    }
+
+    if (strcmp(argv[1], "metadata") == 0) {
+        if (argc != 6 || prctl(PR_SET_NAME, argv[2], 0, 0, 0) != 0) {
+            return 2;
+        }
+        ready();
+        for (;;) {
+            __asm__ __volatile__("" ::: "memory");
+        }
+    }
+
+    if (strcmp(argv[1], "reap-spin") == 0) {
+        if (argc != 3) {
+            return 2;
+        }
+        if (strcmp(argv[2], "blocked") == 0) {
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCHLD);
+            if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
+                return 2;
+            }
+        } else if (strcmp(argv[2], "handler") == 0) {
+            struct sigaction action = {0};
+            action.sa_sigaction = on_child_exit;
+            action.sa_flags = SA_SIGINFO;
+            sigemptyset(&action.sa_mask);
+            if (sigaction(SIGCHLD, &action, NULL) != 0) {
+                return 2;
+            }
+        } else if (strcmp(argv[2], "default") != 0) {
+            return 2;
+        }
+        ready();
+        sig_atomic_t reported = 0;
+        for (;;) {
+            if (reported != child_notice) {
+                reported = child_notice;
+                printf("child-notice=%d\n", (int)reported);
+                fflush(stdout);
+            }
+        }
     }
 
     if (strcmp(argv[1], "worker-crash") == 0) {

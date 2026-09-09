@@ -168,6 +168,124 @@ CASE_RAN=1
     "$TEST_TMP/proc_test"
 fi
 
+# Verify live identity through both capture paths and default output naming.
+if [[ $CASE == metadata || $CASE == all ]]; then
+CASE_RAN=1
+metadata_index=0
+for metadata_name in 'worker pool' '' 'right) space' $'line1\nline2' '12345678901234567890'; do
+    metadata_index=$((metadata_index + 1))
+    metadata_argument='arg with spaces'
+    if [[ $metadata_index -eq 5 ]]; then
+        metadata_argument+=' 0123456789012345678901234567890123456789012345678901234567890123456789'
+    fi
+    (
+        exec -a metadata-probe "$TEST_TMP/fixture" metadata "$metadata_name" \
+            "$metadata_argument" '' tail
+    ) >"$TEST_TMP/metadata-fixture.log" 2>&1 &
+    FIXTURE_PID=$!
+    TARGET_PIDS+=("$FIXTURE_PID")
+    wait_for_log "$TEST_TMP/metadata-fixture.log" ready
+    for metadata_mode in 0 1; do
+        metadata_dir="$TEST_TMP/metadata-$metadata_index-$metadata_mode"
+        mkdir "$metadata_dir"
+        (
+            cd "$metadata_dir"
+            expect_status 0 "$ARTHUR_BIN" -p "$FIXTURE_PID" "-$metadata_mode"
+            [[ -s "acore.$FIXTURE_PID" ]]
+            expect_status 0 "$ARTHUR_BIN" -c "acore.$FIXTURE_PID"
+            [[ -s "core.$FIXTURE_PID" ]]
+            ARTHUR_EXPECT_PID="$FIXTURE_PID" ARTHUR_EXPECT_COMM="$metadata_name" \
+                ARTHUR_EXPECT_PSARGS="metadata-probe metadata $metadata_name $metadata_argument  tail " \
+                "$TEST_TMP/core_note_test" "core.$FIXTURE_PID" \
+                "$(id -u)" "$(id -g)" 0 0x600 1 0 0 1 "$XSTATE_NOTE_COUNT" 0 19
+            expect_status 0 "$ARTHUR_BIN" -c "acore.$FIXTURE_PID" -o explicit.core
+            cmp "core.$FIXTURE_PID" explicit.core
+        )
+        kill -0 "$FIXTURE_PID"
+        [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+    done
+    kill -TERM "$FIXTURE_PID"
+    expect_status 143 wait "$FIXTURE_PID"
+done
+fi
+
+# Repeated snapshots must not accumulate Arthur's own exited fork children.
+if [[ $CASE == snapshot-reap || $CASE == all ]]; then
+CASE_RAN=1
+for reap_mode in 0 3; do
+    for reap_disposition in default blocked handler; do
+        start_fixture reap-spin "$reap_disposition"
+        reap_prefix="$TEST_TMP/reap-$reap_mode-$reap_disposition"
+        mkdir "$reap_prefix"
+        reap_mask=$(awk '/^SigBlk:/ {print $2}' "/proc/$FIXTURE_PID/status")
+        if [[ $reap_mode == 3 ]]; then
+            "$ARTHUR_BIN" -p "$FIXTURE_PID" -3 -o "$reap_prefix/final.acore" \
+                >"$reap_prefix/monitor.log" 2>&1 &
+            MONITOR_PID=$!
+            TARGET_PIDS+=("$MONITOR_PID")
+            wait_for_log "$reap_prefix/monitor.log" "Launched in monitor mode"
+        fi
+        for reap_iteration in 1 2 3; do
+            if [[ $reap_mode == 0 ]]; then
+                reap_log="$reap_prefix/$reap_iteration.log"
+                reap_acore="$reap_prefix/$reap_iteration.acore"
+                if ! expect_status 0 "$ARTHUR_BIN" -p "$FIXTURE_PID" -0 -o "$reap_acore" \
+                    >"$reap_log" 2>&1; then
+                    cat "$reap_log" >&2
+                    exit 1
+                fi
+                reap_child=$(sed -n 's/.*child_pid = \([0-9]*\).*/\1/p' "$reap_log")
+            else
+                reap_log="$reap_prefix/monitor.log"
+                kill -USR1 "$MONITOR_PID"
+                for _ in $(seq 1 200); do
+                    reap_finished=$(awk '/writing out acore finished/ {n++} END {print n+0}' "$reap_log")
+                    [[ $reap_finished -ge $reap_iteration ]] && break
+                    sleep 0.05
+                done
+                if [[ $reap_finished -ne $reap_iteration ]]; then
+                    cat "$reap_log" >&2
+                    echo "repeated monitor snapshot did not complete" >&2
+                    exit 1
+                fi
+                reap_child=$(sed -n 's/.*child_pid = \([0-9]*\).*/\1/p' "$reap_log" | sed -n "${reap_iteration}p")
+                reap_acore=$(sed -n 's/.*writing out \(.*\)\.\.\./\1/p' "$reap_log" | sed -n "${reap_iteration}p")
+            fi
+            if [[ ! $reap_child =~ ^[0-9]+$ || ! -s $reap_acore ]]; then
+                cat "$reap_log" >&2
+                echo "snapshot did not produce a child PID and complete acore" >&2
+                exit 1
+            fi
+            for _ in $(seq 1 200); do
+                [[ ! -e /proc/$reap_child ]] && break
+                sleep 0.01
+            done
+            if [[ -e /proc/$reap_child ]]; then
+                cat "$reap_log" >&2
+                echo "snapshot child $reap_child remains after capture: $(awk '{print $3}' "/proc/$reap_child/stat")" >&2
+                exit 1
+            fi
+            if [[ $reap_disposition == handler ]]; then
+                if ! wait_for_log "$TEST_TMP/fixture.log" "^child-notice=$reap_child$"; then
+                    cat "$reap_log" "$TEST_TMP/fixture.log" >&2
+                    exit 1
+                fi
+            fi
+            [[ $(awk '/^SigBlk:/ {print $2}' "/proc/$FIXTURE_PID/status") == "$reap_mask" ]]
+            expect_status 0 "$ARTHUR_BIN" -c "$reap_acore" -o "$reap_prefix/$reap_iteration.core"
+            kill -0 "$FIXTURE_PID"
+        done
+        if [[ $reap_mode == 3 ]]; then
+            kill -TERM "$MONITOR_PID"
+            expect_status 0 wait "$MONITOR_PID"
+        fi
+        [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$FIXTURE_PID/status") == 0 ]]
+        kill -TERM "$FIXTURE_PID"
+        expect_status 143 wait "$FIXTURE_PID"
+    done
+done
+fi
+
 if [[ $CASE == cli || $CASE == all ]]; then
 CASE_RAN=1
 printf 'cli operand validation\n' >"$TEST_TMP/cli.input"

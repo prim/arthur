@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <string>
 #include <vector>
 
 #include "elf.h"
@@ -75,6 +76,7 @@ int main(int argc, char **argv)
     int first_prstatus_signal = 0;
     int first_prstatus_info_signal = 0;
     int first_siginfo_signal = 0;
+    int first_prstatus_pid = 0;
     elf_prpsinfo64 prpsinfo = {};
     for (size_t i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr phdr;
@@ -120,6 +122,7 @@ int main(int argc, char **argv)
                     x64_elf_prstatus status = {};
 #endif
                     memcpy(&status, desc, sizeof(status));
+                    first_prstatus_pid = status.pr_pid;
                     first_sigpend = status.pr_sigpend;
                     first_sighold = status.pr_sighold;
                     first_prstatus_signal = status.pr_cursig;
@@ -143,6 +146,23 @@ int main(int argc, char **argv)
     assert((prpsinfo.pr_flag & required_flags) == required_flags);
     assert((prpsinfo.pr_flag & forbidden_flags) == 0);
     assert(siginfo_count == expected_siginfo);
+    const char *expected_pid = getenv("ARTHUR_EXPECT_PID");
+    if (expected_pid != NULL) {
+        assert(prpsinfo.pr_pid == (int)parse_u64(expected_pid));
+        assert(first_prstatus_pid == prpsinfo.pr_pid);
+    }
+    const char *expected_comm = getenv("ARTHUR_EXPECT_COMM");
+    if (expected_comm != NULL) {
+        assert(std::string(prpsinfo.pr_fname,
+                           strnlen(prpsinfo.pr_fname, sizeof(prpsinfo.pr_fname))) ==
+               std::string(expected_comm).substr(0, sizeof(prpsinfo.pr_fname) - 1));
+    }
+    const char *expected_args = getenv("ARTHUR_EXPECT_PSARGS");
+    if (expected_args != NULL) {
+        assert(std::string(prpsinfo.pr_psargs,
+                           strnlen(prpsinfo.pr_psargs, sizeof(prpsinfo.pr_psargs))) ==
+               std::string(expected_args).substr(0, sizeof(prpsinfo.pr_psargs) - 1));
+    }
     if (check_thread_state) {
         assert(first_sigpend == expected_sigpend);
         assert(first_sighold == expected_sighold);

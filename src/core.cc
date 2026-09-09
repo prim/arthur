@@ -1355,12 +1355,28 @@ static inline int pt_terminate_tracee(pid_t pid)
     error("snapshot child %d did not terminate after SIGKILL", pid);
     return -1;
 }
+static int signal_has_nondefault_disposition(pid_t pid, int sig);
+
+static bool is_default_snapshot_exit(pid_t pid, pid_t child)
+{
+    if (child <= 0) {
+        return false;
+    }
+    siginfo_t info = {};
+    return ptrace(PTRACE_GETSIGINFO, pid, NULL, &info) == 0 &&
+        info.si_signo == SIGCHLD && info.si_pid == child &&
+        (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED ||
+         info.si_code == CLD_DUMPED) &&
+        signal_has_nondefault_disposition(pid, SIGCHLD) == 0;
+}
+
 static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, int argc,
                           uint64_t argv[], uint64_t *out_inject_rsp = NULL,
                           uint64_t *out_orig_word = NULL,
                           uint64_t *out_fork_child = NULL,
                           int *out_death = NULL,
-                          int *out_stop_signal = NULL)
+                          int *out_stop_signal = NULL,
+                          pid_t reaping_child = 0)
 {
     int rc, status = 0;
     user_regs64_struct regs;
@@ -1589,7 +1605,11 @@ static inline int pt_call(pid_t pid, user_regs64_struct *oregs, uint64_t func, i
                       strsignal(WSTOPSIG(status)));
                 return fail("crash during injection");
             }
-            if (stop_event == 0) {
+            // The default SIGCHLD notification for the child being reaped
+            // must not abort that waitpid. Application handlers still relay.
+            if (stop_event == 0 &&
+                !(WSTOPSIG(status) == SIGCHLD &&
+                  is_default_snapshot_exit(pid, reaping_child))) {
                 // A real delivery-stop unrelated to the injected call must not
                 // be resumed with signal 0. Report it to the owner, which will
                 // restore GPRs and relay the signal to the original TID.
@@ -4939,7 +4959,9 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
     if (pt_attach(_pid, &reattach_relay_signal) != 0) {
         warn("re-attach of %d failed; injected waitpid may not have reaped the "
              "fork child", _pid);
-    } else if (reattach_relay_signal != 0) {
+    } else if (reattach_relay_signal != 0 &&
+               !(!sys_core && reattach_relay_signal == SIGCHLD &&
+                 is_default_snapshot_exit(_pid, _core_pid))) {
         warn("re-attach of %d intercepted %s; skipping waitpid injection and relaying it",
              _pid, strsignal(reattach_relay_signal));
         if (pt_detach(_pid, reattach_relay_signal) != 0 && errno != ESRCH) {
@@ -4966,7 +4988,7 @@ int Coredump::forkcore(const char *corefile, bool sys_core)
             // 读垃圾进日志/告警。检查并告警（acore 已有效，best-effort 收尸）。
             int wait_signal = 0;
             if (pt_call(_pid, &regs, r_waitpid, 3, gv, NULL, NULL, NULL,
-                        NULL, &wait_signal) != 0) {
+                        NULL, &wait_signal, sys_core ? 0 : _core_pid) != 0) {
                 // R50-38: 注入 waitpid 失败不必然是"target died"——mode 2 下
                 // fork 子进程非 tracee，DETACH+SIGKILL 无效，子进程靠 int $3 内核
                 // core 后自行死亡；大目标内核 core dump 可 >10s，pt_call 超时
@@ -5941,7 +5963,8 @@ int Coredump::forkcore_m(const char *corefile, bool sys_core)
             // R50-1: pt_call 返回未检查——目标中途死亡时 regs 未初始化，get_rc() 读垃圾。
             int wait_signal = 0;
             int wait_call = pt_call(_pid, &regs, r_waitpid, 3, gv, NULL,
-                                    NULL, NULL, NULL, &wait_signal);
+                                    NULL, NULL, NULL, &wait_signal,
+                                    sys_core ? 0 : _core_pid);
             if (wait_call != 0) {
                 if (wait_call == PT_CALL_RECOVERY_FAILED) {
                     _monitor_recovery_failed = true;
